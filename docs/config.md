@@ -111,6 +111,58 @@ Plan preset. The string value `none` means "no reasoning" (an explicit Plan
 override), not "inherit the global default". There is currently no separate
 config value for "follow the global default in Plan mode".
 
+## Per-task model and provider overrides
+
+Some background tasks can be routed to a different model and provider than
+the main agent. Each override is a pair: setting `*_provider` without the
+matching `*_model` is rejected at config load.
+
+```toml
+# ~/.codex/config.toml — main agent stays on its default model/provider.
+
+# Conversation compaction (auto-compact and /compact).
+compact_provider = "ollama"
+compact_model    = "gemma4:26b-a4b-it-q4_K_M"
+
+# Inline /review and detached /review (app-server). Detached reviews fork
+# from the parent thread's full effective config and inherit these.
+review_provider  = "ollama"
+review_model     = "gemma4:26b-a4b-it-q4_K_M"
+
+[memories]
+extract_provider       = "ollama"
+extract_model          = "gemma4:26b-a4b-it-q4_K_M"
+consolidation_provider = "ollama"
+consolidation_model    = "gemma4:26b-a4b-it-q4_K_M"
+```
+
+The provider id must reference a provider already known to Codex (built-in
+or from `[model_providers.<id>]`). The built-in `ollama` provider speaks
+the Responses wire API and requires Ollama ≥ 0.13.4.
+
+## Delegating to a local LLM agent
+
+A child agent role can pin its own provider and model. The main agent can
+then call `spawn_agent(agent_type = "local_llm", ...)` to delegate work to
+it without changing its own model.
+
+```toml
+# ~/.codex/config.toml
+[agents.local_llm]
+description         = "Delegate to local Gemma 4 26B-A4B (Ollama)."
+config_file         = "./agents/local_llm.toml"
+nickname_candidates = ["Gemma"]
+```
+
+```toml
+# ~/.codex/agents/local_llm.toml
+model_provider = "ollama"
+model          = "gemma4:26b-a4b-it-q4_K_M"
+```
+
+Local quantized models do best on prose-shaped tasks (summarisation,
+classification, drafting). Tool-heavy delegations may degrade.
+
 ## Realtime start instructions
 
 `experimental_realtime_start_instructions` lets you replace the built-in
