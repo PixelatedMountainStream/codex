@@ -31,11 +31,14 @@ pub(super) async fn spawn_review_thread(
     // tools) is wrong when the review subthread runs against a different
     // provider (e.g. a local LLM). When `review_provider` is unset, we keep
     // the parent provider's capabilities (status quo).
-    let review_provider_info: Option<ModelProviderInfo> =
+    let resolved_review_provider: Option<(&str, ModelProviderInfo)> =
         if let Some(review_provider_id) = config.review_provider.as_deref() {
             match config.model_providers.get(review_provider_id) {
-                Some(info) => Some(info.clone()),
+                Some(info) => Some((review_provider_id, info.clone())),
                 None => {
+                    // Should be unreachable: config-load validation rejects
+                    // unknown `*_provider` ids. Defensive fallback in case
+                    // `model_providers` is mutated post-load.
                     tracing::error!(
                         "review_provider '{review_provider_id}' is not present in \
                          model_providers; falling back to parent provider"
@@ -46,6 +49,9 @@ pub(super) async fn spawn_review_thread(
         } else {
             None
         };
+    let review_provider_info = resolved_review_provider
+        .as_ref()
+        .map(|(_, info)| info.clone());
     let review_shared_provider = match review_provider_info.clone() {
         Some(info) => codex_model_provider::create_model_provider(
             info,
@@ -104,13 +110,23 @@ pub(super) async fn spawn_review_thread(
     let mut per_turn_config = (*config).clone();
     per_turn_config.model = Some(model.clone());
     per_turn_config.features = review_features.clone();
-    if let Some(review_provider_id) = config.review_provider.as_deref()
-        && let Err(err) =
+    // Only override per_turn_config's provider when the same id resolved
+    // successfully above. If it didn't, capabilities already fell back to the
+    // parent provider — keep `model` and `provider` consistent with that.
+    if let Some((review_provider_id, _)) = resolved_review_provider {
+        if let Err(err) =
             crate::config::apply_provider_override(&mut per_turn_config, review_provider_id)
-    {
-        tracing::error!(
-            "failed to apply review_provider '{review_provider_id}' to per-turn config: {err}"
-        );
+        {
+            tracing::error!(
+                "failed to apply review_provider '{review_provider_id}' to per-turn config: \
+                 {err}; keeping parent model+provider"
+            );
+            per_turn_config.model = Some(parent_turn_context.model_info.slug.clone());
+        }
+    } else if config.review_provider.is_some() {
+        // Provider resolution fell back; keep model on parent too so the wire
+        // request never carries an override slug paired with the parent provider.
+        per_turn_config.model = Some(parent_turn_context.model_info.slug.clone());
     }
     if let Err(err) = per_turn_config.web_search_mode.set(review_web_search_mode) {
         let fallback_value = per_turn_config.web_search_mode.value();

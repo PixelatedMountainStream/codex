@@ -8792,6 +8792,105 @@ consolidation_provider = "ollama"
 }
 
 #[tokio::test]
+async fn config_load_rejects_unknown_compact_provider_id() {
+    let cfg: ConfigToml = toml::from_str(
+        r#"
+compact_provider = "definitely-not-a-known-provider"
+compact_model    = "gemma4:26b"
+"#,
+    )
+    .expect("TOML deserialization should succeed");
+    let err = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides::default(),
+        tempdir().expect("tempdir").abs(),
+    )
+    .await
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("compact_provider")
+            && msg.contains("definitely-not-a-known-provider")
+            && msg.contains("not present in model_providers"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn config_load_rejects_unknown_review_provider_id() {
+    let cfg: ConfigToml = toml::from_str(
+        r#"
+review_provider = "definitely-not-a-known-provider"
+review_model    = "gemma4:26b"
+"#,
+    )
+    .expect("TOML deserialization should succeed");
+    let err = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides::default(),
+        tempdir().expect("tempdir").abs(),
+    )
+    .await
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("review_provider")
+            && msg.contains("not present in model_providers"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn config_load_rejects_unknown_memories_extract_provider_id() {
+    let cfg: ConfigToml = toml::from_str(
+        r#"
+[memories]
+extract_provider = "definitely-not-a-known-provider"
+extract_model    = "gemma4:26b"
+"#,
+    )
+    .expect("TOML deserialization should succeed");
+    let err = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides::default(),
+        tempdir().expect("tempdir").abs(),
+    )
+    .await
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("memories.extract_provider")
+            && msg.contains("not present in model_providers"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn config_load_rejects_unknown_memories_consolidation_provider_id() {
+    let cfg: ConfigToml = toml::from_str(
+        r#"
+[memories]
+consolidation_provider = "definitely-not-a-known-provider"
+consolidation_model    = "gemma4:26b"
+"#,
+    )
+    .expect("TOML deserialization should succeed");
+    let err = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides::default(),
+        tempdir().expect("tempdir").abs(),
+    )
+    .await
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("memories.consolidation_provider")
+            && msg.contains("not present in model_providers"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
 async fn apply_provider_override_unknown_id_returns_error() {
     let cfg: ConfigToml = toml::from_str("").expect("empty TOML");
     let mut config = Config::load_from_base_config_with_overrides(

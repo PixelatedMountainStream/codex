@@ -2558,6 +2558,35 @@ impl Config {
             }
         }
 
+        // Provider-id existence: every `*_provider` must reference a known entry
+        // in `model_providers`. Without this, an unknown id would deserialise
+        // cleanly and only fail at runtime — and one runtime path (interactive
+        // /review) only logs the error, leaving the override model slug paired
+        // with the parent's provider.
+        let validate_known_provider = |provider: &Option<String>, field: &str| {
+            if let Some(id) = provider.as_deref()
+                && !model_providers.contains_key(id)
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("{field} '{id}' is not present in model_providers"),
+                ));
+            }
+            Ok(())
+        };
+        validate_known_provider(&compact_provider, "compact_provider")?;
+        validate_known_provider(&review_provider, "review_provider")?;
+        if let Some(memories_toml) = cfg.memories.as_ref() {
+            validate_known_provider(
+                &memories_toml.extract_provider,
+                "memories.extract_provider",
+            )?;
+            validate_known_provider(
+                &memories_toml.consolidation_provider,
+                "memories.consolidation_provider",
+            )?;
+        }
+
         let check_for_update_on_startup = cfg.check_for_update_on_startup.unwrap_or(true);
         let model_catalog = load_model_catalog(
             config_profile
