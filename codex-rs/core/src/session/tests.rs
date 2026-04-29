@@ -3605,7 +3605,7 @@ async fn compact_override_provisions_dedicated_client_and_model_info() -> anyhow
     let session = make_session_with_config(move |config| {
         config
             .model_providers
-            .insert("local-test".to_string(), override_provider.clone());
+            .insert("local-test".to_string(), override_provider);
         config.compact_model = Some("compact-test-slug".to_string());
         config.compact_provider = Some("local-test".to_string());
     })

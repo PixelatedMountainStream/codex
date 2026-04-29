@@ -8885,7 +8885,7 @@ review_provider = "ollama"
         .review_model
         .clone()
         .expect("review_model set in fixture");
-    sub_agent_config.model = Some(model.clone());
+    sub_agent_config.model = Some(model);
     if let Some(review_provider) = parent_config.review_provider.clone() {
         super::apply_provider_override(&mut sub_agent_config, &review_provider)
             .expect("override should succeed for built-in ollama provider");

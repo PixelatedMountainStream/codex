@@ -104,15 +104,13 @@ pub(super) async fn spawn_review_thread(
     let mut per_turn_config = (*config).clone();
     per_turn_config.model = Some(model.clone());
     per_turn_config.features = review_features.clone();
-    if let Some(review_provider_id) = config.review_provider.as_deref() {
-        if let Err(err) = crate::config::apply_provider_override(
-            &mut per_turn_config,
-            review_provider_id,
-        ) {
-            tracing::error!(
-                "failed to apply review_provider '{review_provider_id}' to per-turn config: {err}"
-            );
-        }
+    if let Some(review_provider_id) = config.review_provider.as_deref()
+        && let Err(err) =
+            crate::config::apply_provider_override(&mut per_turn_config, review_provider_id)
+    {
+        tracing::error!(
+            "failed to apply review_provider '{review_provider_id}' to per-turn config: {err}"
+        );
     }
     if let Err(err) = per_turn_config.web_search_mode.set(review_web_search_mode) {
         let fallback_value = per_turn_config.web_search_mode.value();
