@@ -74,6 +74,16 @@ pub struct ConfigToml {
     /// Review model override used by the `/review` feature.
     pub review_model: Option<String>,
 
+    /// Provider override used by the `/review` feature. Requires `review_model`.
+    pub review_provider: Option<String>,
+
+    /// Model override used by compaction. Requires `compact_provider` to be paired
+    /// with this when overriding the compaction provider.
+    pub compact_model: Option<String>,
+
+    /// Provider override used by compaction. Requires `compact_model`.
+    pub compact_provider: Option<String>,
+
     /// Provider to use from the model_providers map.
     pub model_provider: Option<String>,
 

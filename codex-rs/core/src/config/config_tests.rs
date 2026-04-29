@@ -288,7 +288,9 @@ consolidation_model = "gpt-5.2"
             min_rollout_idle_hours: Some(24),
             min_rate_limit_remaining_percent: Some(12),
             extract_model: Some("gpt-5-mini".to_string()),
+            extract_provider: None,
             consolidation_model: Some("gpt-5.2".to_string()),
+            consolidation_provider: None,
         }),
         memories_cfg.memories
     );
@@ -313,7 +315,9 @@ consolidation_model = "gpt-5.2"
             min_rollout_idle_hours: 24,
             min_rate_limit_remaining_percent: 12,
             extract_model: Some("gpt-5-mini".to_string()),
+            extract_provider: None,
             consolidation_model: Some("gpt-5.2".to_string()),
+            consolidation_provider: None,
         }
     );
 
@@ -5886,6 +5890,9 @@ async fn test_precedence_fixture_with_o3_profile() -> std::io::Result<()> {
         Config {
             model: Some("o3".to_string()),
             review_model: None,
+            review_provider: None,
+            compact_model: None,
+            compact_provider: None,
             model_context_window: None,
             model_auto_compact_token_limit: None,
             service_tier: None,
@@ -6080,6 +6087,9 @@ async fn test_precedence_fixture_with_gpt3_profile() -> std::io::Result<()> {
     let expected_gpt3_profile_config = Config {
         model: Some("gpt-3.5-turbo".to_string()),
         review_model: None,
+        review_provider: None,
+        compact_model: None,
+        compact_provider: None,
         model_context_window: None,
         model_auto_compact_token_limit: None,
         service_tier: None,
@@ -6228,6 +6238,9 @@ async fn test_precedence_fixture_with_zdr_profile() -> std::io::Result<()> {
     let expected_zdr_profile_config = Config {
         model: Some("o3".to_string()),
         review_model: None,
+        review_provider: None,
+        compact_model: None,
+        compact_provider: None,
         model_context_window: None,
         model_auto_compact_token_limit: None,
         service_tier: None,
@@ -6361,6 +6374,9 @@ async fn test_precedence_fixture_with_gpt5_profile() -> std::io::Result<()> {
     let expected_gpt5_profile_config = Config {
         model: Some("gpt-5.4".to_string()),
         review_model: None,
+        review_provider: None,
+        compact_model: None,
+        compact_provider: None,
         model_context_window: None,
         model_auto_compact_token_limit: None,
         service_tier: None,
@@ -8649,5 +8665,185 @@ fn test_tui_notification_condition_rejects_unknown_value() {
             && err.contains("unfocused")
             && err.contains("always"),
         "unexpected error: {err}"
+    );
+}
+
+// =============================================================================
+// Provider-override fields (Phase 2A)
+// =============================================================================
+
+#[tokio::test]
+async fn provider_override_fields_thread_through_to_runtime_config() {
+    let cfg: ConfigToml = toml::from_str(
+        r#"
+review_model    = "gpt-5-mini"
+review_provider = "ollama"
+compact_model    = "gemma4:26b"
+compact_provider = "ollama"
+
+[memories]
+extract_model            = "gpt-5-mini"
+extract_provider         = "ollama"
+consolidation_model      = "gpt-5.2"
+consolidation_provider   = "ollama"
+"#,
+    )
+    .expect("TOML deserialization should succeed");
+
+    let config = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides::default(),
+        tempdir().expect("tempdir").abs(),
+    )
+    .await
+    .expect("config should load");
+
+    assert_eq!(config.review_model.as_deref(), Some("gpt-5-mini"));
+    assert_eq!(config.review_provider.as_deref(), Some("ollama"));
+    assert_eq!(config.compact_model.as_deref(), Some("gemma4:26b"));
+    assert_eq!(config.compact_provider.as_deref(), Some("ollama"));
+    assert_eq!(config.memories.extract_provider.as_deref(), Some("ollama"));
+    assert_eq!(
+        config.memories.consolidation_provider.as_deref(),
+        Some("ollama")
+    );
+}
+
+#[tokio::test]
+async fn pair_rule_rejects_compact_provider_without_compact_model() {
+    let cfg: ConfigToml = toml::from_str(r#"compact_provider = "ollama""#)
+        .expect("TOML deserialization should succeed");
+    let err = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides::default(),
+        tempdir().expect("tempdir").abs(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("compact_provider requires compact_model"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn pair_rule_rejects_review_provider_without_review_model() {
+    let cfg: ConfigToml = toml::from_str(r#"review_provider = "ollama""#)
+        .expect("TOML deserialization should succeed");
+    let err = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides::default(),
+        tempdir().expect("tempdir").abs(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("review_provider requires review_model"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn pair_rule_rejects_memories_extract_provider_without_extract_model() {
+    let cfg: ConfigToml = toml::from_str(
+        r#"
+[memories]
+extract_provider = "ollama"
+"#,
+    )
+    .expect("TOML deserialization should succeed");
+    let err = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides::default(),
+        tempdir().expect("tempdir").abs(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("memories.extract_provider requires memories.extract_model"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn pair_rule_rejects_memories_consolidation_provider_without_consolidation_model() {
+    let cfg: ConfigToml = toml::from_str(
+        r#"
+[memories]
+consolidation_provider = "ollama"
+"#,
+    )
+    .expect("TOML deserialization should succeed");
+    let err = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides::default(),
+        tempdir().expect("tempdir").abs(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("memories.consolidation_provider requires memories.consolidation_model"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn apply_provider_override_unknown_id_returns_error() {
+    let cfg: ConfigToml = toml::from_str("").expect("empty TOML");
+    let mut config = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides::default(),
+        tempdir().expect("tempdir").abs(),
+    )
+    .await
+    .expect("config should load");
+
+    let err = super::apply_provider_override(&mut config, "definitely-not-a-real-provider")
+        .expect_err("unknown provider should be rejected");
+    assert!(
+        err.to_string().contains("unknown model_provider"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn apply_provider_override_known_id_mutates_both_provider_fields() {
+    let cfg: ConfigToml = toml::from_str("").expect("empty TOML");
+    let mut config = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides::default(),
+        tempdir().expect("tempdir").abs(),
+    )
+    .await
+    .expect("config should load");
+
+    // Sanity check — start on the default (openai) provider.
+    let original_id = config.model_provider_id.clone();
+    let original_info = config.model_provider.clone();
+    assert_ne!(
+        original_id,
+        OLLAMA_OSS_PROVIDER_ID,
+        "test fixture must not start on ollama"
+    );
+
+    let target_provider = OLLAMA_OSS_PROVIDER_ID;
+    let expected_info = config
+        .model_providers
+        .get(target_provider)
+        .cloned()
+        .expect("ollama provider must be registered as a built-in");
+
+    super::apply_provider_override(&mut config, target_provider)
+        .expect("override to a known provider should succeed");
+
+    assert_eq!(config.model_provider_id, target_provider);
+    assert_eq!(config.model_provider, expected_info);
+    assert_ne!(
+        config.model_provider, original_info,
+        "model_provider must actually change"
     );
 }

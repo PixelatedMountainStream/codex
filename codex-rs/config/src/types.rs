@@ -255,8 +255,12 @@ pub struct MemoriesToml {
     pub min_rate_limit_remaining_percent: Option<i64>,
     /// Model used for thread summarisation.
     pub extract_model: Option<String>,
+    /// Provider override used for thread summarisation. Requires `extract_model`.
+    pub extract_provider: Option<String>,
     /// Model used for memory consolidation.
     pub consolidation_model: Option<String>,
+    /// Provider override used for memory consolidation. Requires `consolidation_model`.
+    pub consolidation_provider: Option<String>,
 }
 
 /// Effective memories settings after defaults are applied.
@@ -272,7 +276,9 @@ pub struct MemoriesConfig {
     pub min_rollout_idle_hours: i64,
     pub min_rate_limit_remaining_percent: i64,
     pub extract_model: Option<String>,
+    pub extract_provider: Option<String>,
     pub consolidation_model: Option<String>,
+    pub consolidation_provider: Option<String>,
 }
 
 impl Default for MemoriesConfig {
@@ -288,7 +294,9 @@ impl Default for MemoriesConfig {
             min_rollout_idle_hours: DEFAULT_MEMORIES_MIN_ROLLOUT_IDLE_HOURS,
             min_rate_limit_remaining_percent: DEFAULT_MEMORIES_MIN_RATE_LIMIT_REMAINING_PERCENT,
             extract_model: None,
+            extract_provider: None,
             consolidation_model: None,
+            consolidation_provider: None,
         }
     }
 }
@@ -333,7 +341,9 @@ impl From<MemoriesToml> for MemoriesConfig {
                 .unwrap_or(defaults.min_rate_limit_remaining_percent)
                 .clamp(0, 100),
             extract_model: toml.extract_model,
+            extract_provider: toml.extract_provider,
             consolidation_model: toml.consolidation_model,
+            consolidation_provider: toml.consolidation_provider,
         }
     }
 }

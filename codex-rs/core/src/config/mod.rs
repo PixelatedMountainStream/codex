@@ -371,6 +371,18 @@ pub struct Config {
     /// Model used specifically for review sessions.
     pub review_model: Option<String>,
 
+    /// Provider override for review sessions. When set, the corresponding
+    /// `model_providers` entry is used in place of `model_provider` for
+    /// `/review` work. Requires `review_model` to also be set.
+    pub review_provider: Option<String>,
+
+    /// Model used specifically for compaction. Requires `compact_provider`
+    /// to also be set when overriding the compaction provider.
+    pub compact_model: Option<String>,
+
+    /// Provider override for compaction. Requires `compact_model`.
+    pub compact_provider: Option<String>,
+
     /// Size of the context window for the model, in tokens.
     pub model_context_window: Option<i64>,
 
@@ -1380,6 +1392,24 @@ pub(crate) fn set_project_trust_level_inner(
 
 /// Patch `CODEX_HOME/config.toml` project state to set trust level.
 /// Use with caution.
+/// Replace the active provider on `config` with the entry registered as
+/// `provider_id` in `config.model_providers`. Both `model_provider_id` and
+/// `model_provider` move together so downstream `ModelClient` construction sees
+/// a consistent provider.
+pub fn apply_provider_override(
+    config: &mut Config,
+    provider_id: &str,
+) -> anyhow::Result<()> {
+    let info = config
+        .model_providers
+        .get(provider_id)
+        .ok_or_else(|| anyhow::anyhow!("unknown model_provider '{provider_id}'"))?
+        .clone();
+    config.model_provider_id = provider_id.to_string();
+    config.model_provider = info;
+    Ok(())
+}
+
 pub fn set_project_trust_level(
     codex_home: &Path,
     project_path: &Path,
@@ -2494,6 +2524,39 @@ impl Config {
             .or(cfg.zsh_path.map(Into::into));
 
         let review_model = override_review_model.or(cfg.review_model);
+        let review_provider = cfg.review_provider;
+        let compact_model = cfg.compact_model;
+        let compact_provider = cfg.compact_provider;
+
+        // Pair-rule: a `*_provider` override must come with a matching `*_model`.
+        if compact_provider.is_some() && compact_model.is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "compact_provider requires compact_model to be set",
+            ));
+        }
+        if review_provider.is_some() && review_model.is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "review_provider requires review_model to be set",
+            ));
+        }
+        if let Some(memories_toml) = cfg.memories.as_ref() {
+            if memories_toml.extract_provider.is_some() && memories_toml.extract_model.is_none() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "memories.extract_provider requires memories.extract_model to be set",
+                ));
+            }
+            if memories_toml.consolidation_provider.is_some()
+                && memories_toml.consolidation_model.is_none()
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "memories.consolidation_provider requires memories.consolidation_model to be set",
+                ));
+            }
+        }
 
         let check_for_update_on_startup = cfg.check_for_update_on_startup.unwrap_or(true);
         let model_catalog = load_model_catalog(
@@ -2639,6 +2702,9 @@ impl Config {
             model,
             service_tier,
             review_model,
+            review_provider,
+            compact_model,
+            compact_provider,
             model_context_window: cfg.model_context_window,
             model_auto_compact_token_limit: cfg.model_auto_compact_token_limit,
             model_provider_id,
