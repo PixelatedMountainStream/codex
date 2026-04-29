@@ -25,7 +25,35 @@ pub(super) async fn spawn_review_thread(
     let _ = review_features.disable(Feature::WebSearchCached);
     let review_web_search_mode = WebSearchMode::Disabled;
     let goal_tools_supported = !config.ephemeral && parent_turn_context.tools_config.goal_tools;
-    let provider_capabilities = parent_turn_context.provider.capabilities();
+    // Resolve the review provider BEFORE deriving `provider_capabilities` so
+    // that `ToolsConfig::new(...)` is built against the review provider's
+    // capabilities — otherwise tool surface (web_search, image gen, namespace
+    // tools) is wrong when the review subthread runs against a different
+    // provider (e.g. a local LLM). When `review_provider` is unset, we keep
+    // the parent provider's capabilities (status quo).
+    let review_provider_info: Option<ModelProviderInfo> =
+        if let Some(review_provider_id) = config.review_provider.as_deref() {
+            match config.model_providers.get(review_provider_id) {
+                Some(info) => Some(info.clone()),
+                None => {
+                    tracing::error!(
+                        "review_provider '{review_provider_id}' is not present in \
+                         model_providers; falling back to parent provider"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+    let review_shared_provider = match review_provider_info.clone() {
+        Some(info) => codex_model_provider::create_model_provider(
+            info,
+            parent_turn_context.auth_manager.clone(),
+        ),
+        None => parent_turn_context.provider.clone(),
+    };
+    let provider_capabilities = review_shared_provider.capabilities();
     let tools_config = ToolsConfig::new(&ToolsConfigParams {
         model_info: &review_model_info,
         available_models: &sess
@@ -68,7 +96,7 @@ pub(super) async fn spawn_review_thread(
     ));
 
     let review_prompt = resolved.prompt.clone();
-    let provider = parent_turn_context.provider.clone();
+    let provider = review_shared_provider.clone();
     let auth_manager = parent_turn_context.auth_manager.clone();
     let model_info = review_model_info.clone();
 
@@ -76,6 +104,16 @@ pub(super) async fn spawn_review_thread(
     let mut per_turn_config = (*config).clone();
     per_turn_config.model = Some(model.clone());
     per_turn_config.features = review_features.clone();
+    if let Some(review_provider_id) = config.review_provider.as_deref() {
+        if let Err(err) = crate::config::apply_provider_override(
+            &mut per_turn_config,
+            review_provider_id,
+        ) {
+            tracing::error!(
+                "failed to apply review_provider '{review_provider_id}' to per-turn config: {err}"
+            );
+        }
+    }
     if let Err(err) = per_turn_config.web_search_mode.set(review_web_search_mode) {
         let fallback_value = per_turn_config.web_search_mode.value();
         tracing::warn!(

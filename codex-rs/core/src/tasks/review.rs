@@ -120,6 +120,16 @@ async fn start_review_conversation(
         .clone()
         .unwrap_or_else(|| ctx.model_info.slug.clone());
     sub_agent_config.model = Some(model);
+    if let Some(review_provider) = config.review_provider.clone() {
+        if let Err(err) =
+            crate::config::apply_provider_override(&mut sub_agent_config, &review_provider)
+        {
+            tracing::error!(
+                "failed to apply review_provider '{review_provider}' for inline review: {err}"
+            );
+            return None;
+        }
+    }
     (run_codex_thread_one_shot(
         sub_agent_config,
         session.auth_manager(),

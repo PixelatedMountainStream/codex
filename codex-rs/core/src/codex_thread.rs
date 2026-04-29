@@ -381,6 +381,15 @@ impl CodexThread {
         self.codex.session.get_config().await
     }
 
+    /// Returns the parent thread's full effective `Config`. Used by the
+    /// detached app-server review path to fork a child thread from the
+    /// parent's resolved configuration (rather than from the process
+    /// baseline `Config`). Mirrors `config()` but exposed under the name
+    /// the local-LLM provider override plan calls for.
+    pub async fn effective_config(&self) -> Arc<crate::config::Config> {
+        self.codex.session.get_config().await
+    }
+
     pub async fn read_mcp_resource(
         &self,
         server: &str,

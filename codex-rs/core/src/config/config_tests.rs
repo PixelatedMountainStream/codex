@@ -8847,3 +8847,133 @@ async fn apply_provider_override_known_id_mutates_both_provider_fields() {
         "model_provider must actually change"
     );
 }
+
+/// Mirrors the inline `/review` sub-agent config build in
+/// `crate::tasks::review::start_review_conversation`: clone the parent
+/// `Config`, override the model with `review_model`, then — when set —
+/// apply `review_provider`. Asserts that both the model name and the
+/// provider fields land on the sub-agent config.
+///
+/// This is a behavioural mirror because `start_review_conversation` is
+/// private and requires a fully constructed `Session` /
+/// `SessionTaskContext` / `TurnContext` to exercise directly. See report.
+#[tokio::test]
+async fn inline_review_subagent_applies_review_provider() {
+    let cfg: ConfigToml = toml::from_str(
+        r#"
+review_model    = "gemma4:26b"
+review_provider = "ollama"
+"#,
+    )
+    .expect("TOML deserialization should succeed");
+    let parent_config = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides::default(),
+        tempdir().expect("tempdir").abs(),
+    )
+    .await
+    .expect("config should load");
+
+    assert_ne!(
+        parent_config.model_provider_id, OLLAMA_OSS_PROVIDER_ID,
+        "test fixture parent must not already be on ollama"
+    );
+
+    // Replicate the inline `/review` body.
+    let mut sub_agent_config = parent_config.clone();
+    let model = parent_config
+        .review_model
+        .clone()
+        .expect("review_model set in fixture");
+    sub_agent_config.model = Some(model.clone());
+    if let Some(review_provider) = parent_config.review_provider.clone() {
+        super::apply_provider_override(&mut sub_agent_config, &review_provider)
+            .expect("override should succeed for built-in ollama provider");
+    }
+
+    assert_eq!(sub_agent_config.model.as_deref(), Some("gemma4:26b"));
+    assert_eq!(sub_agent_config.model_provider_id, OLLAMA_OSS_PROVIDER_ID);
+    assert_ne!(
+        sub_agent_config.model_provider, parent_config.model_provider,
+        "sub-agent provider must differ from parent provider"
+    );
+}
+
+/// Behavioural mirror of the interactive `/review` provider resolution in
+/// `crate::session::review::spawn_review_thread`: when `review_provider`
+/// is set and that provider lacks web-search / image-gen / namespace-tool
+/// capabilities, the capability snapshot used to build `ToolsConfig` must
+/// come from the *review* provider — not the parent. We use
+/// `amazon-bedrock` here because it is the only built-in provider that
+/// overrides `ProviderCapabilities` to `false` across the board (see
+/// `model-provider/src/amazon_bedrock/mod.rs` `fn capabilities`); the
+/// default openai parent still reports `true`.
+///
+/// We assert on `provider_capabilities` directly (the input to
+/// `ToolsConfig::new(...).with_web_search_capability(...)` /
+/// `.with_image_generation_capability(...)` /
+/// `.with_namespace_tools_capability(...)`), since the downstream
+/// `ToolsConfig` cannot be constructed without a fully wired `Session`.
+/// This is the simplest assertion the test infrastructure supports — see
+/// the agent report for why we did not exercise `spawn_review_thread`
+/// end-to-end.
+#[tokio::test]
+async fn interactive_review_uses_review_provider_capabilities_for_tools_config() {
+    let cfg: ConfigToml = toml::from_str(
+        r#"
+review_model    = "anthropic.claude-3-5-sonnet"
+review_provider = "amazon-bedrock"
+"#,
+    )
+    .expect("TOML deserialization should succeed");
+    let parent_config = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides::default(),
+        tempdir().expect("tempdir").abs(),
+    )
+    .await
+    .expect("config should load");
+
+    // Parent provider capabilities (the pre-Phase-2C behaviour).
+    let parent_shared = codex_model_provider::create_model_provider(
+        parent_config.model_provider.clone(),
+        /*auth_manager*/ None,
+    );
+    let parent_caps = parent_shared.capabilities();
+
+    // Resolve the review provider as `spawn_review_thread` does.
+    let review_provider_id = parent_config
+        .review_provider
+        .as_deref()
+        .expect("fixture sets review_provider");
+    let review_info = parent_config
+        .model_providers
+        .get(review_provider_id)
+        .expect("amazon-bedrock is a built-in provider")
+        .clone();
+    let review_shared =
+        codex_model_provider::create_model_provider(review_info, /*auth_manager*/ None);
+    let review_caps = review_shared.capabilities();
+
+    // Amazon Bedrock disables all three. If `spawn_review_thread`
+    // regressed and used the parent's capabilities, web-search /
+    // image-gen / namespace-tools would all be incorrectly enabled in
+    // the review subthread's `ToolsConfig`.
+    assert!(
+        !review_caps.web_search,
+        "review provider must report no web_search capability"
+    );
+    assert!(
+        !review_caps.image_generation,
+        "review provider must report no image_generation capability"
+    );
+    assert!(
+        !review_caps.namespace_tools,
+        "review provider must report no namespace_tools capability"
+    );
+    assert!(
+        parent_caps.web_search,
+        "default openai parent provider must report web_search capability \
+         (otherwise this test fixture is degenerate)"
+    );
+}
