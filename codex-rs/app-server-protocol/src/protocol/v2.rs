@@ -815,6 +815,9 @@ const fn default_enabled() -> bool {
 pub struct Config {
     pub model: Option<String>,
     pub review_model: Option<String>,
+    pub review_provider: Option<String>,
+    pub compact_model: Option<String>,
+    pub compact_provider: Option<String>,
     pub model_context_window: Option<i64>,
     pub model_auto_compact_token_limit: Option<i64>,
     pub model_provider: Option<String>,
@@ -9192,6 +9195,9 @@ mod tests {
         let reason = crate::experimental_api::ExperimentalApi::experimental_reason(&Config {
             model: None,
             review_model: None,
+            review_provider: None,
+            compact_model: None,
+            compact_provider: None,
             model_context_window: None,
             model_auto_compact_token_limit: None,
             model_provider: None,
@@ -9231,6 +9237,9 @@ mod tests {
         let reason = crate::experimental_api::ExperimentalApi::experimental_reason(&Config {
             model: None,
             review_model: None,
+            review_provider: None,
+            compact_model: None,
+            compact_provider: None,
             model_context_window: None,
             model_auto_compact_token_limit: None,
             model_provider: None,
@@ -9264,6 +9273,9 @@ mod tests {
         let reason = crate::experimental_api::ExperimentalApi::experimental_reason(&Config {
             model: None,
             review_model: None,
+            review_provider: None,
+            compact_model: None,
+            compact_provider: None,
             model_context_window: None,
             model_auto_compact_token_limit: None,
             model_provider: None,
@@ -9319,6 +9331,9 @@ mod tests {
         let reason = crate::experimental_api::ExperimentalApi::experimental_reason(&Config {
             model: None,
             review_model: None,
+            review_provider: None,
+            compact_model: None,
+            compact_provider: None,
             model_context_window: None,
             model_auto_compact_token_limit: None,
             model_provider: None,
@@ -9361,6 +9376,45 @@ mod tests {
         });
 
         assert_eq!(reason, Some("config/read.approvalsReviewer"));
+    }
+
+    #[test]
+    fn config_review_and_compact_provider_overrides_round_trip() {
+        // Snake_case JSON, matching the rest of the v2 Config schema (see
+        // commit bfb4d5710b which added Config typing in snake_case).
+        let raw = json!({
+            "review_model": "gemma4:26b",
+            "review_provider": "ollama",
+            "compact_model": "gemma4:26b",
+            "compact_provider": "ollama",
+        });
+
+        let parsed: Config =
+            serde_json::from_value(raw.clone()).expect("snake_case Config should deserialize");
+        assert_eq!(parsed.review_model.as_deref(), Some("gemma4:26b"));
+        assert_eq!(parsed.review_provider.as_deref(), Some("ollama"));
+        assert_eq!(parsed.compact_model.as_deref(), Some("gemma4:26b"));
+        assert_eq!(parsed.compact_provider.as_deref(), Some("ollama"));
+        assert!(
+            parsed.additional.is_empty(),
+            "new fields must not fall through to `additional`: {:?}",
+            parsed.additional
+        );
+
+        let reserialized =
+            serde_json::to_value(&parsed).expect("Config should reserialize cleanly");
+        for key in [
+            "review_model",
+            "review_provider",
+            "compact_model",
+            "compact_provider",
+        ] {
+            assert_eq!(
+                reserialized.get(key),
+                raw.get(key),
+                "round-trip drift for `{key}`"
+            );
+        }
     }
 
     #[test]

@@ -7070,9 +7070,18 @@ impl CodexMessageProcessor {
                 })?
         };
 
-        let mut config = self.config.as_ref().clone();
-        if let Some(review_model) = &config.review_model {
-            config.model = Some(review_model.clone());
+        let mut config: Config = parent_thread.effective_config().await.as_ref().clone();
+        if let Some(review_model) = config.review_model.clone() {
+            config.model = Some(review_model);
+        }
+        if let Some(review_provider) = config.review_provider.clone() {
+            codex_core::config::apply_provider_override(&mut config, &review_provider).map_err(
+                |err| JSONRPCErrorError {
+                    code: INVALID_REQUEST_ERROR_CODE,
+                    message: format!("invalid review_provider: {err}"),
+                    data: None,
+                },
+            )?;
         }
 
         let NewThread {

@@ -8899,6 +8899,54 @@ review_provider = "ollama"
     );
 }
 
+/// Behavioural mirror of the detached `/review` fork in
+/// `codex-rs/app-server/src/codex_message_processor.rs::start_detached_review`:
+/// the forked config must come from the parent thread's *effective* `Config`
+/// (not the process-baseline `self.config`), so any `review_provider` set via
+/// thread-scoped layers reaches `ThreadManager::fork_thread`. Mirrors the
+/// fork-time body without spinning up a real `ThreadManager`.
+#[tokio::test]
+async fn detached_review_fork_inherits_review_provider_from_parent_effective_config() {
+    let cfg: ConfigToml = toml::from_str(
+        r#"
+review_model    = "gemma4:26b"
+review_provider = "ollama"
+"#,
+    )
+    .expect("TOML deserialization should succeed");
+    // The "parent thread's effective config" — what `CodexThread::effective_config()`
+    // would hand back. The detached path clones this rather than `self.config`.
+    let parent_effective_config = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides::default(),
+        tempdir().expect("tempdir").abs(),
+    )
+    .await
+    .expect("config should load");
+
+    assert_ne!(
+        parent_effective_config.model_provider_id, OLLAMA_OSS_PROVIDER_ID,
+        "test fixture parent must not already be on ollama"
+    );
+
+    // Replicate the detached fork body in `start_detached_review`.
+    let mut config = parent_effective_config.clone();
+    if let Some(review_model) = config.review_model.clone() {
+        config.model = Some(review_model);
+    }
+    if let Some(review_provider) = config.review_provider.clone() {
+        super::apply_provider_override(&mut config, &review_provider)
+            .expect("override should succeed for built-in ollama provider");
+    }
+
+    assert_eq!(config.model.as_deref(), Some("gemma4:26b"));
+    assert_eq!(config.model_provider_id, OLLAMA_OSS_PROVIDER_ID);
+    assert_ne!(
+        config.model_provider, parent_effective_config.model_provider,
+        "forked review thread provider must differ from parent provider"
+    );
+}
+
 /// Behavioural mirror of the interactive `/review` provider resolution in
 /// `crate::session::review::spawn_review_thread`: when `review_provider`
 /// is set and that provider lacks web-search / image-gen / namespace-tool

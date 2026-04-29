@@ -862,6 +862,8 @@ Example request/response:
 
 For a detached review, use `"delivery": "detached"`. The response is the same shape, but `reviewThreadId` will be the id of the new review thread (different from the original `threadId`). The server also emits a `thread/started` notification for that new thread before streaming the review turn.
 
+Detached reviews fork from the parent thread's effective `Config`. If the parent's config sets `review_model` and/or `review_provider` (siblings to the existing model/provider knobs, exposed alongside `compact_model`/`compact_provider` in the v2 `Config` schema), the review thread inherits those overrides — `review_provider` rebinds both `model_provider_id` and `model_provider` so the review runs against the configured backend.
+
 Codex streams the usual `turn/started` notification followed by an `item/started`
 with an `enteredReviewMode` item so clients can show progress:
 
