@@ -25,6 +25,7 @@ use codex_protocol::items::TurnItem;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::TurnStartedEvent;
@@ -167,9 +168,31 @@ async fn run_compact_task_inner_impl(
 
     let mut truncated_count = 0usize;
 
-    let max_retries = turn_context.provider.info().stream_max_retries();
+    // When `compact_model` (and optionally `compact_provider`) is configured,
+    // compaction routes through a dedicated `ModelClient` and `ModelInfo`
+    // wired up at `Session::new`. Falling back to the parent `ModelClient` /
+    // `turn_context.model_info` preserves the historical behaviour when no
+    // override is set.
+    //
+    // Telemetry intentionally remains bound to `turn_context.session_telemetry`:
+    // the parent owns the rollout and the compaction call should still report
+    // under the parent's session telemetry even if the model differs.
+    let compact_client = sess
+        .services
+        .compact_model_client
+        .as_deref()
+        .unwrap_or(&sess.services.model_client);
+    let compact_model_info = sess
+        .services
+        .compact_model_info
+        .as_ref()
+        .unwrap_or(&turn_context.model_info);
+    let max_retries = sess
+        .services
+        .compact_stream_max_retries
+        .unwrap_or_else(|| turn_context.provider.info().stream_max_retries());
     let mut retries = 0;
-    let mut client_session = sess.services.model_client.new_session();
+    let mut client_session = compact_client.new_session();
     // Reuse one client session so turn-scoped state (sticky routing, websocket incremental
     // request tracking)
     // survives retries within this compact turn.
@@ -178,7 +201,7 @@ async fn run_compact_task_inner_impl(
         // Clone is required because of the loop
         let turn_input = history
             .clone()
-            .for_prompt(&turn_context.model_info.input_modalities);
+            .for_prompt(&compact_model_info.input_modalities);
         let turn_input_len = turn_input.len();
         let prompt = Prompt {
             input: turn_input,
@@ -191,6 +214,7 @@ async fn run_compact_task_inner_impl(
             &sess,
             turn_context.as_ref(),
             &mut client_session,
+            compact_model_info,
             turn_metadata_header.as_deref(),
             &prompt,
         )
@@ -520,13 +544,18 @@ async fn drain_to_completed(
     sess: &Session,
     turn_context: &TurnContext,
     client_session: &mut ModelClientSession,
+    compact_model_info: &ModelInfo,
     turn_metadata_header: Option<&str>,
     prompt: &Prompt,
 ) -> CodexResult<()> {
+    // `compact_model_info` is the override resolved at session start (or the
+    // parent's `turn_context.model_info` when no override is configured) —
+    // sending the same slug whose `input_modalities` shaped the prompt avoids
+    // mismatched wire model names on the compaction call.
     let mut stream = client_session
         .stream(
             prompt,
-            &turn_context.model_info,
+            compact_model_info,
             &turn_context.session_telemetry,
             turn_context.reasoning_effort,
             turn_context.reasoning_summary,

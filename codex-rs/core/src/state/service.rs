@@ -22,6 +22,7 @@ use codex_login::AuthManager;
 use codex_mcp::McpConnectionManager;
 use codex_models_manager::manager::SharedModelsManager;
 use codex_otel::SessionTelemetry;
+use codex_protocol::openai_models::ModelInfo;
 use codex_rollout::state_db::StateDbHandle;
 use codex_rollout_trace::ThreadTraceContext;
 use codex_thread_store::LiveThread;
@@ -67,6 +68,20 @@ pub(crate) struct SessionServices {
     pub(crate) thread_store: Arc<dyn ThreadStore>,
     /// Session-scoped model client shared across turns.
     pub(crate) model_client: ModelClient,
+    /// When `compact_model` (and optionally `compact_provider`) is configured,
+    /// compaction routes through this dedicated `ModelClient` instead of
+    /// `model_client`. The `ModelClient` is bound at session construction and
+    /// cannot be retargeted later via `TurnContext.provider`, so the override
+    /// must be built up-front in `Session::new`.
+    pub(crate) compact_model_client: Option<Arc<ModelClient>>,
+    /// `ModelInfo` resolved against the override `compact_model` (when set).
+    /// Used so the wire model name matches the slug whose `input_modalities`
+    /// shape the compaction prompt.
+    pub(crate) compact_model_info: Option<ModelInfo>,
+    /// Cached `stream_max_retries()` from the override provider so the
+    /// compaction call site does not need an `info()` accessor on the
+    /// dedicated client.
+    pub(crate) compact_stream_max_retries: Option<u64>,
     pub(crate) code_mode_service: CodeModeService,
     /// Shared process-level environment registry. Sessions carry an `Arc` handle so they can pass
     /// the same manager through child-thread spawn paths without reconstructing it.

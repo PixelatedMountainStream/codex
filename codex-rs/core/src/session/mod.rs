@@ -870,6 +870,41 @@ impl Session {
     /// `ModelClient` is session-scoped and intentionally does not depend on the full `Config`, so
     /// we precompute the comma-separated list of enabled experimental feature keys at session
     /// creation time and thread it into the client.
+    /// Builds a session-scoped `ModelClient` and applies the same
+    /// post-construction `set_window_generation` step the default client
+    /// receives.
+    ///
+    /// Used for both the default session client and the optional compaction
+    /// override so the two construction sites cannot drift on argument lists
+    /// or post-construction wiring.
+    #[allow(clippy::too_many_arguments)]
+    fn build_session_model_client(
+        provider_info: ModelProviderInfo,
+        auth_manager: Arc<AuthManager>,
+        conversation_id: ThreadId,
+        installation_id: String,
+        session_source: SessionSource,
+        model_verbosity: Option<codex_protocol::config_types::Verbosity>,
+        enable_request_compression: bool,
+        runtime_metrics: bool,
+        beta_features_header: Option<String>,
+        window_generation: u64,
+    ) -> ModelClient {
+        let client = ModelClient::new(
+            Some(auth_manager),
+            conversation_id,
+            installation_id,
+            provider_info,
+            session_source,
+            model_verbosity,
+            enable_request_compression,
+            runtime_metrics,
+            beta_features_header,
+        );
+        client.set_window_generation(window_generation);
+        client
+    }
+
     fn build_model_client_beta_features_header(config: &Config) -> Option<String> {
         let beta_features_header = FEATURES
             .iter()

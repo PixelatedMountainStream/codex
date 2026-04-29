@@ -3509,6 +3509,9 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
             config.features.enabled(Feature::RuntimeMetrics),
             Session::build_model_client_beta_features_header(config.as_ref()),
         ),
+        compact_model_client: None,
+        compact_model_info: None,
+        compact_stream_max_retries: None,
         code_mode_service: crate::tools::code_mode::CodeModeService::new(),
         environment_manager: Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
     };
@@ -3571,6 +3574,71 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
     };
 
     (session, turn_context)
+}
+
+#[tokio::test]
+async fn compact_override_provisions_dedicated_client_and_model_info() -> anyhow::Result<()> {
+    use codex_model_provider_info::ModelProviderInfo;
+    use codex_model_provider_info::WireApi;
+
+    let override_provider = ModelProviderInfo {
+        name: "Local".into(),
+        base_url: Some("http://127.0.0.1:11434/v1".into()),
+        env_key: None,
+        env_key_instructions: None,
+        experimental_bearer_token: None,
+        auth: None,
+        aws: None,
+        wire_api: WireApi::Responses,
+        query_params: None,
+        http_headers: None,
+        env_http_headers: None,
+        request_max_retries: None,
+        // Pin a non-default value so the cache can be asserted distinctly.
+        stream_max_retries: Some(7),
+        stream_idle_timeout_ms: None,
+        websocket_connect_timeout_ms: None,
+        requires_openai_auth: false,
+        supports_websockets: false,
+    };
+    let expected_max_retries = override_provider.stream_max_retries();
+    let session = make_session_with_config(move |config| {
+        config
+            .model_providers
+            .insert("local-test".to_string(), override_provider.clone());
+        config.compact_model = Some("compact-test-slug".to_string());
+        config.compact_provider = Some("local-test".to_string());
+    })
+    .await?;
+
+    assert!(
+        session.services.compact_model_client.is_some(),
+        "compact_model_client should be wired when compact_model is configured",
+    );
+    let info = session
+        .services
+        .compact_model_info
+        .as_ref()
+        .expect("compact_model_info should be populated");
+    assert_eq!(
+        info.slug, "compact-test-slug",
+        "override ModelInfo slug should be the compact_model slug",
+    );
+    assert_eq!(
+        session.services.compact_stream_max_retries,
+        Some(expected_max_retries),
+        "compact_stream_max_retries should mirror the override provider's policy",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn compact_override_absent_when_compact_model_unset() -> anyhow::Result<()> {
+    let session = make_session_with_config(|_config| {}).await?;
+    assert!(session.services.compact_model_client.is_none());
+    assert!(session.services.compact_model_info.is_none());
+    assert!(session.services.compact_stream_max_retries.is_none());
+    Ok(())
 }
 
 async fn make_session_with_config(
@@ -4903,6 +4971,9 @@ where
             config.features.enabled(Feature::RuntimeMetrics),
             Session::build_model_client_beta_features_header(config.as_ref()),
         ),
+        compact_model_client: None,
+        compact_model_info: None,
+        compact_stream_max_retries: None,
         code_mode_service: crate::tools::code_mode::CodeModeService::new(),
         environment_manager: Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
     };

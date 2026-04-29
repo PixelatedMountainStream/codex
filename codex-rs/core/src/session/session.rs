@@ -786,6 +786,73 @@ impl Session {
                     config.analytics_enabled,
                 )
             });
+
+            // Build the default session model client. The override (if any) is
+            // built immediately after using the same helper, so both clients
+            // stay in lockstep on every constructor argument.
+            let default_model_client = Self::build_session_model_client(
+                session_configuration.provider.clone(),
+                Arc::clone(&auth_manager),
+                conversation_id,
+                installation_id.clone(),
+                session_configuration.session_source.clone(),
+                config.model_verbosity,
+                config.features.enabled(Feature::EnableRequestCompression),
+                config.features.enabled(Feature::RuntimeMetrics),
+                Self::build_model_client_beta_features_header(config.as_ref()),
+                window_generation,
+            );
+
+            // When `compact_model` is configured (the pair-rule already
+            // ensures `compact_provider`-without-`compact_model` is rejected
+            // at config-load time), construct a dedicated `ModelClient` and
+            // resolve a matching `ModelInfo` so that compaction sends the
+            // override slug to the wire it was modality-derived from.
+            let (compact_model_client, compact_model_info, compact_stream_max_retries) =
+                if let Some(compact_model) = config.compact_model.as_deref() {
+                    let provider_info = if let Some(compact_provider_id) =
+                        config.compact_provider.as_deref()
+                    {
+                        match config.model_providers.get(compact_provider_id) {
+                            Some(info) => info.clone(),
+                            None => {
+                                tracing::error!(
+                                    "compact_provider '{compact_provider_id}' is not present in \
+                                     model_providers; falling back to parent provider for compaction"
+                                );
+                                session_configuration.provider.clone()
+                            }
+                        }
+                    } else {
+                        session_configuration.provider.clone()
+                    };
+
+                    let compact_info = models_manager
+                        .get_model_info(compact_model, &config.to_models_manager_config())
+                        .await;
+
+                    let stream_max_retries = provider_info.stream_max_retries();
+
+                    let client = Self::build_session_model_client(
+                        provider_info,
+                        Arc::clone(&auth_manager),
+                        conversation_id,
+                        installation_id.clone(),
+                        session_configuration.session_source.clone(),
+                        config.model_verbosity,
+                        config.features.enabled(Feature::EnableRequestCompression),
+                        config.features.enabled(Feature::RuntimeMetrics),
+                        Self::build_model_client_beta_features_header(config.as_ref()),
+                        window_generation,
+                    );
+                    (
+                        Some(Arc::new(client)),
+                        Some(compact_info),
+                        Some(stream_max_retries),
+                    )
+                } else {
+                    (None, None, None)
+                };
             let services = SessionServices {
                 // Initialize the MCP connection manager with an uninitialized
                 // instance. It will be replaced with one created via
@@ -828,23 +895,13 @@ impl Session {
                 state_db: state_db_ctx.clone(),
                 live_thread: live_thread_init.as_ref().cloned(),
                 thread_store: Arc::clone(&thread_store),
-                model_client: ModelClient::new(
-                    Some(Arc::clone(&auth_manager)),
-                    conversation_id,
-                    installation_id,
-                    session_configuration.provider.clone(),
-                    session_configuration.session_source.clone(),
-                    config.model_verbosity,
-                    config.features.enabled(Feature::EnableRequestCompression),
-                    config.features.enabled(Feature::RuntimeMetrics),
-                    Self::build_model_client_beta_features_header(config.as_ref()),
-                ),
+                model_client: default_model_client,
+                compact_model_client,
+                compact_model_info,
+                compact_stream_max_retries,
                 code_mode_service: crate::tools::code_mode::CodeModeService::new(),
                 environment_manager,
             };
-            services
-                .model_client
-                .set_window_generation(window_generation);
             let (out_of_band_elicitation_paused, _out_of_band_elicitation_paused_rx) =
                 watch::channel(false);
 
