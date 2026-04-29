@@ -171,11 +171,12 @@ impl MemoryStartupContext {
     ) -> anyhow::Result<(String, Option<TokenUsage>)> {
         let installation_id = resolve_installation_id(&config.codex_home).await?;
         let session_source = self.thread.config_snapshot().await.session_source;
+        let model_provider = resolve_extract_provider(config)?;
         let model_client = ModelClient::new(
             Some(Arc::clone(&self.auth_manager)),
             self.thread_id,
             installation_id,
-            config.model_provider.clone(),
+            model_provider,
             session_source,
             config.model_verbosity,
             config.features.enabled(Feature::EnableRequestCompression),
@@ -289,5 +290,79 @@ impl MemoryStartupContext {
             })??;
 
         Ok(())
+    }
+}
+
+/// Resolve the `ModelProviderInfo` to use for the phase-1 (extract) one-shot
+/// `ModelClient`. When `memories.extract_provider` is set, look it up in the
+/// merged provider map; otherwise fall back to the active session provider.
+pub fn resolve_extract_provider(
+    config: &Config,
+) -> anyhow::Result<codex_model_provider_info::ModelProviderInfo> {
+    match config.memories.extract_provider.as_deref() {
+        Some(provider_id) => config
+            .model_providers
+            .get(provider_id)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unknown memories.extract_provider '{provider_id}' (not present in model_providers)"
+                )
+            }),
+        None => Ok(config.model_provider.clone()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_model_provider_info::OLLAMA_OSS_PROVIDER_ID;
+    use core_test_support::load_default_config_for_test;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn resolve_extract_provider_returns_session_provider_when_unset() {
+        let codex_home = tempdir().expect("tempdir");
+        let config = load_default_config_for_test(&codex_home).await;
+        assert!(config.memories.extract_provider.is_none());
+
+        let resolved = resolve_extract_provider(&config).expect("resolve should succeed");
+        assert_eq!(resolved, config.model_provider);
+    }
+
+    #[tokio::test]
+    async fn resolve_extract_provider_returns_override_provider_info() {
+        let codex_home = tempdir().expect("tempdir");
+        let mut config = load_default_config_for_test(&codex_home).await;
+        // Sanity check — the default fixture must not already be on ollama.
+        assert_ne!(config.model_provider_id, OLLAMA_OSS_PROVIDER_ID);
+        let expected = config
+            .model_providers
+            .get(OLLAMA_OSS_PROVIDER_ID)
+            .cloned()
+            .expect("ollama provider must be a registered built-in");
+
+        config.memories.extract_provider = Some(OLLAMA_OSS_PROVIDER_ID.to_string());
+
+        let resolved = resolve_extract_provider(&config).expect("resolve should succeed");
+        assert_eq!(resolved, expected);
+        assert_ne!(
+            resolved, config.model_provider,
+            "override must differ from the parent session provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_extract_provider_unknown_id_errors() {
+        let codex_home = tempdir().expect("tempdir");
+        let mut config = load_default_config_for_test(&codex_home).await;
+        config.memories.extract_provider = Some("definitely-not-a-real-provider".to_string());
+
+        let err =
+            resolve_extract_provider(&config).expect_err("unknown provider should be rejected");
+        assert!(
+            err.to_string().contains("unknown memories.extract_provider"),
+            "unexpected error: {err}"
+        );
     }
 }

@@ -336,6 +336,15 @@ mod agent {
                 .clone()
                 .unwrap_or(crate::stage_two::MODEL.to_string()),
         );
+        if let Some(provider_id) = config.memories.consolidation_provider.as_deref()
+            && let Err(err) =
+                codex_core::config::apply_provider_override(&mut agent_config, provider_id)
+        {
+            tracing::error!(
+                "failed to apply memories.consolidation_provider '{provider_id}': {err}"
+            );
+            return None;
+        }
         agent_config.model_reasoning_effort = Some(crate::stage_two::REASONING_EFFORT);
 
         Some(agent_config)
@@ -566,4 +575,63 @@ fn emit_token_usage_metrics(context: &MemoryStartupContext, token_usage: &TokenU
         token_usage.reasoning_output_tokens.max(0),
         &[("token_type", "reasoning_output")],
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_model_provider_info::OLLAMA_OSS_PROVIDER_ID;
+    use core_test_support::load_default_config_for_test;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn agent_get_config_applies_consolidation_provider_override() {
+        let codex_home = tempdir().expect("tempdir");
+        let mut config = load_default_config_for_test(&codex_home).await;
+        // Sanity check — the default fixture must not already be on ollama.
+        assert_ne!(config.model_provider_id, OLLAMA_OSS_PROVIDER_ID);
+        let expected_provider_info = config
+            .model_providers
+            .get(OLLAMA_OSS_PROVIDER_ID)
+            .cloned()
+            .expect("ollama provider must be a registered built-in");
+
+        config.memories.consolidation_model = Some("gemma3:27b".to_string());
+        config.memories.consolidation_provider = Some(OLLAMA_OSS_PROVIDER_ID.to_string());
+
+        let agent_config =
+            agent::get_config(&config).expect("agent config should build with valid override");
+
+        assert_eq!(agent_config.model.as_deref(), Some("gemma3:27b"));
+        assert_eq!(agent_config.model_provider_id, OLLAMA_OSS_PROVIDER_ID);
+        assert_eq!(agent_config.model_provider, expected_provider_info);
+    }
+
+    #[tokio::test]
+    async fn agent_get_config_without_override_leaves_provider_untouched() {
+        let codex_home = tempdir().expect("tempdir");
+        let mut config = load_default_config_for_test(&codex_home).await;
+        config.memories.consolidation_model = Some("gpt-5".to_string());
+        // No consolidation_provider set.
+
+        let parent_provider_id = config.model_provider_id.clone();
+        let parent_provider_info = config.model_provider.clone();
+
+        let agent_config = agent::get_config(&config).expect("agent config should build");
+
+        assert_eq!(agent_config.model_provider_id, parent_provider_id);
+        assert_eq!(agent_config.model_provider, parent_provider_info);
+    }
+
+    #[tokio::test]
+    async fn agent_get_config_returns_none_for_unknown_consolidation_provider() {
+        let codex_home = tempdir().expect("tempdir");
+        let mut config = load_default_config_for_test(&codex_home).await;
+        config.memories.consolidation_model = Some("gemma3:27b".to_string());
+        config.memories.consolidation_provider =
+            Some("definitely-not-a-real-provider".to_string());
+
+        let result = agent::get_config(&config);
+        assert!(result.is_none(), "unknown provider must surface as None");
+    }
 }

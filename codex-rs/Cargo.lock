@@ -2994,6 +2994,7 @@ dependencies = [
  "codex-features",
  "codex-git-utils",
  "codex-login",
+ "codex-model-provider-info",
  "codex-models-manager",
  "codex-otel",
  "codex-protocol",
