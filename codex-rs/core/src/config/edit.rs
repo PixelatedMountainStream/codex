@@ -534,14 +534,10 @@ impl ConfigDocument {
                 let mut mutated = false;
                 mutated |= self.write_profile_value(
                     &["model_provider"],
-                    provider_id
-                        .as_ref()
-                        .map(|p| value(p.clone())),
+                    provider_id.as_ref().map(|p| value(p.clone())),
                 );
-                mutated |= self.write_profile_value(
-                    &["model"],
-                    model.as_ref().map(|m| value(m.clone())),
-                );
+                mutated |=
+                    self.write_profile_value(&["model"], model.as_ref().map(|m| value(m.clone())));
                 mutated |= self.write_profile_value(
                     &["model_reasoning_effort"],
                     effort.map(|e| value(e.to_string())),

@@ -628,8 +628,7 @@ mod tests {
         let codex_home = tempdir().expect("tempdir");
         let mut config = load_default_config_for_test(&codex_home).await;
         config.memories.consolidation_model = Some("gemma3:27b".to_string());
-        config.memories.consolidation_provider =
-            Some("definitely-not-a-real-provider".to_string());
+        config.memories.consolidation_provider = Some("definitely-not-a-real-provider".to_string());
 
         let result = agent::get_config(&config);
         assert!(result.is_none(), "unknown provider must surface as None");

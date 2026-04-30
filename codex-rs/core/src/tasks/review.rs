@@ -124,7 +124,9 @@ async fn start_review_conversation(
         && let Err(err) =
             crate::config::apply_provider_override(&mut sub_agent_config, &review_provider)
     {
-        tracing::error!("failed to apply review_provider '{review_provider}' for inline review: {err}");
+        tracing::error!(
+            "failed to apply review_provider '{review_provider}' for inline review: {err}"
+        );
         return None;
     }
     (run_codex_thread_one_shot(

@@ -2548,7 +2548,11 @@ async fn turn_context_with_model_updates_model_fields() {
     let (session, mut turn_context) = make_session_and_context().await;
     turn_context.reasoning_effort = Some(ReasoningEffortConfig::Minimal);
     let updated = turn_context
-        .with_model("gpt-5.4".to_string(), /*provider*/ None, &session.services.models_manager)
+        .with_model(
+            "gpt-5.4".to_string(),
+            /*provider*/ None,
+            &session.services.models_manager,
+        )
         .await;
     let expected_model_info = session
         .services
@@ -6058,7 +6062,11 @@ async fn record_context_updates_and_set_reference_context_item_persists_baseline
         "gpt-5.4"
     };
     let turn_context = previous_context
-        .with_model(next_model.to_string(), /*provider*/ None, &session.services.models_manager)
+        .with_model(
+            next_model.to_string(),
+            /*provider*/ None,
+            &session.services.models_manager,
+        )
         .await;
     let previous_context_item = previous_context.to_turn_context_item();
     {
@@ -6174,7 +6182,11 @@ async fn record_context_updates_and_set_reference_context_item_persists_full_rei
         "gpt-5.4"
     };
     let turn_context = previous_context
-        .with_model(next_model.to_string(), /*provider*/ None, &session.services.models_manager)
+        .with_model(
+            next_model.to_string(),
+            /*provider*/ None,
+            &session.services.models_manager,
+        )
         .await;
     let rollout_path = attach_thread_persistence(&mut session).await;
 

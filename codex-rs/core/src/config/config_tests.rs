@@ -8834,8 +8834,7 @@ review_model    = "gemma4:26b"
     .unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("review_provider")
-            && msg.contains("not present in model_providers"),
+        msg.contains("review_provider") && msg.contains("not present in model_providers"),
         "unexpected error: {err}"
     );
 }
@@ -8859,8 +8858,7 @@ extract_model    = "gemma4:26b"
     .unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("memories.extract_provider")
-            && msg.contains("not present in model_providers"),
+        msg.contains("memories.extract_provider") && msg.contains("not present in model_providers"),
         "unexpected error: {err}"
     );
 }
@@ -8924,8 +8922,7 @@ async fn apply_provider_override_known_id_mutates_both_provider_fields() {
     let original_id = config.model_provider_id.clone();
     let original_info = config.model_provider.clone();
     assert_ne!(
-        original_id,
-        OLLAMA_OSS_PROVIDER_ID,
+        original_id, OLLAMA_OSS_PROVIDER_ID,
         "test fixture must not start on ollama"
     );
 

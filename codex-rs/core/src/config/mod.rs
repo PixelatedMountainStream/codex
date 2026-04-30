@@ -1396,10 +1396,7 @@ pub(crate) fn set_project_trust_level_inner(
 /// `provider_id` in `config.model_providers`. Both `model_provider_id` and
 /// `model_provider` move together so downstream `ModelClient` construction sees
 /// a consistent provider.
-pub fn apply_provider_override(
-    config: &mut Config,
-    provider_id: &str,
-) -> anyhow::Result<()> {
+pub fn apply_provider_override(config: &mut Config, provider_id: &str) -> anyhow::Result<()> {
     let info = config
         .model_providers
         .get(provider_id)

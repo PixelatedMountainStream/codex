@@ -351,7 +351,9 @@ impl ModelClient {
     }
 
     pub(crate) fn window_generation(&self) -> u64 {
-        self.state.window_generation.load(std::sync::atomic::Ordering::Relaxed)
+        self.state
+            .window_generation
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub(crate) fn set_window_generation(&self, window_generation: u64) {

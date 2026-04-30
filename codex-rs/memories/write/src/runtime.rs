@@ -361,7 +361,8 @@ mod tests {
         let err =
             resolve_extract_provider(&config).expect_err("unknown provider should be rejected");
         assert!(
-            err.to_string().contains("unknown memories.extract_provider"),
+            err.to_string()
+                .contains("unknown memories.extract_provider"),
             "unexpected error: {err}"
         );
     }

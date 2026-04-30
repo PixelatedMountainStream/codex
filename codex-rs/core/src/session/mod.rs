@@ -1446,9 +1446,10 @@ impl Session {
             )
         };
 
-        let state = self.state.lock().await;
-        let session_source = state.session_configuration.session_source.clone();
-        drop(state);
+        let session_source = {
+            let state = self.state.lock().await;
+            state.session_configuration.session_source.clone()
+        };
 
         let config_ref = &cfg;
         let new_client = Session::build_session_model_client(
