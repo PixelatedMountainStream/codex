@@ -1435,6 +1435,11 @@ impl Session {
 
         let new_provider = cfg.model_provider.clone();
 
+        // Invalidate any in-flight or cached prewarmed `ModelClientSession` —
+        // it was bound to the previous provider's endpoint. The next turn will
+        // create a fresh session from the swapped client.
+        let _ = self.take_session_startup_prewarm().await;
+
         // Snapshot construction params from the existing client (no lock held
         // across an await — clone is cheap; Arc<ModelClientState> is shared).
         let (conversation_id, installation_id, window_gen) = {
@@ -1453,7 +1458,7 @@ impl Session {
 
         let config_ref = &cfg;
         let new_client = Session::build_session_model_client(
-            new_provider,
+            new_provider.clone(),
             Arc::clone(&self.services.auth_manager),
             conversation_id,
             installation_id,
@@ -1469,7 +1474,19 @@ impl Session {
             window_gen,
         );
 
+        // Update the wire client AND the session-scoped provider together.
+        // Leaving `state.session_configuration.provider` (or `.original_config_do_not_use`)
+        // pointing at the old provider would cause subsequent `TurnContext`
+        // construction to read stale capabilities, retry budgets, telemetry,
+        // and remote-compact routing — even though HTTP traffic correctly
+        // hits the new endpoint. This matters for the
+        // `model_provider_id ↔ model_provider` invariant the rest of the
+        // codebase relies on.
         *self.services.model_client.lock().await = new_client;
+        let new_config = Arc::new(cfg);
+        let mut state = self.state.lock().await;
+        state.session_configuration.provider = new_provider;
+        state.session_configuration.original_config_do_not_use = new_config;
         Ok(())
     }
 

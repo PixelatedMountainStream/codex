@@ -6,20 +6,25 @@ use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::openai_models::ReasoningEffortPreset;
 use std::convert::Infallible;
 
+const OLLAMA_PROVIDER_ID: &str = "ollama";
+
 #[derive(Debug, Clone)]
 pub(crate) struct ModelCatalog {
     models: Vec<ModelPreset>,
     collaboration_modes_config: CollaborationModesConfig,
+    configured_provider_ids: Vec<String>,
 }
 
 impl ModelCatalog {
     pub(crate) fn new(
         models: Vec<ModelPreset>,
         collaboration_modes_config: CollaborationModesConfig,
+        configured_provider_ids: Vec<String>,
     ) -> Self {
         Self {
             models,
             collaboration_modes_config,
+            configured_provider_ids,
         }
     }
 
@@ -28,7 +33,16 @@ impl ModelCatalog {
         // Milestone-1 stub: one hard-coded local Ollama preset so the provider
         // switching pipeline can be validated end-to-end before real catalog
         // discovery (fetch_local_presets) ships in Milestone 2.
-        models.push(local_ollama_gemma4_preset());
+        // Only surfaced when the running config actually has an `ollama`
+        // entry in its merged provider map — otherwise selecting it would
+        // fail at runtime with an unknown-provider error.
+        if self
+            .configured_provider_ids
+            .iter()
+            .any(|id| id == OLLAMA_PROVIDER_ID)
+        {
+            models.push(local_ollama_gemma4_preset());
+        }
         Ok(models)
     }
 
@@ -77,7 +91,7 @@ mod tests {
         let collaboration_modes_config = CollaborationModesConfig {
             default_mode_request_user_input: true,
         };
-        let catalog = ModelCatalog::new(Vec::new(), collaboration_modes_config);
+        let catalog = ModelCatalog::new(Vec::new(), collaboration_modes_config, Vec::new());
 
         assert_eq!(
             catalog.list_collaboration_modes(),

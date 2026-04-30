@@ -135,6 +135,7 @@ pub(super) fn test_model_catalog(config: &Config) -> Arc<ModelCatalog> {
     Arc::new(ModelCatalog::new(
         crate::legacy_core::test_support::all_model_presets().clone(),
         collaboration_modes_config,
+        Vec::new(),
     ))
 }
 
@@ -429,6 +430,8 @@ pub(crate) fn set_fast_mode_test_catalog(chat: &mut ChatWidget) {
     .map(Into::into)
     .collect();
 
+    let configured_provider_ids: Vec<String> =
+        chat.config.model_providers.keys().cloned().collect();
     chat.model_catalog = Arc::new(ModelCatalog::new(
         models,
         CollaborationModesConfig {
@@ -437,6 +440,7 @@ pub(crate) fn set_fast_mode_test_catalog(chat: &mut ChatWidget) {
                 .features
                 .enabled(Feature::DefaultModeRequestUserInput),
         },
+        configured_provider_ids,
     ));
 }
 

@@ -743,6 +743,8 @@ impl App {
         if let Some(updated_model) = config.model.clone() {
             model = updated_model;
         }
+        let configured_provider_ids: Vec<String> =
+            config.model_providers.keys().cloned().collect();
         let model_catalog = Arc::new(ModelCatalog::new(
             available_models.clone(),
             CollaborationModesConfig {
@@ -750,6 +752,7 @@ impl App {
                     .features
                     .enabled(Feature::DefaultModeRequestUserInput),
             },
+            configured_provider_ids,
         ));
         let feedback_audience = bootstrap.feedback_audience;
         let auth_mode = bootstrap.auth_mode;
