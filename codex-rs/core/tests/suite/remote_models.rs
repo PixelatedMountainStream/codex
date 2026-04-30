@@ -606,6 +606,7 @@ async fn remote_models_remote_model_uses_unified_exec() -> Result<()> {
             service_tier: None,
             collaboration_mode: None,
             personality: None,
+            model_provider_id: None,
         })
         .await?;
 
@@ -856,6 +857,7 @@ async fn remote_models_apply_remote_base_instructions() -> Result<()> {
             service_tier: None,
             collaboration_mode: None,
             personality: None,
+            model_provider_id: None,
         })
         .await?;
 

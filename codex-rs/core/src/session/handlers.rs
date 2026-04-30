@@ -98,7 +98,32 @@ pub async fn realtime_conversation_list_voices(sess: &Session, sub_id: String) {
     .await;
 }
 
-pub async fn override_turn_context(sess: &Session, sub_id: String, updates: SessionSettingsUpdate) {
+pub async fn override_turn_context(
+    sess: &Arc<Session>,
+    sub_id: String,
+    updates: SessionSettingsUpdate,
+) {
+    // When the caller requests a provider switch, rebuild `model_client` for
+    // the named provider before applying the rest of the settings update.
+    // `apply_provider_override` is the only place that mutates both provider
+    // fields atomically — do not bypass it.
+    if let Some(provider_id) = &updates.model_provider_id {
+        match sess.swap_model_provider(provider_id).await {
+            Ok(()) => {}
+            Err(err) => {
+                sess.send_event_raw(Event {
+                    id: sub_id,
+                    msg: EventMsg::Error(ErrorEvent {
+                        message: err.to_string(),
+                        codex_error_info: Some(CodexErrorInfo::BadRequest),
+                    }),
+                })
+                .await;
+                return;
+            }
+        }
+    }
+
     if let Err(err) = sess.update_settings(updates).await {
         sess.send_event_raw(Event {
             id: sub_id,
@@ -171,6 +196,7 @@ pub(super) async fn user_input_or_turn_inner(
                     personality,
                     app_server_client_name: None,
                     app_server_client_version: None,
+                    model_provider_id: None,
                 },
                 None,
             )
@@ -221,6 +247,7 @@ pub(super) async fn user_input_or_turn_inner(
                     personality,
                     app_server_client_name: None,
                     app_server_client_version: None,
+                    model_provider_id: None,
                 },
                 responsesapi_client_metadata,
             )
@@ -1029,6 +1056,7 @@ pub(super) async fn submission_loop(
                     service_tier,
                     collaboration_mode,
                     personality,
+                    model_provider_id,
                 } => {
                     let collaboration_mode = if let Some(collab_mode) = collaboration_mode {
                         collab_mode
@@ -1054,6 +1082,7 @@ pub(super) async fn submission_loop(
                             reasoning_summary: summary,
                             service_tier,
                             personality,
+                            model_provider_id,
                             ..Default::default()
                         },
                     )

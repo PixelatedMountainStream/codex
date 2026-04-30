@@ -604,6 +604,8 @@ async fn prepare_realtime_start(
     let auth_manager = sess
         .services
         .model_client
+        .lock()
+        .await
         .auth_manager()
         .unwrap_or_else(|| Arc::clone(&sess.services.auth_manager));
     let auth = auth_manager.auth().await;
@@ -775,7 +777,7 @@ async fn handle_start_inner(
         api_provider,
         extra_headers,
         session_config,
-        model_client: sess.services.model_client.clone(),
+        model_client: sess.services.model_client.lock().await.clone(),
         sdp,
     };
     let start_output = sess.conversation.start(start).await?;

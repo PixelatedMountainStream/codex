@@ -8968,6 +8968,20 @@ impl ChatWidget {
         effort_for_action: Option<ReasoningEffortConfig>,
         should_prompt_plan_mode_scope: bool,
     ) -> Vec<SelectionAction> {
+        Self::model_selection_actions_with_provider(
+            model_for_action,
+            /*provider_id*/ None,
+            effort_for_action,
+            should_prompt_plan_mode_scope,
+        )
+    }
+
+    fn model_selection_actions_with_provider(
+        model_for_action: String,
+        provider_id: Option<String>,
+        effort_for_action: Option<ReasoningEffortConfig>,
+        should_prompt_plan_mode_scope: bool,
+    ) -> Vec<SelectionAction> {
         vec![Box::new(move |tx| {
             if should_prompt_plan_mode_scope {
                 tx.send(AppEvent::OpenPlanReasoningScopePrompt {
@@ -8979,10 +8993,19 @@ impl ChatWidget {
 
             tx.send(AppEvent::UpdateModel(model_for_action.clone()));
             tx.send(AppEvent::UpdateReasoningEffort(effort_for_action));
-            tx.send(AppEvent::PersistModelSelection {
-                model: model_for_action.clone(),
-                effort: effort_for_action,
-            });
+
+            if provider_id.is_some() {
+                tx.send(AppEvent::PersistModelAndProviderSelection {
+                    model: model_for_action.clone(),
+                    provider_id: provider_id.clone(),
+                    effort: effort_for_action,
+                });
+            } else {
+                tx.send(AppEvent::PersistModelSelection {
+                    model: model_for_action.clone(),
+                    effort: effort_for_action,
+                });
+            }
         })]
     }
 
@@ -9096,6 +9119,9 @@ impl ChatWidget {
     pub(crate) fn open_reasoning_popup(&mut self, preset: ModelPreset) {
         let default_effort: ReasoningEffortConfig = preset.default_reasoning_effort;
         let supported = preset.supported_reasoning_efforts;
+        // Carry the provider id through all selection actions so that local
+        // presets (e.g. Ollama) dispatch `PersistModelAndProviderSelection`.
+        let preset_provider_id = preset.provider_id.clone();
         let in_plan_mode =
             self.collaboration_modes_enabled() && self.active_mode_kind() == ModeKind::Plan;
 
@@ -9147,6 +9173,17 @@ impl ChatWidget {
                 self.app_event_tx
                     .send(AppEvent::OpenPlanReasoningScopePrompt {
                         model: selected_model,
+                        effort: selected_effort,
+                    });
+            } else if preset_provider_id.is_some() {
+                self.apply_model_and_effort_without_persist(
+                    selected_model.clone(),
+                    selected_effort,
+                );
+                self.app_event_tx
+                    .send(AppEvent::PersistModelAndProviderSelection {
+                        model: selected_model,
+                        provider_id: preset_provider_id,
                         effort: selected_effort,
                     });
             } else {
@@ -9216,6 +9253,7 @@ impl ChatWidget {
 
             let model_for_action = model_slug.clone();
             let choice_effort = choice.stored;
+            let choice_provider_id = preset_provider_id.clone();
             let should_prompt_plan_mode_scope =
                 self.should_prompt_plan_mode_reasoning_scope(model_slug.as_str(), choice_effort);
             let actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
@@ -9227,10 +9265,18 @@ impl ChatWidget {
                 } else {
                     tx.send(AppEvent::UpdateModel(model_for_action.clone()));
                     tx.send(AppEvent::UpdateReasoningEffort(choice_effort));
-                    tx.send(AppEvent::PersistModelSelection {
-                        model: model_for_action.clone(),
-                        effort: choice_effort,
-                    });
+                    if choice_provider_id.is_some() {
+                        tx.send(AppEvent::PersistModelAndProviderSelection {
+                            model: model_for_action.clone(),
+                            provider_id: choice_provider_id.clone(),
+                            effort: choice_effort,
+                        });
+                    } else {
+                        tx.send(AppEvent::PersistModelSelection {
+                            model: model_for_action.clone(),
+                            effort: choice_effort,
+                        });
+                    }
                 }
             })];
 

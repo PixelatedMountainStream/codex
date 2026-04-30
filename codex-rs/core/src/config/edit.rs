@@ -31,6 +31,15 @@ pub enum ConfigEdit {
         model: Option<String>,
         effort: Option<ReasoningEffort>,
     },
+    /// Update the active model provider, model slug, and optional reasoning effort atomically.
+    ///
+    /// All three keys are written at profile scope, symmetric with [`ConfigEdit::SetModel`].
+    /// `SetModel` is kept for single-purpose call sites that only change the model.
+    SetModelAndProvider {
+        provider_id: Option<String>,
+        model: Option<String>,
+        effort: Option<ReasoningEffort>,
+    },
     /// Update the service tier preference for future turns.
     SetServiceTier { service_tier: Option<ServiceTier> },
     /// Update the active (or default) model personality.
@@ -514,6 +523,28 @@ impl ConfigDocument {
                 mutated |= self.write_profile_value(
                     &["model_reasoning_effort"],
                     effort.map(|effort| value(effort.to_string())),
+                );
+                mutated
+            }),
+            ConfigEdit::SetModelAndProvider {
+                provider_id,
+                model,
+                effort,
+            } => Ok({
+                let mut mutated = false;
+                mutated |= self.write_profile_value(
+                    &["model_provider"],
+                    provider_id
+                        .as_ref()
+                        .map(|p| value(p.clone())),
+                );
+                mutated |= self.write_profile_value(
+                    &["model"],
+                    model.as_ref().map(|m| value(m.clone())),
+                );
+                mutated |= self.write_profile_value(
+                    &["model_reasoning_effort"],
+                    effort.map(|e| value(e.to_string())),
                 );
                 mutated
             }),
@@ -1091,6 +1122,24 @@ impl ConfigEditsBuilder {
 
     pub fn set_model(mut self, model: Option<&str>, effort: Option<ReasoningEffort>) -> Self {
         self.edits.push(ConfigEdit::SetModel {
+            model: model.map(ToOwned::to_owned),
+            effort,
+        });
+        self
+    }
+
+    /// Persist a provider + model + effort selection atomically at profile scope.
+    ///
+    /// All three keys land in the same profile section as [`Self::set_model`].
+    /// Pass `None` for any field you wish to leave unchanged.
+    pub fn set_model_and_provider(
+        mut self,
+        provider_id: Option<&str>,
+        model: Option<&str>,
+        effort: Option<ReasoningEffort>,
+    ) -> Self {
+        self.edits.push(ConfigEdit::SetModelAndProvider {
+            provider_id: provider_id.map(ToOwned::to_owned),
             model: model.map(ToOwned::to_owned),
             effort,
         });

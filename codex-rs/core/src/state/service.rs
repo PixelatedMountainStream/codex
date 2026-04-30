@@ -67,7 +67,11 @@ pub(crate) struct SessionServices {
     pub(crate) live_thread: Option<LiveThread>,
     pub(crate) thread_store: Arc<dyn ThreadStore>,
     /// Session-scoped model client shared across turns.
-    pub(crate) model_client: ModelClient,
+    ///
+    /// Wrapped in a `Mutex` so `override_turn_context` can atomically swap the
+    /// client when the user switches providers via `/model` (no task is active
+    /// at that point, so contention is negligible).
+    pub(crate) model_client: Mutex<ModelClient>,
     /// When `compact_model` (and optionally `compact_provider`) is configured,
     /// compaction routes through this dedicated `ModelClient` instead of
     /// `model_client`. The `ModelClient` is bound at session construction and

@@ -164,9 +164,8 @@ async fn run_remote_compact_task_inner_impl(
         output_schema: None,
         output_schema_strict: true,
     };
-    let mut new_history = sess
-        .services
-        .model_client
+    let primary_client = sess.services.model_client.lock().await.clone();
+    let mut new_history = primary_client
         .compact_conversation_history(
             &prompt,
             &turn_context.model_info,

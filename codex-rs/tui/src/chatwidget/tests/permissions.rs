@@ -318,6 +318,7 @@ async fn approvals_popup_navigation_skips_disabled() {
             AppEvent::CodexOp(Op::OverrideTurnContext {
                 approval_policy: Some(AskForApproval::OnRequest),
                 personality: None,
+                model_provider_id: None,
                 ..
             })
         )),
@@ -329,6 +330,7 @@ async fn approvals_popup_navigation_skips_disabled() {
             AppEvent::CodexOp(Op::OverrideTurnContext {
                 approval_policy: Some(AskForApproval::Never),
                 personality: None,
+                model_provider_id: None,
                 ..
             })
         )),
@@ -717,6 +719,7 @@ async fn permissions_selection_sends_approvals_reviewer_in_override_turn_context
             service_tier: None,
             collaboration_mode: None,
             personality: None,
+            model_provider_id: None,
         }
     );
 }

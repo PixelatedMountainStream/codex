@@ -1673,6 +1673,7 @@ async fn fork_startup_context_then_first_turn_diff_snapshot() -> anyhow::Result<
             service_tier: None,
             collaboration_mode: Some(collaboration_mode),
             personality: None,
+            model_provider_id: None,
         })
         .await?;
 
@@ -2547,7 +2548,7 @@ async fn turn_context_with_model_updates_model_fields() {
     let (session, mut turn_context) = make_session_and_context().await;
     turn_context.reasoning_effort = Some(ReasoningEffortConfig::Minimal);
     let updated = turn_context
-        .with_model("gpt-5.4".to_string(), &session.services.models_manager)
+        .with_model("gpt-5.4".to_string(), /*provider*/ None, &session.services.models_manager)
         .await;
     let expected_model_info = session
         .services
@@ -3498,7 +3499,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         thread_store: Arc::new(codex_thread_store::LocalThreadStore::new(
             codex_rollout::RolloutConfig::from_view(config.as_ref()),
         )),
-        model_client: ModelClient::new(
+        model_client: Mutex::new(ModelClient::new(
             Some(auth_manager.clone()),
             conversation_id,
             /*installation_id*/ "11111111-1111-4111-8111-111111111111".to_string(),
@@ -3508,7 +3509,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
             config.features.enabled(Feature::EnableRequestCompression),
             config.features.enabled(Feature::RuntimeMetrics),
             Session::build_model_client_beta_features_header(config.as_ref()),
-        ),
+        )),
         compact_model_client: None,
         compact_model_info: None,
         compact_stream_max_retries: None,
@@ -4248,6 +4249,7 @@ fn op_kind_distinguishes_turn_ops() {
             service_tier: None,
             collaboration_mode: None,
             personality: None,
+            model_provider_id: None,
         }
         .kind(),
         "override_turn_context"
@@ -4960,7 +4962,7 @@ where
         thread_store: Arc::new(codex_thread_store::LocalThreadStore::new(
             codex_rollout::RolloutConfig::from_view(config.as_ref()),
         )),
-        model_client: ModelClient::new(
+        model_client: Mutex::new(ModelClient::new(
             Some(Arc::clone(&auth_manager)),
             conversation_id,
             /*installation_id*/ "11111111-1111-4111-8111-111111111111".to_string(),
@@ -4970,7 +4972,7 @@ where
             config.features.enabled(Feature::EnableRequestCompression),
             config.features.enabled(Feature::RuntimeMetrics),
             Session::build_model_client_beta_features_header(config.as_ref()),
-        ),
+        )),
         compact_model_client: None,
         compact_model_info: None,
         compact_stream_max_retries: None,
@@ -5207,6 +5209,7 @@ async fn build_settings_update_items_emits_environment_item_for_network_changes(
     let mut current_context = previous_context
         .with_model(
             previous_context.model_info.slug.clone(),
+            /*provider*/ None,
             &session.services.models_manager,
         )
         .await;
@@ -5269,6 +5272,7 @@ async fn build_settings_update_items_emits_environment_item_for_time_changes() {
     let mut current_context = previous_context
         .with_model(
             previous_context.model_info.slug.clone(),
+            /*provider*/ None,
             &session.services.models_manager,
         )
         .await;
@@ -5295,6 +5299,7 @@ async fn build_settings_update_items_omits_environment_item_when_disabled() {
     let mut current_context = previous_context
         .with_model(
             previous_context.model_info.slug.clone(),
+            /*provider*/ None,
             &session.services.models_manager,
         )
         .await;
@@ -5324,6 +5329,7 @@ async fn build_settings_update_items_emits_realtime_start_when_session_becomes_l
     let mut current_context = previous_context
         .with_model(
             previous_context.model_info.slug.clone(),
+            /*provider*/ None,
             &session.services.models_manager,
         )
         .await;
@@ -5352,6 +5358,7 @@ async fn build_settings_update_items_emits_realtime_end_when_session_stops_being
     let mut current_context = previous_context
         .with_model(
             previous_context.model_info.slug.clone(),
+            /*provider*/ None,
             &session.services.models_manager,
         )
         .await;
@@ -5385,6 +5392,7 @@ async fn build_settings_update_items_uses_previous_turn_settings_for_realtime_en
     let mut current_context = previous_context
         .with_model(
             previous_context.model_info.slug.clone(),
+            /*provider*/ None,
             &session.services.models_manager,
         )
         .await;
@@ -6050,7 +6058,7 @@ async fn record_context_updates_and_set_reference_context_item_persists_baseline
         "gpt-5.4"
     };
     let turn_context = previous_context
-        .with_model(next_model.to_string(), &session.services.models_manager)
+        .with_model(next_model.to_string(), /*provider*/ None, &session.services.models_manager)
         .await;
     let previous_context_item = previous_context.to_turn_context_item();
     {
@@ -6166,7 +6174,7 @@ async fn record_context_updates_and_set_reference_context_item_persists_full_rei
         "gpt-5.4"
     };
     let turn_context = previous_context
-        .with_model(next_model.to_string(), &session.services.models_manager)
+        .with_model(next_model.to_string(), /*provider*/ None, &session.services.models_manager)
         .await;
     let rollout_path = attach_thread_persistence(&mut session).await;
 

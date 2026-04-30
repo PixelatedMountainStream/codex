@@ -297,6 +297,11 @@ pub(crate) struct SessionSettingsUpdate {
     pub(crate) personality: Option<Personality>,
     pub(crate) app_server_client_name: Option<String>,
     pub(crate) app_server_client_version: Option<String>,
+    /// When set, rebuilds the session `ModelClient` for the named provider
+    /// before the next turn. Requires the provider to be present in
+    /// `Config::model_providers`. Processed in `override_turn_context`
+    /// before `update_settings` is called.
+    pub(crate) model_provider_id: Option<String>,
 }
 
 pub(crate) struct AppServerClientMetadata {
@@ -895,7 +900,7 @@ impl Session {
                 state_db: state_db_ctx.clone(),
                 live_thread: live_thread_init.as_ref().cloned(),
                 thread_store: Arc::clone(&thread_store),
-                model_client: default_model_client,
+                model_client: Mutex::new(default_model_client),
                 compact_model_client,
                 compact_model_info,
                 compact_stream_max_retries,

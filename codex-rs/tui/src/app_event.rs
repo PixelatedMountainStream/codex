@@ -478,6 +478,14 @@ pub(crate) enum AppEvent {
         effort: Option<ReasoningEffort>,
     },
 
+    /// Persist a model + provider + effort selection atomically and dispatch
+    /// `Op::OverrideTurnContext` so the running session switches provider.
+    PersistModelAndProviderSelection {
+        model: String,
+        provider_id: Option<String>,
+        effort: Option<ReasoningEffort>,
+    },
+
     /// Persist the selected personality to the appropriate config.
     PersistPersonalitySelection {
         personality: Personality,

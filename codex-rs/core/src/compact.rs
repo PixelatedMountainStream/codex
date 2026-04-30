@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::Prompt;
+use crate::client::ModelClient;
 use crate::client::ModelClientSession;
 use crate::client_common::ResponseEvent;
 #[cfg(test)]
@@ -177,11 +178,13 @@ async fn run_compact_task_inner_impl(
     // Telemetry intentionally remains bound to `turn_context.session_telemetry`:
     // the parent owns the rollout and the compaction call should still report
     // under the parent's session telemetry even if the model differs.
-    let compact_client = sess
-        .services
-        .compact_model_client
-        .as_deref()
-        .unwrap_or(&sess.services.model_client);
+    // Snapshot the model client (cheap Arc clone) so we don't hold the lock
+    // across the compaction's async await points.
+    let compact_client_owned: ModelClient = match sess.services.compact_model_client.as_deref() {
+        Some(client) => client.clone(),
+        None => sess.services.model_client.lock().await.clone(),
+    };
+    let compact_client = &compact_client_owned;
     let compact_model_info = sess
         .services
         .compact_model_info

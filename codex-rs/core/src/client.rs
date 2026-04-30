@@ -346,6 +346,14 @@ impl ModelClient {
         self.state.provider.auth_manager()
     }
 
+    pub(crate) fn installation_id(&self) -> &str {
+        &self.state.installation_id
+    }
+
+    pub(crate) fn window_generation(&self) -> u64 {
+        self.state.window_generation.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub(crate) fn set_window_generation(&self, window_generation: u64) {
         self.state
             .window_generation

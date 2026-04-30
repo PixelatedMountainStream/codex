@@ -436,6 +436,7 @@ async fn resume_model_switch_is_not_duplicated_after_pre_turn_override() -> Resu
             service_tier: None,
             collaboration_mode: None,
             personality: None,
+            model_provider_id: None,
         })
         .await?;
     resumed

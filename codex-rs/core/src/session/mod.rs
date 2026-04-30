@@ -1413,6 +1413,65 @@ impl Session {
         state.session_configuration.provider.clone()
     }
 
+    /// Rebuild `services.model_client` for the named provider.
+    ///
+    /// Calls `apply_provider_override` (the canonical seam) on a clone of the
+    /// current config, then builds a fresh [`ModelClient`] from the resulting
+    /// provider info and swaps it in under the mutex.  The new client inherits
+    /// the conversation id, installation id, window generation, and all other
+    /// session-scoped parameters from the existing client so that session
+    /// continuity is preserved.
+    ///
+    /// Returns an error if `provider_id` is not present in `model_providers`.
+    ///
+    /// # MUST go through apply_provider_override
+    /// Do not mutate `model_provider_id` / `model_provider` on `Config`
+    /// directly — only `apply_provider_override` keeps them in sync.
+    pub(crate) async fn swap_model_provider(&self, provider_id: &str) -> anyhow::Result<()> {
+        // Snapshot config so we can call apply_provider_override on it.
+        let current_config = self.get_config().await;
+        let mut cfg = (*current_config).clone();
+        crate::config::apply_provider_override(&mut cfg, provider_id)?;
+
+        let new_provider = cfg.model_provider.clone();
+
+        // Snapshot construction params from the existing client (no lock held
+        // across an await — clone is cheap; Arc<ModelClientState> is shared).
+        let (conversation_id, installation_id, window_gen) = {
+            let guard = self.services.model_client.lock().await;
+            (
+                self.conversation_id,
+                guard.installation_id().to_owned(),
+                guard.window_generation(),
+            )
+        };
+
+        let state = self.state.lock().await;
+        let session_source = state.session_configuration.session_source.clone();
+        drop(state);
+
+        let config_ref = &cfg;
+        let new_client = Session::build_session_model_client(
+            new_provider,
+            Arc::clone(&self.services.auth_manager),
+            conversation_id,
+            installation_id,
+            session_source,
+            config_ref.model_verbosity,
+            config_ref
+                .features
+                .enabled(codex_features::Feature::EnableRequestCompression),
+            config_ref
+                .features
+                .enabled(codex_features::Feature::RuntimeMetrics),
+            Session::build_model_client_beta_features_header(config_ref),
+            window_gen,
+        );
+
+        *self.services.model_client.lock().await = new_client;
+        Ok(())
+    }
+
     pub(crate) async fn reload_user_config_layer(&self) {
         let config_toml_path = {
             let state = self.state.lock().await;
@@ -2500,7 +2559,11 @@ impl Session {
             self.persist_rollout_items(&[RolloutItem::TurnContext(turn_context_item)])
                 .await;
         }
-        self.services.model_client.advance_window_generation();
+        self.services
+            .model_client
+            .lock()
+            .await
+            .advance_window_generation();
     }
 
     async fn persist_rollout_response_items(&self, items: &[ResponseItem]) {

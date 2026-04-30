@@ -202,6 +202,33 @@ impl AppCommand {
             service_tier,
             collaboration_mode,
             personality,
+            model_provider_id: None,
+        })
+    }
+
+    /// Variant of [`Self::override_turn_context`] that also switches the active
+    /// model provider for subsequent turns.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn override_turn_context_with_provider(
+        model: Option<String>,
+        model_provider_id: Option<String>,
+        effort: Option<Option<ReasoningEffortConfig>>,
+        collaboration_mode: Option<CollaborationMode>,
+    ) -> Self {
+        Self(Op::OverrideTurnContext {
+            cwd: None,
+            approval_policy: None,
+            approvals_reviewer: None,
+            sandbox_policy: None,
+            permission_profile: None,
+            windows_sandbox_level: None,
+            model,
+            effort,
+            summary: None,
+            service_tier: None,
+            collaboration_mode,
+            personality: None,
+            model_provider_id,
         })
     }
 
@@ -340,6 +367,7 @@ impl AppCommand {
                 service_tier,
                 collaboration_mode,
                 personality,
+                model_provider_id: _,
             } => AppCommandView::OverrideTurnContext {
                 cwd,
                 approval_policy,

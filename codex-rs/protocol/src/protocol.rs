@@ -652,6 +652,14 @@ pub enum Op {
         /// Updated personality preference.
         #[serde(skip_serializing_if = "Option::is_none")]
         personality: Option<Personality>,
+
+        /// Switch the active model provider for subsequent turns.
+        ///
+        /// The provider must be registered in `config.model_providers`. When
+        /// set, a new `ModelClient` is built for the named provider and swapped
+        /// in atomically before the next turn runs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_provider_id: Option<String>,
     },
 
     /// Approve a command execution

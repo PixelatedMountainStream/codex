@@ -256,6 +256,7 @@ async fn memories_startup_phase1_uses_live_thread_service_tier() -> anyhow::Resu
             service_tier: Some(Some(ServiceTier::Fast)),
             collaboration_mode: None,
             personality: None,
+            model_provider_id: None,
         })
         .await?;
 

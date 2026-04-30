@@ -2392,6 +2392,7 @@ async fn single_reasoning_option_skips_selection() {
         default_reasoning_effort: ReasoningEffortConfig::High,
         supported_reasoning_efforts: single_effort,
         supports_personality: false,
+        model_provider_id: None,
         additional_speed_tiers: Vec::new(),
         is_default: false,
         upgrade: None,
