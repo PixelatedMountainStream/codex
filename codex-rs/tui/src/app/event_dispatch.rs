@@ -1100,52 +1100,8 @@ impl App {
                 provider_id,
                 effort,
             } => {
-                let profile = self.active_profile.as_deref();
-                match ConfigEditsBuilder::new(&self.config.codex_home)
-                    .with_profile(profile)
-                    .set_model_and_provider(provider_id.as_deref(), Some(model.as_str()), effort)
-                    .apply()
-                    .await
-                {
-                    Ok(()) => {
-                        let effort_label = effort
-                            .map(|e| e.to_string())
-                            .unwrap_or_else(|| "default".to_string());
-                        tracing::info!(
-                            model,
-                            provider = ?provider_id,
-                            effort = effort_label,
-                            "Selected model+provider"
-                        );
-                        let provider_label = provider_id.as_deref().unwrap_or("default provider");
-                        let mut message = format!("Model changed to {model} via {provider_label}");
-                        if let Some(label) = Self::reasoning_label_for(&model, effort) {
-                            message.push(' ');
-                            message.push_str(label);
-                        }
-                        if let Some(profile) = profile {
-                            message.push_str(" for ");
-                            message.push_str(profile);
-                            message.push_str(" profile");
-                        }
-                        self.chat_widget.add_info_message(message, /*hint*/ None);
-                    }
-                    Err(err) => {
-                        tracing::error!(error = %err, "failed to persist model+provider selection");
-                        self.chat_widget
-                            .add_error_message(format!("Failed to save model+provider: {err}"));
-                    }
-                }
-
-                // Dispatch the provider switch to the running session so that
-                // the next turn targets the new provider.
-                self.chat_widget
-                    .submit_op(AppCommand::override_turn_context_with_provider(
-                        Some(model),
-                        provider_id,
-                        effort.map(Some),
-                        /*collaboration_mode*/ None,
-                    ));
+                self.persist_model_and_provider(model, provider_id, effort)
+                    .await;
             }
             AppEvent::PluginUninstallLoaded {
                 cwd,
@@ -2021,5 +1977,66 @@ impl App {
                 AppRunControl::Exit(ExitReason::UserRequested)
             }
         }
+    }
+
+    /// Persist a model+provider selection to config and immediately dispatch
+    /// `Op::OverrideTurnContext` to the running session so the next turn
+    /// targets the chosen provider.
+    ///
+    /// Extracted from the `AppEvent::PersistModelAndProviderSelection` match
+    /// arm so that integration tests can drive this path directly without
+    /// constructing a `tui::Tui` or `AppServerSession`.
+    pub(super) async fn persist_model_and_provider(
+        &mut self,
+        model: String,
+        provider_id: Option<String>,
+        effort: Option<ReasoningEffortConfig>,
+    ) {
+        let profile = self.active_profile.as_deref();
+        match ConfigEditsBuilder::new(&self.config.codex_home)
+            .with_profile(profile)
+            .set_model_and_provider(provider_id.as_deref(), Some(model.as_str()), effort)
+            .apply()
+            .await
+        {
+            Ok(()) => {
+                let effort_label = effort
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "default".to_string());
+                tracing::info!(
+                    model,
+                    provider = ?provider_id,
+                    effort = effort_label,
+                    "Selected model+provider"
+                );
+                let provider_label = provider_id.as_deref().unwrap_or("default provider");
+                let mut message = format!("Model changed to {model} via {provider_label}");
+                if let Some(label) = Self::reasoning_label_for(&model, effort) {
+                    message.push(' ');
+                    message.push_str(label);
+                }
+                if let Some(profile) = profile {
+                    message.push_str(" for ");
+                    message.push_str(profile);
+                    message.push_str(" profile");
+                }
+                self.chat_widget.add_info_message(message, /*hint*/ None);
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "failed to persist model+provider selection");
+                self.chat_widget
+                    .add_error_message(format!("Failed to save model+provider: {err}"));
+            }
+        }
+
+        // Dispatch the provider switch to the running session so that
+        // the next turn targets the new provider.
+        self.chat_widget
+            .submit_op(AppCommand::override_turn_context_with_provider(
+                Some(model),
+                provider_id,
+                effort.map(Some),
+                /*collaboration_mode*/ None,
+            ));
     }
 }

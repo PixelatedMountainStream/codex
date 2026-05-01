@@ -5109,3 +5109,39 @@ async fn session_summary_uses_id_even_when_thread_has_name() {
         Some("codex resume 123e4567-e89b-12d3-a456-426614174000".to_string())
     );
 }
+
+#[tokio::test]
+async fn persist_model_and_provider_dispatches_override_turn_context_op() {
+    let (mut app, _app_event_rx, mut op_rx) = make_test_app_with_channels().await;
+    let codex_home = tempdir().expect("temp codex_home");
+    app.config.codex_home = codex_home.path().to_path_buf().abs();
+
+    // Drain any ops enqueued during construction.
+    while op_rx.try_recv().is_ok() {}
+
+    app.persist_model_and_provider(
+        "gemma4:26b-a4b-it-q4_K_M".to_string(),
+        Some("ollama".to_string()),
+        /*effort*/ None,
+    )
+    .await;
+
+    assert_eq!(
+        op_rx.try_recv(),
+        Ok(Op::OverrideTurnContext {
+            cwd: None,
+            approval_policy: None,
+            approvals_reviewer: None,
+            sandbox_policy: None,
+            permission_profile: None,
+            windows_sandbox_level: None,
+            model: Some("gemma4:26b-a4b-it-q4_K_M".to_string()),
+            effort: None,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
+            model_provider_id: Some("ollama".to_string()),
+        })
+    );
+}
