@@ -1413,7 +1413,13 @@ impl Session {
         state.session_configuration.provider.clone()
     }
 
-    /// Rebuild `services.model_client` for the named provider.
+    /// Swap the active model provider and rebuild the session model client.
+    ///
+    /// SAFETY: this method is only reachable from the TUI `/model` picker
+    /// path, which has `available_during_task() == false` — concurrent calls
+    /// from the submission loop are therefore impossible. The two-phase
+    /// lock pattern (read installation_id+window_gen, build new client,
+    /// then swap under a separate lock) is safe under that invariant.
     ///
     /// Calls `apply_provider_override` (the canonical seam) on a clone of the
     /// current config, then builds a fresh [`ModelClient`] from the resulting

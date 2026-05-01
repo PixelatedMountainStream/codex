@@ -3646,6 +3646,71 @@ async fn compact_override_absent_when_compact_model_unset() -> anyhow::Result<()
     Ok(())
 }
 
+#[tokio::test]
+async fn swap_model_provider_updates_client_and_config() -> anyhow::Result<()> {
+    use codex_model_provider_info::OLLAMA_OSS_PROVIDER_ID;
+    use codex_model_provider_info::OPENAI_PROVIDER_ID;
+
+    // Build a default session — provider starts as `openai`.
+    let session = make_session_with_config(|_config| {}).await?;
+
+    // (2) Initial config must reflect the openai provider id.
+    {
+        let initial_state = session.state.lock().await;
+        assert_eq!(
+            initial_state
+                .session_configuration
+                .original_config_do_not_use
+                .model_provider_id,
+            OPENAI_PROVIDER_ID,
+            "initial model_provider_id should be openai",
+        );
+    }
+
+    // Capture auth_manager pointer before the swap.
+    let auth_ptr_before = Arc::as_ptr(&session.services.auth_manager);
+
+    // (3) Swap to the built-in `ollama` provider (always present, no auth required).
+    session.swap_model_provider(OLLAMA_OSS_PROVIDER_ID).await?;
+
+    // (4) Post-swap: the oss provider has a base_url (non-OpenAI endpoint).
+    // The display `name` field is "gpt-oss"; the canonical id is in the config.
+    let post_provider = session.provider().await;
+    assert!(
+        post_provider.base_url.is_some(),
+        "ollama oss provider should carry a base_url",
+    );
+
+    {
+        let state = session.state.lock().await;
+
+        // (5) session_configuration.provider should reflect the swapped-in entry.
+        assert_eq!(
+            state.session_configuration.provider.base_url, post_provider.base_url,
+            "session_configuration.provider should be updated after swap",
+        );
+
+        // (6) original_config_do_not_use.model_provider_id must be updated (Critical fix).
+        assert_eq!(
+            state
+                .session_configuration
+                .original_config_do_not_use
+                .model_provider_id,
+            OLLAMA_OSS_PROVIDER_ID,
+            "original_config_do_not_use.model_provider_id should be ollama",
+        );
+    }
+
+    // (7) auth_manager Arc identity must be preserved across the swap.
+    let auth_ptr_after = Arc::as_ptr(&session.services.auth_manager);
+    assert_eq!(
+        auth_ptr_before, auth_ptr_after,
+        "auth_manager Arc should be the same instance after provider swap",
+    );
+
+    Ok(())
+}
+
 async fn make_session_with_config(
     mutator: impl FnOnce(&mut Config),
 ) -> anyhow::Result<Arc<Session>> {

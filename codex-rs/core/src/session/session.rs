@@ -301,6 +301,7 @@ pub(crate) struct SessionSettingsUpdate {
     /// before the next turn. Requires the provider to be present in
     /// `Config::model_providers`. Processed in `override_turn_context`
     /// before `update_settings` is called.
+    // TODO(milestone-1-followup): consumed in override_turn_context before update_settings; should not be on this struct.
     pub(crate) model_provider_id: Option<String>,
 }
 

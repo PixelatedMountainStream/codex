@@ -8807,8 +8807,9 @@ impl ChatWidget {
                     model.as_str(),
                     Some(preset.default_reasoning_effort),
                 );
-                let actions = Self::model_selection_actions(
+                let actions = Self::model_selection_actions_with_provider(
                     model.clone(),
+                    preset.provider_id.clone(),
                     Some(preset.default_reasoning_effort),
                     should_prompt_plan_mode_scope,
                 );
@@ -8961,19 +8962,6 @@ impl ChatWidget {
             items,
             ..Default::default()
         });
-    }
-
-    fn model_selection_actions(
-        model_for_action: String,
-        effort_for_action: Option<ReasoningEffortConfig>,
-        should_prompt_plan_mode_scope: bool,
-    ) -> Vec<SelectionAction> {
-        Self::model_selection_actions_with_provider(
-            model_for_action,
-            /*provider_id*/ None,
-            effort_for_action,
-            should_prompt_plan_mode_scope,
-        )
     }
 
     fn model_selection_actions_with_provider(

@@ -743,8 +743,7 @@ impl App {
         if let Some(updated_model) = config.model.clone() {
             model = updated_model;
         }
-        let configured_provider_ids: Vec<String> =
-            config.model_providers.keys().cloned().collect();
+        let configured_provider_ids: Vec<String> = config.model_providers.keys().cloned().collect();
         let model_catalog = Arc::new(ModelCatalog::new(
             available_models.clone(),
             CollaborationModesConfig {

@@ -1433,3 +1433,105 @@ fn replace_mcp_servers_blocking_clears_table_when_empty() {
     let contents = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
     assert!(!contents.contains("mcp_servers"));
 }
+
+#[test]
+fn set_model_and_provider_writes_all_three_keys_at_profile_scope() {
+    let tmp = tempdir().expect("tmpdir");
+    let codex_home = tmp.path();
+    // Seed a config with an active profile so that writes land in profile scope.
+    std::fs::write(
+        codex_home.join(CONFIG_TOML_FILE),
+        r#"profile = "local"
+
+[profiles.local]
+model = "gpt-4o"
+"#,
+    )
+    .expect("seed config");
+
+    apply_blocking(
+        codex_home,
+        /*profile*/ None,
+        &[ConfigEdit::SetModelAndProvider {
+            provider_id: Some("ollama".into()),
+            model: Some("gemma4:26b-a4b-it-q4_K_M".into()),
+            effort: Some(ReasoningEffort::Medium),
+        }],
+    )
+    .expect("persist");
+
+    let raw = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
+    let config: toml::Value = toml::from_str(&raw).expect("parse config");
+    let profile = config
+        .get("profiles")
+        .and_then(|v| v.get("local"))
+        .expect("profiles.local");
+    assert_eq!(
+        profile.get("model_provider").and_then(toml::Value::as_str),
+        Some("ollama"),
+        "model_provider should be written",
+    );
+    assert_eq!(
+        profile.get("model").and_then(toml::Value::as_str),
+        Some("gemma4:26b-a4b-it-q4_K_M"),
+        "model should be written",
+    );
+    assert_eq!(
+        profile
+            .get("model_reasoning_effort")
+            .and_then(toml::Value::as_str),
+        Some("medium"),
+        "model_reasoning_effort should be written",
+    );
+}
+
+#[test]
+fn set_model_and_provider_none_effort_clears_effort_key() {
+    // Passing `effort: None` is the same semantic as `SetModel { effort: None }` —
+    // it removes any previously-written `model_reasoning_effort` from the profile
+    // so the provider default takes effect.  This mirrors the `write_profile_value`
+    // contract: `None` maps to `clear()`.
+    let tmp = tempdir().expect("tmpdir");
+    let codex_home = tmp.path();
+    std::fs::write(
+        codex_home.join(CONFIG_TOML_FILE),
+        r#"profile = "local"
+
+[profiles.local]
+model_reasoning_effort = "high"
+"#,
+    )
+    .expect("seed config");
+
+    apply_blocking(
+        codex_home,
+        /*profile*/ None,
+        &[ConfigEdit::SetModelAndProvider {
+            provider_id: Some("ollama".into()),
+            model: Some("gemma4:26b-a4b-it-q4_K_M".into()),
+            effort: None,
+        }],
+    )
+    .expect("persist");
+
+    let raw = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
+    let config: toml::Value = toml::from_str(&raw).expect("parse config");
+    let profile = config
+        .get("profiles")
+        .and_then(|v| v.get("local"))
+        .expect("profiles.local");
+    // effort: None clears the key — consistent with SetModel { effort: None }.
+    assert_eq!(
+        profile.get("model_reasoning_effort"),
+        None,
+        "model_reasoning_effort should be cleared when effort is None",
+    );
+    assert_eq!(
+        profile.get("model_provider").and_then(toml::Value::as_str),
+        Some("ollama"),
+    );
+    assert_eq!(
+        profile.get("model").and_then(toml::Value::as_str),
+        Some("gemma4:26b-a4b-it-q4_K_M"),
+    );
+}

@@ -98,4 +98,42 @@ mod tests {
             builtin_collaboration_mode_presets(collaboration_modes_config)
         );
     }
+
+    #[test]
+    fn try_list_models_includes_ollama_stub_when_ollama_configured() {
+        let collab_cfg = CollaborationModesConfig {
+            default_mode_request_user_input: false,
+        };
+        let catalog =
+            ModelCatalog::new(Vec::new(), collab_cfg, vec![OLLAMA_PROVIDER_ID.to_string()]);
+
+        let presets = catalog.try_list_models().expect("infallible");
+        assert_eq!(presets.len(), 1, "exactly one stub preset expected");
+        let preset = &presets[0];
+        assert_eq!(
+            preset.provider_id,
+            Some(OLLAMA_PROVIDER_ID.to_string()),
+            "preset provider_id should be ollama",
+        );
+        assert_eq!(
+            preset.model, "gemma4:26b-a4b-it-q4_K_M",
+            "preset model slug should match the hard-coded stub",
+        );
+    }
+
+    #[test]
+    fn try_list_models_omits_ollama_stub_when_ollama_not_configured() {
+        let collab_cfg = CollaborationModesConfig {
+            default_mode_request_user_input: false,
+        };
+        let catalog = ModelCatalog::new(Vec::new(), collab_cfg, Vec::new());
+
+        let presets = catalog.try_list_models().expect("infallible");
+        assert!(
+            presets
+                .iter()
+                .all(|p| p.provider_id.as_deref() != Some(OLLAMA_PROVIDER_ID)),
+            "no ollama preset should be present when ollama is not in configured_provider_ids",
+        );
+    }
 }
