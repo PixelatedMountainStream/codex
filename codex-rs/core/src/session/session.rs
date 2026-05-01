@@ -136,6 +136,15 @@ impl SessionConfiguration {
     }
 
     pub(crate) fn apply(&self, updates: &SessionSettingsUpdate) -> ConstraintResult<Self> {
+        // Provider switches are dispatched ahead of `apply` by
+        // `override_turn_context` (handlers.rs:110), which calls
+        // `swap_model_provider` directly. By the time the update reaches
+        // here, `model_provider_id` must be `None` — otherwise we'd silently
+        // drop the swap. Catch any future caller bypassing that path.
+        debug_assert!(
+            updates.model_provider_id.is_none(),
+            "SessionSettingsUpdate.model_provider_id must be consumed by override_turn_context before reaching apply()"
+        );
         let mut next_configuration = self.clone();
         let current_sandbox_policy = self.sandbox_policy();
         let current_file_system_sandbox_policy = self.file_system_sandbox_policy();

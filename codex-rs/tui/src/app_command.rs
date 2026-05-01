@@ -208,6 +208,10 @@ impl AppCommand {
 
     /// Variant of [`Self::override_turn_context`] that also switches the active
     /// model provider for subsequent turns.
+    ///
+    // TODO(milestone-1-followup): consolidate into `override_turn_context` by
+    // making `model_provider_id` a normal parameter; this variant exists only
+    // to avoid a positional-argument explosion at all existing call sites.
     pub(crate) fn override_turn_context_with_provider(
         model: Option<String>,
         model_provider_id: Option<String>,

@@ -2550,7 +2550,6 @@ async fn turn_context_with_model_updates_model_fields() {
     let updated = turn_context
         .with_model(
             "gpt-5.4".to_string(),
-            /*provider*/ None,
             &session.services.models_manager,
         )
         .await;
@@ -5278,7 +5277,6 @@ async fn build_settings_update_items_emits_environment_item_for_network_changes(
     let mut current_context = previous_context
         .with_model(
             previous_context.model_info.slug.clone(),
-            /*provider*/ None,
             &session.services.models_manager,
         )
         .await;
@@ -5341,7 +5339,6 @@ async fn build_settings_update_items_emits_environment_item_for_time_changes() {
     let mut current_context = previous_context
         .with_model(
             previous_context.model_info.slug.clone(),
-            /*provider*/ None,
             &session.services.models_manager,
         )
         .await;
@@ -5368,7 +5365,6 @@ async fn build_settings_update_items_omits_environment_item_when_disabled() {
     let mut current_context = previous_context
         .with_model(
             previous_context.model_info.slug.clone(),
-            /*provider*/ None,
             &session.services.models_manager,
         )
         .await;
@@ -5398,7 +5394,6 @@ async fn build_settings_update_items_emits_realtime_start_when_session_becomes_l
     let mut current_context = previous_context
         .with_model(
             previous_context.model_info.slug.clone(),
-            /*provider*/ None,
             &session.services.models_manager,
         )
         .await;
@@ -5427,7 +5422,6 @@ async fn build_settings_update_items_emits_realtime_end_when_session_stops_being
     let mut current_context = previous_context
         .with_model(
             previous_context.model_info.slug.clone(),
-            /*provider*/ None,
             &session.services.models_manager,
         )
         .await;
@@ -5461,7 +5455,6 @@ async fn build_settings_update_items_uses_previous_turn_settings_for_realtime_en
     let mut current_context = previous_context
         .with_model(
             previous_context.model_info.slug.clone(),
-            /*provider*/ None,
             &session.services.models_manager,
         )
         .await;
@@ -6129,7 +6122,6 @@ async fn record_context_updates_and_set_reference_context_item_persists_baseline
     let turn_context = previous_context
         .with_model(
             next_model.to_string(),
-            /*provider*/ None,
             &session.services.models_manager,
         )
         .await;
@@ -6249,7 +6241,6 @@ async fn record_context_updates_and_set_reference_context_item_persists_full_rei
     let turn_context = previous_context
         .with_model(
             next_model.to_string(),
-            /*provider*/ None,
             &session.services.models_manager,
         )
         .await;

@@ -755,7 +755,6 @@ async fn maybe_run_previous_model_inline_compact(
         turn_context
             .with_model(
                 previous_turn_settings.model,
-                /*provider*/ None,
                 &sess.services.models_manager,
             )
             .await,

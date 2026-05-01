@@ -533,6 +533,12 @@ pub(crate) enum AppEvent {
     OpenPlanReasoningScopePrompt {
         model: String,
         effort: Option<ReasoningEffort>,
+        /// Optional provider switch carried alongside the model+effort change.
+        /// When `Some`, the prompt's confirmation closures must dispatch
+        /// `PersistModelAndProviderSelection` (not `PersistModelSelection`)
+        /// so that re-selecting a local model in Plan mode does not silently
+        /// drop the provider hop.
+        provider_id: Option<String>,
     },
 
     /// Open the full model picker (non-auto models).

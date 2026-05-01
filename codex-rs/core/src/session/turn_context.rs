@@ -137,7 +137,6 @@ impl TurnContext {
     pub(crate) async fn with_model(
         &self,
         model: String,
-        provider: Option<SharedModelProvider>,
         models_manager: &SharedModelsManager,
     ) -> Self {
         let mut config = (*self.config).clone();
@@ -174,8 +173,7 @@ impl TurnContext {
             /*developer_instructions*/ None,
         );
         let features = self.features.clone();
-        let effective_provider = provider.as_ref().unwrap_or(&self.provider);
-        let provider_capabilities = effective_provider.capabilities();
+        let provider_capabilities = self.provider.capabilities();
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
             model_info: &model_info,
             available_models: &models_manager
@@ -228,7 +226,7 @@ impl TurnContext {
                 .session_telemetry
                 .clone()
                 .with_model(model.as_str(), model_info.slug.as_str()),
-            provider: provider.unwrap_or_else(|| self.provider.clone()),
+            provider: self.provider.clone(),
             reasoning_effort,
             reasoning_summary: self.reasoning_summary,
             session_source: self.session_source.clone(),

@@ -8975,6 +8975,7 @@ impl ChatWidget {
                 tx.send(AppEvent::OpenPlanReasoningScopePrompt {
                     model: model_for_action.clone(),
                     effort: effort_for_action,
+                    provider_id: provider_id.clone(),
                 });
                 return;
             }
@@ -9021,6 +9022,7 @@ impl ChatWidget {
         &mut self,
         model: String,
         effort: Option<ReasoningEffortConfig>,
+        provider_id: Option<String>,
     ) {
         let reasoning_phrase = match effort {
             Some(ReasoningEffortConfig::None) => "no reasoning".to_string(),
@@ -9070,10 +9072,22 @@ impl ChatWidget {
             tx.send(AppEvent::UpdateReasoningEffort(effort));
             tx.send(AppEvent::UpdatePlanModeReasoningEffort(effort));
             tx.send(AppEvent::PersistPlanModeReasoningEffort(effort));
-            tx.send(AppEvent::PersistModelSelection {
-                model: model.clone(),
-                effort,
-            });
+            // Carry the provider hop through if this scope-prompt was opened
+            // from a local-provider preset; otherwise persist via the cloud
+            // path. Without this branch, re-selecting an already-active local
+            // model in Plan mode silently drops the provider switch.
+            if provider_id.is_some() {
+                tx.send(AppEvent::PersistModelAndProviderSelection {
+                    model: model.clone(),
+                    provider_id: provider_id.clone(),
+                    effort,
+                });
+            } else {
+                tx.send(AppEvent::PersistModelSelection {
+                    model: model.clone(),
+                    effort,
+                });
+            }
         })];
 
         self.bottom_pane.show_selection_view(SelectionViewParams {
@@ -9104,6 +9118,12 @@ impl ChatWidget {
     }
 
     /// Open a popup to choose the reasoning effort (stage 2) for the given model.
+    // TODO(milestone-1-followup): consolidate provider-dispatch branches; all
+    // three sites that emit `PersistModelAndProviderSelection` vs
+    // `PersistModelSelection` (model_selection_actions_with_provider, the
+    // single-effort fast path here, and the multi-effort closure here) should
+    // delegate to a shared helper. Tracked rather than refactored to keep the
+    // Milestone-1 diff focused.
     pub(crate) fn open_reasoning_popup(&mut self, preset: ModelPreset) {
         let default_effort: ReasoningEffortConfig = preset.default_reasoning_effort;
         let supported = preset.supported_reasoning_efforts;
@@ -9162,6 +9182,7 @@ impl ChatWidget {
                     .send(AppEvent::OpenPlanReasoningScopePrompt {
                         model: selected_model,
                         effort: selected_effort,
+                        provider_id: preset_provider_id,
                     });
             } else if preset_provider_id.is_some() {
                 self.apply_model_and_effort_without_persist(
@@ -9249,6 +9270,7 @@ impl ChatWidget {
                     tx.send(AppEvent::OpenPlanReasoningScopePrompt {
                         model: model_for_action.clone(),
                         effort: choice_effort,
+                        provider_id: choice_provider_id.clone(),
                     });
                 } else {
                     tx.send(AppEvent::UpdateModel(model_for_action.clone()));
