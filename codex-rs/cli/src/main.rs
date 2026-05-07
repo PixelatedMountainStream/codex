@@ -1342,6 +1342,12 @@ async fn run_debug_prompt_input_command(
     arg0_paths: Arg0DispatchPaths,
 ) -> anyhow::Result<()> {
     let shared = interactive.shared.into_inner();
+    if let Err(msg) = codex_utils_cli::validate_local_provider_requires_oss(
+        shared.oss,
+        shared.oss_provider.as_deref(),
+    ) {
+        return Err(anyhow::anyhow!(msg));
+    }
     let mut cli_kv_overrides = root_config_overrides
         .parse_overrides()
         .map_err(anyhow::Error::msg)?;

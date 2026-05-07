@@ -8,4 +8,6 @@ pub use approval_mode_cli_arg::ApprovalModeCliArg;
 pub use config_override::CliConfigOverrides;
 pub use format_env_display::format_env_display;
 pub use sandbox_mode_cli_arg::SandboxModeCliArg;
+pub use shared_options::LOCAL_PROVIDER_REQUIRES_OSS_MSG;
 pub use shared_options::SharedCliOptions;
+pub use shared_options::validate_local_provider_requires_oss;

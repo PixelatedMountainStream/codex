@@ -111,6 +111,25 @@ Plan preset. The string value `none` means "no reasoning" (an explicit Plan
 override), not "inherit the global default". There is currently no separate
 config value for "follow the global default in Plan mode".
 
+## Switching providers between sessions
+
+To run the main agent against a local provider, start (or resume) Codex with
+both `--oss` and `--local-provider`. `--local-provider` only takes effect
+under `--oss`; passing it alone exits with an error pointing to the correct
+flag combination.
+
+```bash
+# Start a new session against local Ollama.
+codex --oss --local-provider ollama --model gemma4:26b-a4b-it-q4_K_M
+
+# Resume an existing thread on the same provider/model.
+codex resume <thread-id> --oss --local-provider ollama --model gemma4:26b-a4b-it-q4_K_M
+```
+
+Per-task routing for compaction, `/review`, and memories is configured via
+TOML (see below) and is independent of the main-agent provider chosen at
+startup.
+
 ## Per-task model and provider overrides
 
 Some background tasks can be routed to a different model and provider than

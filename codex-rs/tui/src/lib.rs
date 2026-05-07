@@ -801,6 +801,12 @@ pub async fn run_main(
     )
     .await;
 
+    if let Err(msg) =
+        codex_utils_cli::validate_local_provider_requires_oss(cli.oss, cli.oss_provider.as_deref())
+    {
+        return Err(std::io::Error::other(msg));
+    }
+
     let model_provider_override = if cli.oss {
         let resolved = resolve_oss_provider(
             cli.oss_provider.as_deref(),

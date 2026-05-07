@@ -25,7 +25,8 @@ pub struct SharedCliOptions {
     pub oss: bool,
 
     /// Specify which local provider to use (lmstudio or ollama).
-    /// If not specified with --oss, will use config default or show selection.
+    /// Requires `--oss`; rerun with `--oss --local-provider <id> --model <slug>`.
+    /// When omitted under `--oss`, the config default is used or a selection prompt appears.
     #[arg(long = "local-provider")]
     pub oss_provider: Option<String>,
 
@@ -54,6 +55,26 @@ pub struct SharedCliOptions {
     /// Additional directories that should be writable alongside the primary workspace.
     #[arg(long = "add-dir", value_name = "DIR", value_hint = clap::ValueHint::DirPath)]
     pub add_dir: Vec<PathBuf>,
+}
+
+/// Error returned when `--local-provider` is supplied without `--oss`.
+///
+/// `--local-provider` only takes effect inside the `--oss` code path; without
+/// `--oss` the flag would be silently dropped and the session would fall back
+/// to the default cloud provider, which is a confusing footgun.
+pub const LOCAL_PROVIDER_REQUIRES_OSS_MSG: &str =
+    "--local-provider requires --oss; rerun with: codex --oss --local-provider <id> --model <slug>";
+
+/// Validate that `--local-provider` is only used together with `--oss`.
+pub fn validate_local_provider_requires_oss(
+    oss: bool,
+    oss_provider: Option<&str>,
+) -> Result<(), &'static str> {
+    if oss_provider.is_some() && !oss {
+        Err(LOCAL_PROVIDER_REQUIRES_OSS_MSG)
+    } else {
+        Ok(())
+    }
 }
 
 impl SharedCliOptions {
@@ -158,5 +179,32 @@ impl SharedCliOptions {
         if !add_dir.is_empty() {
             self.add_dir.extend(add_dir);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_provider_without_oss_is_rejected() {
+        assert_eq!(
+            validate_local_provider_requires_oss(false, Some("ollama")),
+            Err(LOCAL_PROVIDER_REQUIRES_OSS_MSG),
+        );
+    }
+
+    #[test]
+    fn local_provider_with_oss_is_accepted() {
+        assert_eq!(
+            validate_local_provider_requires_oss(true, Some("ollama")),
+            Ok(()),
+        );
+    }
+
+    #[test]
+    fn no_local_provider_is_accepted() {
+        assert_eq!(validate_local_provider_requires_oss(false, None), Ok(()));
+        assert_eq!(validate_local_provider_requires_oss(true, None), Ok(()));
     }
 }
