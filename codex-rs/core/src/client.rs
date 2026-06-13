@@ -108,11 +108,18 @@ use crate::attestation::X_OAI_ATTESTATION_HEADER;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::client_common::ResponseStream;
+use crate::context_manager::strip_images_when_unsupported;
 use crate::feedback_tags;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::subagent_header_value;
 use crate::util::emit_feedback_auth_recovery_tags;
 use codex_api::map_api_error;
+use codex_chat_completions::ToolReverseMap;
+use codex_chat_completions::build_chat_request;
+use codex_chat_completions::parse_chat_sse_stream;
+use codex_client::HttpTransport as _;
+use codex_client::Request;
+use codex_client::RequestBody;
 use codex_feedback::FeedbackRequestTags;
 use codex_feedback::emit_feedback_request_tags_with_auth_env;
 use codex_login::auth_env_telemetry::AuthEnvTelemetry;
@@ -149,6 +156,7 @@ const X_OPENAI_INTERNAL_CODEX_RESPONSES_LITE_HEADER: &str =
     "x-openai-internal-codex-responses-lite";
 const RESPONSES_ENDPOINT: &str = "/responses";
 const RESPONSES_COMPACT_ENDPOINT: &str = "/responses/compact";
+const CHAT_COMPLETIONS_ENDPOINT: &str = "/chat/completions";
 // `/responses/compact` is unary, so the timeout covers the full response rather than one idle
 // period between stream events.
 const COMPACT_REQUEST_TIMEOUT_IDLE_MULTIPLIER: u32 = 4;
@@ -761,9 +769,13 @@ impl ModelClient {
 
     /// Returns whether the Responses-over-WebSocket transport is active for this session.
     ///
-    /// WebSocket use is controlled by provider capability and session-scoped fallback state.
+    /// WebSocket use is controlled by provider capability, wire API type, and session-scoped
+    /// fallback state. The WebSocket transport is only valid for [`WireApi::Responses`] providers;
+    /// non-Responses wire APIs (e.g. [`WireApi::Chat`]) never use the WebSocket path.
     pub fn responses_websocket_enabled(&self) -> bool {
-        if !self.state.provider.info().supports_websockets
+        let info = self.state.provider.info();
+        if info.wire_api != WireApi::Responses
+            || !info.supports_websockets
             || self.state.disable_websockets.load(Ordering::Relaxed)
         {
             return false;
@@ -1297,6 +1309,168 @@ impl ModelClientSession {
         }
     }
 
+    /// Streams a turn via the OpenAI Chat Completions API.
+    ///
+    /// Mirrors [`stream_responses_api`] in its auth recovery loop, telemetry wiring, and
+    /// inference-trace instrumentation.  All HTTP transport stays here; the `codex-chat-completions`
+    /// crate handles only request/response translation.
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(
+        name = "model_client.stream_chat_completions_api",
+        level = "info",
+        skip_all,
+        fields(
+            model = %model_info.slug,
+            wire_api = %self.client.state.provider.info().wire_api,
+            transport = "chat_completions_http",
+            http.method = "POST",
+            api.path = "chat/completions",
+            turn.has_metadata_header = responses_metadata.has_turn_metadata()
+        )
+    )]
+    async fn stream_chat_completions_api(
+        &self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        session_telemetry: &SessionTelemetry,
+        effort: Option<ReasoningEffortConfig>,
+        summary: ReasoningSummaryConfig,
+        service_tier: Option<String>,
+        responses_metadata: &CodexResponsesMetadata,
+        inference_trace: &InferenceTraceContext,
+    ) -> Result<ResponseStream> {
+        let auth_manager = self.client.state.provider.auth_manager();
+        let mut auth_recovery = auth_manager
+            .as_ref()
+            .map(AuthManager::unauthorized_recovery);
+        let mut pending_retry = PendingUnauthorizedRetry::default();
+        loop {
+            let client_setup = self.client.current_client_setup().await?;
+            let transport = ReqwestTransport::new(build_reqwest_client());
+            let request_auth_context = AuthRequestTelemetryContext::new(
+                client_setup.auth.as_ref().map(CodexAuth::auth_mode),
+                client_setup.api_auth.as_ref(),
+                pending_retry,
+            );
+            let (_request_telemetry, _sse_telemetry) = Self::build_streaming_telemetry(
+                session_telemetry,
+                request_auth_context,
+                RequestRouteTelemetry::for_endpoint(CHAT_COMPLETIONS_ENDPOINT),
+                self.client.state.auth_env_telemetry.clone(),
+            );
+
+            // Build the Responses-API request object (reusing the shared builder), then
+            // normalize images before translating to the Chat Completions wire format.
+            let mut request = self.client.build_responses_request(
+                &client_setup.api_provider,
+                prompt,
+                model_info,
+                effort.clone(),
+                summary,
+                service_tier.clone(),
+                responses_metadata,
+            )?;
+            // Strip image content items when the model does not declare image support,
+            // replacing them with IMAGE_CONTENT_OMITTED_PLACEHOLDER text so downstream
+            // chat message assembly always sees plain text.
+            strip_images_when_unsupported(&model_info.input_modalities, &mut request.input);
+
+            let mut tool_map = ToolReverseMap::new();
+            let chat_body = build_chat_request(&request, &mut tool_map).map_err(map_api_error)?;
+
+            // Build extra headers (session, beta features, turn state, attestation).
+            let mut extra_headers = build_responses_headers(
+                self.client.state.beta_features_header.as_deref(),
+                Some(&self.turn_state),
+            );
+            extra_headers.extend(
+                self.client
+                    .build_responses_compatibility_headers(responses_metadata),
+            );
+            if let Some(header_value) = self.client.generate_attestation_header_for().await {
+                extra_headers.insert(X_OAI_ATTESTATION_HEADER, header_value);
+            }
+
+            let inference_trace_attempt = inference_trace.start_attempt();
+            inference_trace_attempt.add_request_headers(&mut extra_headers);
+            inference_trace_attempt.record_started(&request);
+
+            // Assemble the raw HTTP request.
+            let mut raw_req: Request = client_setup
+                .api_provider
+                .build_request(http::Method::POST, "chat/completions");
+            raw_req.headers.extend(extra_headers);
+            raw_req.headers.insert(
+                http::header::ACCEPT,
+                HeaderValue::from_static("text/event-stream"),
+            );
+            raw_req.body = Some(RequestBody::Json(chat_body));
+
+            // Apply auth headers to the request.
+            let raw_req = match client_setup.api_auth.apply_auth(raw_req).await {
+                Ok(req) => req,
+                Err(e) => {
+                    let api_err = ApiError::Transport(TransportError::from(e));
+                    let err = map_api_error(api_err);
+                    return Err(err);
+                }
+            };
+
+            // Stream the response bytes.
+            let stream_result = transport.stream(raw_req).await;
+            match stream_result {
+                Ok(stream_response) => {
+                    let upstream_request_id = stream_response
+                        .headers
+                        .get("x-request-id")
+                        .and_then(|v| v.to_str().ok())
+                        .map(String::from);
+                    let event_stream =
+                        parse_chat_sse_stream(stream_response.bytes, tool_map).boxed();
+                    let (response_stream, _) = map_response_events(
+                        upstream_request_id,
+                        event_stream,
+                        session_telemetry.clone(),
+                        inference_trace_attempt,
+                    );
+                    return Ok(response_stream);
+                }
+                Err(unauthorized_transport @ TransportError::Http { status, .. })
+                    if status == StatusCode::UNAUTHORIZED =>
+                {
+                    let response_debug_context =
+                        extract_response_debug_context(&unauthorized_transport);
+                    inference_trace_attempt.record_failed(
+                        &unauthorized_transport,
+                        response_debug_context.request_id.as_deref(),
+                        /*output_items*/ &[],
+                    );
+                    pending_retry = PendingUnauthorizedRetry::from_recovery(
+                        handle_unauthorized(
+                            unauthorized_transport,
+                            &mut auth_recovery,
+                            session_telemetry,
+                        )
+                        .await?,
+                    );
+                    continue;
+                }
+                Err(err) => {
+                    let api_err = ApiError::Transport(err);
+                    let response_debug_context =
+                        extract_response_debug_context_from_api_error(&api_err);
+                    let api_err = map_api_error(api_err);
+                    inference_trace_attempt.record_failed(
+                        &api_err,
+                        response_debug_context.request_id.as_deref(),
+                        /*output_items*/ &[],
+                    );
+                    return Err(api_err);
+                }
+            }
+        }
+    }
+
     /// Streams a turn via the Responses API over WebSocket transport.
     #[allow(clippy::too_many_arguments)]
     #[instrument(
@@ -1566,6 +1740,19 @@ impl ModelClientSession {
     ) -> Result<ResponseStream> {
         let wire_api = self.client.state.provider.info().wire_api;
         match wire_api {
+            WireApi::Chat => {
+                self.stream_chat_completions_api(
+                    prompt,
+                    model_info,
+                    session_telemetry,
+                    effort,
+                    summary,
+                    service_tier,
+                    responses_metadata,
+                    inference_trace,
+                )
+                .await
+            }
             WireApi::Responses => {
                 if self.client.responses_websocket_enabled() {
                     let request_trace = current_span_w3c_trace_context();

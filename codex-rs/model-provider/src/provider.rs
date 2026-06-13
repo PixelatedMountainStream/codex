@@ -9,6 +9,7 @@ use codex_api::SharedAuthProvider;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_model_provider_info::ModelProviderInfo;
+use codex_model_provider_info::WireApi;
 use codex_models_manager::manager::OpenAiModelsManager;
 use codex_models_manager::manager::SharedModelsManager;
 use codex_models_manager::manager::StaticModelsManager;
@@ -218,6 +219,17 @@ impl ModelProvider for ConfiguredModelProvider {
         &self.info
     }
 
+    fn capabilities(&self) -> ProviderCapabilities {
+        match self.info.wire_api {
+            WireApi::Chat => ProviderCapabilities {
+                namespace_tools: false,
+                image_generation: false,
+                web_search: false,
+            },
+            WireApi::Responses => ProviderCapabilities::default(),
+        }
+    }
+
     fn auth_manager(&self) -> Option<Arc<AuthManager>> {
         self.auth_manager.clone()
     }
@@ -405,13 +417,36 @@ mod tests {
     }
 
     #[test]
-    fn configured_provider_uses_default_capabilities() {
+    fn configured_provider_uses_default_capabilities_for_responses_wire_api() {
         let provider = create_model_provider(
             ModelProviderInfo::create_openai_provider(/*base_url*/ None),
             /*auth_manager*/ None,
         );
 
         assert_eq!(provider.capabilities(), ProviderCapabilities::default());
+    }
+
+    #[test]
+    fn configured_provider_disables_hosted_tools_for_chat_wire_api() {
+        let provider = create_model_provider(
+            ModelProviderInfo {
+                name: "chat-provider".to_string(),
+                base_url: Some("http://localhost:11434/v1".to_string()),
+                wire_api: WireApi::Chat,
+                requires_openai_auth: false,
+                ..Default::default()
+            },
+            /*auth_manager*/ None,
+        );
+
+        assert_eq!(
+            provider.capabilities(),
+            ProviderCapabilities {
+                namespace_tools: false,
+                image_generation: false,
+                web_search: false,
+            }
+        );
     }
 
     #[test]
