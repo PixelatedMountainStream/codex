@@ -2271,6 +2271,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-chat-completions"
+version = "0.0.0"
+dependencies = [
+ "bytes",
+ "codex-api",
+ "codex-protocol",
+ "futures",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "codex-chatgpt"
 version = "0.0.0"
 dependencies = [
@@ -2600,6 +2616,8 @@ dependencies = [
  "codex-app-server-protocol",
  "codex-apply-patch",
  "codex-async-utils",
+ "codex-chat-completions",
+ "codex-client",
  "codex-code-mode",
  "codex-config",
  "codex-connectors",
