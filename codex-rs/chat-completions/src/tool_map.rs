@@ -96,17 +96,16 @@ pub fn translate_tools(tools: &[Value], map: &mut ToolReverseMap) -> Result<Vec<
 
         match kind {
             "function" => {
-                let func = tool
-                    .get("function")
-                    .ok_or_else(|| ApiError::InvalidRequest {
-                        message: "function tool missing 'function' field".into(),
-                    })?;
-                let name = func.get("name").and_then(Value::as_str).ok_or_else(|| {
+                // Responses-API function tools are serialized flat (the
+                // `#[serde(tag = "type")]` on `ToolSpec`), i.e. the name,
+                // description, and parameters live at the top level alongside
+                // `"type": "function"` — not nested under a `function` object.
+                let name = tool.get("name").and_then(Value::as_str).ok_or_else(|| {
                     ApiError::InvalidRequest {
-                        message: "function tool missing 'function.name'".into(),
+                        message: "function tool missing 'name'".into(),
                     }
                 })?;
-                let namespace = func
+                let namespace = tool
                     .get("namespace")
                     .and_then(Value::as_str)
                     .filter(|s| !s.is_empty());
@@ -120,10 +119,10 @@ pub fn translate_tools(tools: &[Value], map: &mut ToolReverseMap) -> Result<Vec<
 
                 let mut function_obj = serde_json::Map::new();
                 function_obj.insert("name".into(), Value::String(encoded));
-                if let Some(desc) = func.get("description") {
+                if let Some(desc) = tool.get("description") {
                     function_obj.insert("description".into(), desc.clone());
                 }
-                if let Some(params) = func.get("parameters") {
+                if let Some(params) = tool.get("parameters") {
                     function_obj.insert("parameters".into(), params.clone());
                 }
 
@@ -222,13 +221,13 @@ mod tests {
 
     #[test]
     fn translate_function_tool() {
+        // Flat Responses-API shape, as produced by
+        // `create_tools_json_for_responses_api`.
         let tools = vec![json!({
             "type": "function",
-            "function": {
-                "name": "calc",
-                "description": "A calculator",
-                "parameters": { "type": "object", "properties": {} }
-            }
+            "name": "calc",
+            "description": "A calculator",
+            "parameters": { "type": "object", "properties": {} }
         })];
         let mut map = ToolReverseMap::new();
         let out = translate_tools(&tools, &mut map).expect("should succeed");
@@ -245,12 +244,10 @@ mod tests {
     fn translate_function_tool_with_namespace() {
         let tools = vec![json!({
             "type": "function",
-            "function": {
-                "name": "search",
-                "namespace": "web",
-                "description": "Web search",
-                "parameters": { "type": "object", "properties": {} }
-            }
+            "name": "search",
+            "namespace": "web",
+            "description": "Web search",
+            "parameters": { "type": "object", "properties": {} }
         })];
         let mut map = ToolReverseMap::new();
         let out = translate_tools(&tools, &mut map).expect("should succeed");
@@ -287,14 +284,8 @@ mod tests {
     #[test]
     fn collision_returns_error() {
         let tools = vec![
-            json!({
-                "type": "function",
-                "function": { "name": "dup", "parameters": {} }
-            }),
-            json!({
-                "type": "function",
-                "function": { "name": "dup", "parameters": {} }
-            }),
+            json!({ "type": "function", "name": "dup", "parameters": {} }),
+            json!({ "type": "function", "name": "dup", "parameters": {} }),
         ];
         let mut map = ToolReverseMap::new();
         let result = translate_tools(&tools, &mut map);

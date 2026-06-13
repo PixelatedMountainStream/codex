@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use bytes::Bytes;
 use codex_api::ApiError;
 use codex_api::ResponseEvent;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use futures::Stream;
 use futures::StreamExt;
@@ -104,6 +105,7 @@ async fn drive_stream<S, E>(
 {
     // State
     let mut active_text_item_id: Option<String> = None;
+    let mut text_accumulator = String::new();
     let mut tool_call_builders: HashMap<usize, ToolCallBuilder> = HashMap::new();
     let mut stream_id: Option<String> = None;
     let mut finish_reason_seen: Option<String> = None;
@@ -164,6 +166,7 @@ async fn drive_stream<S, E>(
                             if let Err(e) = process_chunk(
                                 &data,
                                 &mut active_text_item_id,
+                                &mut text_accumulator,
                                 &mut tool_call_builders,
                                 &mut stream_id,
                                 &mut finish_reason_seen,
@@ -210,6 +213,7 @@ async fn drive_stream<S, E>(
             && let Err(e) = process_chunk(
                 &data,
                 &mut active_text_item_id,
+                &mut text_accumulator,
                 &mut tool_call_builders,
                 &mut stream_id,
                 &mut finish_reason_seen,
@@ -224,10 +228,19 @@ async fn drive_stream<S, E>(
 
     // Emit OutputItemDone for the text item if present.
     if let Some(text_id) = active_text_item_id.take() {
+        // Carry the accumulated streamed text into the finalized item so the
+        // assistant message is persisted (deltas alone leave content empty).
+        let content = if text_accumulator.is_empty() {
+            vec![]
+        } else {
+            vec![ContentItem::OutputText {
+                text: std::mem::take(&mut text_accumulator),
+            }]
+        };
         let done_item = ResponseItem::Message {
             id: Some(text_id),
             role: "assistant".into(),
-            content: vec![],
+            content,
             phase: None,
         };
         if tx
@@ -355,6 +368,7 @@ async fn drive_stream<S, E>(
 async fn process_chunk(
     data: &str,
     active_text_item_id: &mut Option<String>,
+    text_accumulator: &mut String,
     tool_call_builders: &mut HashMap<usize, ToolCallBuilder>,
     stream_id: &mut Option<String>,
     finish_reason_seen: &mut Option<String>,
@@ -412,6 +426,7 @@ async fn process_chunk(
                     .map_err(|_| ApiError::Stream("channel closed".into()))?;
                 *active_text_item_id = Some(text_id);
             }
+            text_accumulator.push_str(&content);
             tx.send(Ok(ResponseEvent::OutputTextDelta(content)))
                 .await
                 .map_err(|_| ApiError::Stream("channel closed".into()))?;
@@ -537,12 +552,18 @@ mod tests {
             it.next(),
             Some(Ok(ResponseEvent::OutputTextDelta(s))) if s == " world"
         ));
-        assert!(matches!(
-            it.next(),
-            Some(Ok(ResponseEvent::OutputItemDone(
-                ResponseItem::Message { .. }
-            )))
-        ));
+        // The finalized item must carry the accumulated text, not an empty
+        // content shell — otherwise the persisted assistant message is blank.
+        match it.next() {
+            Some(Ok(ResponseEvent::OutputItemDone(ResponseItem::Message { content, .. }))) => {
+                assert_eq!(content.len(), 1);
+                assert!(matches!(
+                    &content[0],
+                    ContentItem::OutputText { text } if text == "Hello world"
+                ));
+            }
+            other => panic!("expected OutputItemDone(Message), got {other:?}"),
+        }
         let completed = it.next().unwrap();
         assert!(matches!(
             completed,
@@ -560,10 +581,8 @@ mod tests {
         crate::tool_map::translate_tools(
             &[serde_json::json!({
                 "type": "function",
-                "function": {
-                    "name": "my_func",
-                    "parameters": {}
-                }
+                "name": "my_func",
+                "parameters": {}
             })],
             &mut tool_map,
         )
@@ -627,7 +646,8 @@ mod tests {
         crate::tool_map::translate_tools(
             &[serde_json::json!({
                 "type": "function",
-                "function": { "name": "ollamatool", "parameters": {} }
+                "name": "ollamatool",
+                "parameters": {}
             })],
             &mut tool_map,
         )
