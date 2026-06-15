@@ -40,6 +40,11 @@ enum ShellCommandBackend {
 pub struct ShellCommandHandler {
     backend: ShellCommandBackend,
     options: ShellCommandHandlerOptions,
+    /// When `Some`, overrides the value returned by `tool_name()`.  Used to
+    /// register dispatch-only aliases (e.g. `exec`) that share all execution
+    /// logic with the primary handler but answer to a different name so that
+    /// local models which emit non-standard tool names are routed correctly.
+    name_override: Option<ToolName>,
 }
 
 #[derive(Clone, Copy)]
@@ -55,7 +60,29 @@ impl ShellCommandHandler {
             ShellCommandBackendConfig::Classic => ShellCommandBackend::Classic,
             ShellCommandBackendConfig::ZshFork => ShellCommandBackend::ZshFork,
         };
-        Self { backend, options }
+        Self {
+            backend,
+            options,
+            name_override: None,
+        }
+    }
+
+    /// Create a dispatch-only alias that shares all execution logic with the
+    /// primary `ShellCommandHandler` but reports `name` as its tool name.
+    ///
+    /// The alias is intended to be registered via
+    /// `PlannedTools::add_dispatch_only` so it is routable but never sent to
+    /// the model as an advertised tool.
+    pub(crate) fn new_alias(options: ShellCommandHandlerOptions, name: ToolName) -> Self {
+        let backend = match options.backend_config {
+            ShellCommandBackendConfig::Classic => ShellCommandBackend::Classic,
+            ShellCommandBackendConfig::ZshFork => ShellCommandBackend::ZshFork,
+        };
+        Self {
+            backend,
+            options,
+            name_override: Some(name),
+        }
     }
 
     fn shell_runtime_backend(&self) -> ShellRuntimeBackend {
@@ -126,7 +153,9 @@ impl From<ShellCommandBackendConfig> for ShellCommandHandler {
 
 impl ToolExecutor<ToolInvocation> for ShellCommandHandler {
     fn tool_name(&self) -> ToolName {
-        ToolName::plain("shell_command")
+        self.name_override
+            .clone()
+            .unwrap_or_else(|| ToolName::plain("shell_command"))
     }
 
     fn spec(&self) -> ToolSpec {

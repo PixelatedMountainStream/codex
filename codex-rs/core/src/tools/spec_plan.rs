@@ -606,12 +606,25 @@ fn add_shell_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut Planne
             // Keep the legacy shell tool registered while unified exec is
             // model-visible.
             planned_tools.add_dispatch_only(ShellCommandHandler::new(shell_command_options));
+            // Register a hidden alias so local models that emit `exec` as the
+            // tool name (e.g. qwen3-coder via the Chat Completions/Ollama path)
+            // are routed to the shell execution path instead of producing an
+            // "unsupported call: exec" error.
+            planned_tools.add_dispatch_only(ShellCommandHandler::new_alias(
+                shell_command_options,
+                ToolName::plain("exec"),
+            ));
         }
         ConfigShellToolType::Disabled => {}
         ConfigShellToolType::Default
         | ConfigShellToolType::Local
         | ConfigShellToolType::ShellCommand => {
             planned_tools.add(ShellCommandHandler::new(shell_command_options));
+            // Same hidden alias for local models on the default shell path.
+            planned_tools.add_dispatch_only(ShellCommandHandler::new_alias(
+                shell_command_options,
+                ToolName::plain("exec"),
+            ));
         }
     }
 }

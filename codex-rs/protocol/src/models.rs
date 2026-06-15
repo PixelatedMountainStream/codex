@@ -1320,6 +1320,9 @@ pub struct SearchToolCallParams {
 /// `arguments` field should deserialize to this struct.
 #[derive(Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 pub struct ShellCommandToolCallParams {
+    // Some local models (e.g. qwen3-coder over the Chat Completions wire) call
+    // the shell tool with a `cmd` key instead of `command`; accept both.
+    #[serde(alias = "cmd")]
     pub command: String,
     pub workdir: Option<String>,
 

@@ -17,12 +17,16 @@ use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::handlers::ShellCommandHandler;
+use crate::tools::handlers::ShellCommandHandlerOptions;
 use crate::tools::hook_names::HookToolName;
 use crate::tools::registry::CoreToolRuntime;
 use crate::turn_diff_tracker::TurnDiffTracker;
 use codex_shell_command::is_safe_command::is_known_safe_command;
 use codex_shell_command::powershell::try_find_powershell_executable_blocking;
 use codex_shell_command::powershell::try_find_pwsh_executable_blocking;
+use codex_tools::ShellCommandBackendConfig;
+use codex_tools::ToolExecutor as _;
+use codex_tools::ToolName;
 use serde_json::json;
 use tokio::sync::Mutex;
 use tokio::sync::watch;
@@ -259,5 +263,46 @@ async fn build_post_tool_use_payload_uses_tool_output_wire_value() {
             tool_input: json!({ "command": "printf shell command" }),
             tool_response: json!("shell output"),
         })
+    );
+}
+
+// ── exec alias tests ──────────────────────────────────────────────────────────
+
+#[test]
+fn exec_alias_tool_name_is_exec() {
+    let options = ShellCommandHandlerOptions {
+        backend_config: ShellCommandBackendConfig::Classic,
+        allow_login_shell: false,
+        exec_permission_approvals_enabled: false,
+    };
+    let alias = ShellCommandHandler::new_alias(options, ToolName::plain("exec"));
+    assert_eq!(alias.tool_name(), ToolName::plain("exec"));
+}
+
+#[test]
+fn primary_handler_tool_name_is_unaffected() {
+    let options = ShellCommandHandlerOptions {
+        backend_config: ShellCommandBackendConfig::Classic,
+        allow_login_shell: false,
+        exec_permission_approvals_enabled: false,
+    };
+    let handler = ShellCommandHandler::new(options);
+    assert_eq!(handler.tool_name(), ToolName::plain("shell_command"));
+}
+
+#[test]
+fn exec_alias_matches_function_payload() {
+    let options = ShellCommandHandlerOptions {
+        backend_config: ShellCommandBackendConfig::Classic,
+        allow_login_shell: false,
+        exec_permission_approvals_enabled: false,
+    };
+    let alias = ShellCommandHandler::new_alias(options, ToolName::plain("exec"));
+    let payload = ToolPayload::Function {
+        arguments: json!({"command": "echo hi"}).to_string(),
+    };
+    assert!(
+        alias.matches_kind(&payload),
+        "exec alias must accept Function payloads"
     );
 }
