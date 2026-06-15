@@ -148,6 +148,9 @@ pub struct ConfigToml {
     /// Size of the context window for the model, in tokens.
     pub model_context_window: Option<i64>,
 
+    /// Override the apply_patch tool presentation type for the model.
+    pub model_apply_patch_tool_type: Option<codex_protocol::openai_models::ApplyPatchToolType>,
+
     /// Token usage threshold triggering auto-compaction of conversation history.
     pub model_auto_compact_token_limit: Option<i64>,
 
