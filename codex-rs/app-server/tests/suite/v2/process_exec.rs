@@ -42,7 +42,7 @@ async fn process_spawn_returns_before_exit_and_emits_exit_notification() -> Resu
                 "while (!(Test-Path -LiteralPath $env:CODEX_PROCESS_EXEC_RELEASE_FILE)) { ",
                 "Start-Sleep -Milliseconds 20 ",
                 "}; ",
-                "[Console]::Out.Write('process-out'); ",
+                "[Console]::Out.Write(('process-out|{0}|{1}' -f $env:OpenAI_Federation_Rule_Id, $env:OPENAI_IDENTITY_TOKEN_FILE)); ",
                 "[Console]::Error.Write('process-err')",
             )
             .to_string(),
@@ -54,7 +54,7 @@ async fn process_spawn_returns_before_exit_and_emits_exit_notification() -> Resu
             concat!(
                 "printf process > \"$CODEX_PROCESS_EXEC_PROBE_FILE\"; ",
                 "while [ ! -e \"$CODEX_PROCESS_EXEC_RELEASE_FILE\" ]; do sleep 0.05; done; ",
-                "printf process-out; ",
+                "printf 'process-out|%s|%s' \"$OpenAI_Federation_Rule_Id\" \"$OPENAI_IDENTITY_TOKEN_FILE\"; ",
                 "printf process-err >&2",
             )
             .to_string(),
@@ -68,6 +68,14 @@ async fn process_spawn_returns_before_exit_and_emits_exit_notification() -> Resu
         (
             "CODEX_PROCESS_EXEC_RELEASE_FILE".to_string(),
             Some(release_file.display().to_string()),
+        ),
+        (
+            "OpenAI_Federation_Rule_Id".to_string(),
+            Some("rule".to_string()),
+        ),
+        (
+            "OPENAI_IDENTITY_TOKEN_FILE".to_string(),
+            Some("/run/identity-token".to_string()),
         ),
     ]);
     let spawn_request_id = mcp
@@ -94,7 +102,7 @@ async fn process_spawn_returns_before_exit_and_emits_exit_notification() -> Resu
         ProcessExitedNotification {
             process_handle,
             exit_code: 0,
-            stdout: "process-out".to_string(),
+            stdout: "process-out||".to_string(),
             stdout_cap_reached: false,
             stderr: "process-err".to_string(),
             stderr_cap_reached: false,
@@ -108,11 +116,12 @@ async fn process_spawn_returns_error_when_local_environment_is_disabled() -> Res
     let codex_home = TempDir::new()?;
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
     create_config_toml(codex_home.path(), &server.uri(), "never")?;
-    let mut mcp = TestAppServer::new_with_env(
-        codex_home.path(),
-        &[(CODEX_EXEC_SERVER_URL_ENV_VAR, Some("none"))],
-    )
-    .await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .with_env_overrides(&[(CODEX_EXEC_SERVER_URL_ENV_VAR, Some("none"))])
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let process_request_id = mcp
@@ -233,7 +242,11 @@ async fn process_kill_terminates_running_process() -> Result<()> {
 async fn initialized_mcp(codex_home: &Path) -> Result<(MockServer, TestAppServer)> {
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
     create_config_toml(codex_home, &server.uri(), "never")?;
-    let mut mcp = TestAppServer::new(codex_home).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home)
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
     Ok((server, mcp))
 }

@@ -3,6 +3,7 @@
   "definitions": {
     "McpAuthStatus": {
       "enum": [
+        "unknown",
         "unsupported",
         "notLoggedIn",
         "bearerToken",
@@ -58,6 +59,12 @@
         },
         "name": {
           "type": "string"
+        },
+        "pluginId": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "resourceTemplates": {
           "items": {

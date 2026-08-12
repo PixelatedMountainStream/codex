@@ -49,10 +49,11 @@ use codex_login::CODEX_ACCESS_TOKEN_ENV_VAR;
 use codex_login::CODEX_API_KEY_ENV_VAR;
 use codex_login::CodexAuth;
 use codex_login::OPENAI_API_KEY_ENV_VAR;
-use codex_login::default_client::build_reqwest_client;
+use codex_login::default_client::create_client_without_request_logging;
 use codex_login::default_client::default_headers;
 use codex_login::load_auth_dot_json;
 use codex_model_provider::create_model_provider;
+use codex_protocol::auth::AuthMode;
 use codex_protocol::protocol::AskForApproval;
 use codex_terminal_detection::Multiplexer;
 use codex_terminal_detection::TerminalInfo;
@@ -796,6 +797,10 @@ fn installation_check(show_details: bool) -> DoctorCheck {
         "managed by bun: {}",
         env::var_os("CODEX_MANAGED_BY_BUN").is_some()
     ));
+    details.push(format!(
+        "managed by pnpm: {}",
+        env::var_os("CODEX_MANAGED_BY_PNPM").is_some()
+    ));
     push_env_path_detail(
         &mut details,
         "managed package root",
@@ -884,6 +889,7 @@ fn doctor_managed_by_npm(current_exe: Option<&Path>) -> bool {
 fn inherited_managed_env_for_cargo_binary(current_exe: Option<&Path>) -> bool {
     if env::var_os("CODEX_MANAGED_BY_NPM").is_none()
         && env::var_os("CODEX_MANAGED_BY_BUN").is_none()
+        && env::var_os("CODEX_MANAGED_BY_PNPM").is_none()
     {
         return false;
     }
@@ -935,6 +941,9 @@ fn describe_install_context(context: &InstallContext) -> String {
         }
         InstallMethod::Bun => {
             describe_method_with_package_layout("bun", context.package_layout.as_ref())
+        }
+        InstallMethod::Pnpm => {
+            describe_method_with_package_layout("pnpm", context.package_layout.as_ref())
         }
         InstallMethod::Brew => {
             describe_method_with_package_layout("brew", context.package_layout.as_ref())
@@ -1080,7 +1089,10 @@ fn config_check(config: &Config) -> DoctorCheck {
     ));
     details.push(format!("model provider: {}", config.model_provider_id));
     details.push(format!("log dir: {}", config.log_dir.display()));
-    details.push(format!("sqlite home: {}", config.sqlite_home.display()));
+    details.push(format!(
+        "sqlite home: {}",
+        config.sqlite_config().home().display()
+    ));
     details.push(format!("mcp servers: {}", config.mcp_servers.get().len()));
     feature_flag_details(config, &mut details);
     config_toml_details(config, &mut details);
@@ -1196,7 +1208,11 @@ fn auth_check(config: &Config) -> DoctorCheck {
         return check;
     }
 
-    match load_auth_dot_json(&config.codex_home, config.cli_auth_credentials_store_mode) {
+    match load_auth_dot_json(
+        &config.codex_home,
+        config.cli_auth_credentials_store_mode,
+        config.auth_keyring_backend_kind(),
+    ) {
         Ok(Some(auth)) => {
             details.push(format!("stored auth mode: {}", stored_auth_mode(&auth)));
             details.push(format!("stored API key: {}", auth.openai_api_key.is_some()));
@@ -1319,27 +1335,28 @@ fn provider_specific_auth_check(
 
 fn stored_auth_mode(auth: &codex_login::AuthDotJson) -> &'static str {
     match stored_auth_mode_value(auth) {
-        codex_app_server_protocol::AuthMode::ApiKey => "api_key",
-        codex_app_server_protocol::AuthMode::Chatgpt => "chatgpt",
-        codex_app_server_protocol::AuthMode::ChatgptAuthTokens => "chatgpt_auth_tokens",
-        codex_app_server_protocol::AuthMode::AgentIdentity => "agent_identity",
-        codex_app_server_protocol::AuthMode::PersonalAccessToken => "personal_access_token",
-        codex_app_server_protocol::AuthMode::BedrockApiKey => "bedrock_api_key",
+        AuthMode::ApiKey => "api_key",
+        AuthMode::Chatgpt => "chatgpt",
+        AuthMode::ChatgptAuthTokens => "chatgpt_auth_tokens",
+        AuthMode::Headers => "headers",
+        AuthMode::AgentIdentity => "agent_identity",
+        AuthMode::PersonalAccessToken => "personal_access_token",
+        AuthMode::BedrockApiKey => "bedrock_api_key",
     }
 }
 
-fn stored_auth_mode_value(auth: &AuthDotJson) -> codex_app_server_protocol::AuthMode {
+fn stored_auth_mode_value(auth: &AuthDotJson) -> AuthMode {
     if let Some(mode) = auth.auth_mode {
         return mode;
     }
     if auth.personal_access_token.is_some() {
-        codex_app_server_protocol::AuthMode::PersonalAccessToken
+        AuthMode::PersonalAccessToken
     } else if auth.bedrock_api_key.is_some() {
-        codex_app_server_protocol::AuthMode::BedrockApiKey
+        AuthMode::BedrockApiKey
     } else if auth.openai_api_key.is_some() {
-        codex_app_server_protocol::AuthMode::ApiKey
+        AuthMode::ApiKey
     } else {
-        codex_app_server_protocol::AuthMode::Chatgpt
+        AuthMode::Chatgpt
     }
 }
 
@@ -1349,7 +1366,7 @@ fn stored_auth_issues(
 ) -> Vec<&'static str> {
     let mut issues = Vec::new();
     match stored_auth_mode_value(auth) {
-        codex_app_server_protocol::AuthMode::ApiKey => {
+        AuthMode::ApiKey => {
             let stored_key_present = auth
                 .openai_api_key
                 .as_deref()
@@ -1360,7 +1377,7 @@ fn stored_auth_issues(
                 issues.push("API key auth is missing an API key");
             }
         }
-        codex_app_server_protocol::AuthMode::Chatgpt => {
+        AuthMode::Chatgpt => {
             match auth.tokens.as_ref() {
                 Some(tokens) => {
                     if tokens.access_token.trim().is_empty() {
@@ -1376,7 +1393,7 @@ fn stored_auth_issues(
                 issues.push("ChatGPT auth is missing refresh metadata");
             }
         }
-        codex_app_server_protocol::AuthMode::ChatgptAuthTokens => {
+        AuthMode::ChatgptAuthTokens => {
             match auth.tokens.as_ref() {
                 Some(tokens) => {
                     if tokens.access_token.trim().is_empty() {
@@ -1392,16 +1409,19 @@ fn stored_auth_issues(
                 issues.push("external ChatGPT auth is missing refresh metadata");
             }
         }
-        codex_app_server_protocol::AuthMode::AgentIdentity => {
+        AuthMode::Headers => {
+            issues.push("header auth cannot be loaded from auth storage");
+        }
+        AuthMode::AgentIdentity => {
             if auth
                 .agent_identity
-                .as_deref()
-                .is_none_or(|token| token.trim().is_empty())
+                .as_ref()
+                .is_none_or(|agent_identity| !agent_identity.has_auth_material())
             {
                 issues.push("agent identity auth is missing an agent identity token");
             }
         }
-        codex_app_server_protocol::AuthMode::PersonalAccessToken => {
+        AuthMode::PersonalAccessToken => {
             if auth
                 .personal_access_token
                 .as_deref()
@@ -1410,7 +1430,7 @@ fn stored_auth_issues(
                 issues.push("personal access token auth is missing a personal access token");
             }
         }
-        codex_app_server_protocol::AuthMode::BedrockApiKey => {
+        AuthMode::BedrockApiKey => {
             if auth.bedrock_api_key.is_none() {
                 issues.push("Bedrock API key auth is missing a Bedrock API key");
             }
@@ -1516,19 +1536,35 @@ async fn mcp_check_from_servers(servers: &HashMap<String, McpServerConfig>) -> D
                 if disabled_server {
                     continue;
                 }
-                if let Some(cwd) = cwd
-                    && !cwd.exists()
-                {
-                    missing_env.push(format!("{name}: cwd does not exist ({})", cwd.display()));
-                }
-                if command.trim().is_empty() {
+                let command_is_empty = command.trim().is_empty();
+                if command_is_empty {
                     missing_env.push(format!("{name}: stdio command is empty"));
-                } else if let Err(err) =
-                    stdio_command_resolves(command, cwd.as_deref(), env.as_ref())
-                {
-                    missing_env.push(format!(
-                        "{name}: stdio command {command:?} is not resolvable ({err})"
-                    ));
+                }
+                if server.is_local_environment() {
+                    let host_native_cwd = cwd.as_ref().map(|cwd| Path::new(cwd.as_str()));
+                    if let Some(cwd) = host_native_cwd
+                        && !cwd.exists()
+                    {
+                        missing_env.push(format!("{name}: cwd does not exist ({})", cwd.display()));
+                    }
+                    if !command_is_empty
+                        && let Err(err) =
+                            stdio_command_resolves(command, host_native_cwd, env.as_ref())
+                    {
+                        missing_env.push(format!(
+                            "{name}: stdio command {command:?} is not resolvable ({err})"
+                        ));
+                    }
+                } else {
+                    match cwd {
+                        Some(cwd) if cwd.to_inferred_path_uri().is_none() => {
+                            missing_env
+                                .push(format!("{name}: remote stdio cwd is not absolute ({cwd})"));
+                        }
+                        None => missing_env
+                            .push(format!("{name}: remote stdio requires an explicit cwd")),
+                        Some(_) => {}
+                    }
                 }
                 if let Some(env) = env {
                     for key in env.keys().filter(|key| key.trim().is_empty()) {
@@ -1537,10 +1573,12 @@ async fn mcp_check_from_servers(servers: &HashMap<String, McpServerConfig>) -> D
                 }
                 for env_var in env_vars {
                     if env_var.is_remote_source() {
-                        missing_env.push(format!(
-                            "{name}: env_vars entry `{}` uses source `remote`, which requires remote MCP stdio",
-                            env_var.name()
-                        ));
+                        if server.is_local_environment() {
+                            missing_env.push(format!(
+                                "{name}: env_vars entry `{}` uses source `remote`, which requires remote MCP stdio",
+                                env_var.name()
+                            ));
+                        }
                     } else if !env_var_present(env_var.name()) {
                         missing_env.push(format!("{name}: env var {} is not set", env_var.name()));
                     }
@@ -2128,11 +2166,18 @@ async fn state_check(config: &Config) -> DoctorCheck {
     let mut details = Vec::new();
     path_readiness(&mut details, "CODEX_HOME", &config.codex_home);
     path_readiness(&mut details, "log dir", &config.log_dir);
-    path_readiness(&mut details, "sqlite home", &config.sqlite_home);
+    path_readiness(&mut details, "sqlite home", config.sqlite_config().home());
     let mut integrity_failures = Vec::new();
-    for db in codex_state::runtime_db_paths(&config.sqlite_home) {
+    for db in config.sqlite_config().runtime_db_paths() {
         path_readiness(&mut details, db.label, &db.path);
-        sqlite_integrity_detail(&mut details, &mut integrity_failures, db.label, &db.path).await;
+        sqlite_integrity_detail(
+            config.sqlite_config(),
+            &mut details,
+            &mut integrity_failures,
+            db.label,
+            &db.path,
+        )
+        .await;
     }
     rollout_stats_details(&mut details, &config.codex_home);
     standalone_release_cache_details(&mut details);
@@ -2157,6 +2202,7 @@ async fn state_check(config: &Config) -> DoctorCheck {
 }
 
 async fn sqlite_integrity_detail(
+    sqlite: &codex_state::SqliteConfig,
     details: &mut Vec<String>,
     integrity_failures: &mut Vec<String>,
     label: &str,
@@ -2167,7 +2213,7 @@ async fn sqlite_integrity_detail(
         return;
     }
 
-    match codex_state::sqlite_integrity_check(path).await {
+    match codex_state::sqlite_integrity_check(sqlite, path).await {
         Ok(rows) if rows.iter().all(|row| row == "ok") => {
             details.push(format!("{label} integrity: ok"));
         }
@@ -2348,9 +2394,11 @@ async fn websocket_reachability_check(
         HeaderValue::from_static(RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE),
     );
     let client = ResponsesWebsocketClient::new(api_provider, api_auth);
+    let http_client_factory = config.http_client_factory();
     match tokio::time::timeout(
         provider.websocket_connect_timeout(),
         client.probe_handshake(
+            &http_client_factory,
             extra_headers,
             default_headers(),
             WEBSOCKET_IMMEDIATE_CLOSE_GRACE,
@@ -2361,10 +2409,6 @@ async fn websocket_reachability_check(
         Ok(Ok(probe)) => {
             details.push(format!("handshake result: HTTP {}", probe.status));
             details.push(format!("reasoning header: {}", probe.reasoning_included));
-            details.push(format!(
-                "models etag present: {}",
-                probe.models_etag_present
-            ));
             details.push(format!(
                 "server model present: {}",
                 probe.server_model_present
@@ -2440,12 +2484,13 @@ fn websocket_error_detail(err: &ApiError) -> String {
 
 fn auth_mode_name(auth: &CodexAuth) -> &'static str {
     match auth.auth_mode() {
-        codex_app_server_protocol::AuthMode::ApiKey => "api_key",
-        codex_app_server_protocol::AuthMode::Chatgpt => "chatgpt",
-        codex_app_server_protocol::AuthMode::ChatgptAuthTokens => "chatgpt_auth_tokens",
-        codex_app_server_protocol::AuthMode::AgentIdentity => "agent_identity",
-        codex_app_server_protocol::AuthMode::PersonalAccessToken => "personal_access_token",
-        codex_app_server_protocol::AuthMode::BedrockApiKey => "bedrock_api_key",
+        AuthMode::ApiKey => "api_key",
+        AuthMode::Chatgpt => "chatgpt",
+        AuthMode::ChatgptAuthTokens => "chatgpt_auth_tokens",
+        AuthMode::Headers => "headers",
+        AuthMode::AgentIdentity => "agent_identity",
+        AuthMode::PersonalAccessToken => "personal_access_token",
+        AuthMode::BedrockApiKey => "bedrock_api_key",
     }
 }
 
@@ -2528,10 +2573,13 @@ impl ProviderAuthReachabilityMode {
 }
 
 fn provider_reachability_plan(config: &Config) -> ReachabilityPlan {
-    let stored_auth =
-        load_auth_dot_json(&config.codex_home, config.cli_auth_credentials_store_mode)
-            .ok()
-            .flatten();
+    let stored_auth = load_auth_dot_json(
+        &config.codex_home,
+        config.cli_auth_credentials_store_mode,
+        config.auth_keyring_backend_kind(),
+    )
+    .ok()
+    .flatten();
     let mode = provider_auth_reachability_mode_from_auth(
         config.model_provider.requires_openai_auth,
         env_var_present,
@@ -2575,15 +2623,13 @@ fn provider_auth_reachability_mode_from_auth(
         return ProviderAuthReachabilityMode::Chatgpt;
     }
     match stored_auth.map(stored_auth_mode_value) {
+        Some(AuthMode::ApiKey | AuthMode::BedrockApiKey) => ProviderAuthReachabilityMode::ApiKey,
         Some(
-            codex_app_server_protocol::AuthMode::ApiKey
-            | codex_app_server_protocol::AuthMode::BedrockApiKey,
-        ) => ProviderAuthReachabilityMode::ApiKey,
-        Some(
-            codex_app_server_protocol::AuthMode::Chatgpt
-            | codex_app_server_protocol::AuthMode::ChatgptAuthTokens
-            | codex_app_server_protocol::AuthMode::AgentIdentity
-            | codex_app_server_protocol::AuthMode::PersonalAccessToken,
+            AuthMode::Chatgpt
+            | AuthMode::ChatgptAuthTokens
+            | AuthMode::Headers
+            | AuthMode::AgentIdentity
+            | AuthMode::PersonalAccessToken,
         )
         | None => ProviderAuthReachabilityMode::Chatgpt,
     }
@@ -2846,7 +2892,7 @@ async fn mcp_http_probe_url_with_timeout(url: &str, timeout: Duration) -> Result
 }
 
 async fn http_probe_url_with_timeout(url: &str, timeout: Duration) -> Result<String, String> {
-    let response = build_reqwest_client()
+    let response = create_client_without_request_logging()
         .head(url)
         .timeout(timeout)
         .send()
@@ -2872,7 +2918,7 @@ async fn http_get_probe_url_with_timeout(url: &str, timeout: Duration) -> Result
 }
 
 async fn http_get_probe_status_with_timeout(url: &str, timeout: Duration) -> Result<u16, String> {
-    let response = build_reqwest_client()
+    let response = create_client_without_request_logging()
         .get(url)
         .timeout(timeout)
         .send()
@@ -3434,6 +3480,26 @@ mod tests {
         }));
     }
 
+    #[tokio::test]
+    async fn mcp_check_does_not_probe_environment_stdio_on_the_host() {
+        let remote_server: McpServerConfig = toml::from_str(
+            r#"
+                command = "remote-only-command"
+                environment_id = "remote"
+                cwd = "C:\\plugins\\demo"
+                required = true
+                env_vars = [{ name = "REMOTE_ONLY_TOKEN", source = "remote" }]
+            "#,
+        )
+        .expect("remote MCP config");
+        let servers = HashMap::from([("remote".to_string(), remote_server)]);
+
+        let check = mcp_check_from_servers(&servers).await;
+
+        assert_eq!(check.status, CheckStatus::Ok);
+        assert_eq!(check.summary, "MCP configuration is locally consistent");
+    }
+
     #[test]
     fn provider_specific_auth_allows_non_openai_provider_without_env_key() {
         let check = provider_specific_auth_check(
@@ -3477,7 +3543,7 @@ mod tests {
     #[test]
     fn stored_auth_validation_rejects_missing_api_key() {
         let auth = AuthDotJson {
-            auth_mode: Some(codex_app_server_protocol::AuthMode::ApiKey),
+            auth_mode: Some(AuthMode::ApiKey),
             openai_api_key: None,
             tokens: None,
             last_refresh: None,
@@ -3529,7 +3595,7 @@ mod tests {
         assert_eq!(stored_auth_mode(&auth), "personal_access_token");
         assert!(stored_auth_issues(&auth, |_| false).is_empty());
 
-        auth.auth_mode = Some(codex_app_server_protocol::AuthMode::PersonalAccessToken);
+        auth.auth_mode = Some(AuthMode::PersonalAccessToken);
         auth.personal_access_token = None;
         assert_eq!(
             stored_auth_issues(&auth, |_| false),
@@ -3540,7 +3606,7 @@ mod tests {
     #[test]
     fn provider_reachability_mode_uses_api_key_auth() {
         let api_key_auth = AuthDotJson {
-            auth_mode: Some(codex_app_server_protocol::AuthMode::ApiKey),
+            auth_mode: Some(AuthMode::ApiKey),
             openai_api_key: Some("sk-test".to_string()),
             tokens: None,
             last_refresh: None,
@@ -3854,6 +3920,70 @@ mod tests {
                 "required: stdio command \"definitely-missing-codex-doctor-mcp\" is not resolvable",
             )
         }));
+    }
+
+    #[tokio::test]
+    async fn mcp_check_skips_host_path_checks_for_remote_stdio() {
+        #[cfg(not(windows))]
+        let cwd = r"C:\Users\openai\share";
+        #[cfg(windows)]
+        let cwd = "/home/openai/share";
+        let cwd = toml::Value::String(cwd.to_string());
+        let remote_server: McpServerConfig = toml::from_str(&format!(
+            r#"
+                command = "definitely-missing-codex-doctor-mcp"
+                environment_id = "remote"
+                cwd = {cwd}
+                required = true
+                env_vars = [{{ name = "REMOTE_ONLY_TOKEN", source = "remote" }}]
+            "#,
+        ))
+        .expect("should deserialize remote MCP config");
+        let servers = HashMap::from([("remote".to_string(), remote_server)]);
+
+        let check = mcp_check_from_servers(&servers).await;
+
+        assert_eq!(check.status, CheckStatus::Ok);
+        assert_eq!(check.summary, "MCP configuration is locally consistent");
+    }
+
+    #[tokio::test]
+    async fn mcp_check_validates_remote_stdio_cwd() {
+        let missing_cwd: McpServerConfig = toml::from_str(
+            r#"
+                command = "echo"
+                environment_id = "remote"
+                required = true
+            "#,
+        )
+        .expect("should deserialize remote MCP config without cwd");
+        let relative_cwd: McpServerConfig = toml::from_str(
+            r#"
+                command = "echo"
+                environment_id = "remote"
+                cwd = "relative"
+                required = true
+            "#,
+        )
+        .expect("should deserialize remote MCP config with relative cwd");
+        let servers = HashMap::from([
+            ("missing".to_string(), missing_cwd),
+            ("relative".to_string(), relative_cwd),
+        ]);
+
+        let check = mcp_check_from_servers(&servers).await;
+
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(
+            check
+                .details
+                .contains(&"missing: remote stdio requires an explicit cwd".to_string())
+        );
+        assert!(
+            check
+                .details
+                .contains(&"relative: remote stdio cwd is not absolute (relative)".to_string())
+        );
     }
 
     #[cfg(unix)]

@@ -35,6 +35,17 @@ impl fmt::Debug for WindowsSandboxCancellationToken {
     }
 }
 
+pub use codex_protocol::config_types::WindowsSandboxProxySettingsMode;
+
+/// Network settings installed by an administrator during managed Windows sandbox setup.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WindowsSandboxProvisioningSettings {
+    /// Loopback proxy ports permitted for the offline sandbox identity.
+    pub proxy_ports: Vec<u16>,
+    /// Whether the offline sandbox identity may exchange arbitrary loopback traffic.
+    pub allow_local_binding: bool,
+}
+
 #[cfg(target_os = "windows")]
 mod acl;
 #[cfg(target_os = "windows")]
@@ -105,7 +116,12 @@ mod setup_error;
 mod spawn_prep;
 
 #[cfg(target_os = "windows")]
+mod stdio_bridge;
+
+#[cfg(target_os = "windows")]
 mod unified_exec;
+#[cfg(target_os = "windows")]
+mod wrapper;
 
 #[cfg(target_os = "windows")]
 pub(crate) use elevated::ipc_framed;
@@ -133,6 +149,8 @@ pub use acl::ensure_allow_write_aces;
 pub use acl::fetch_dacl_handle;
 #[cfg(target_os = "windows")]
 pub use acl::path_mask_allows;
+#[cfg(target_os = "windows")]
+pub use acl::path_write_aces_need_refresh;
 #[cfg(target_os = "windows")]
 pub use audit::apply_world_writable_scan_and_denies_for_permissions;
 #[cfg(target_os = "windows")]
@@ -169,6 +187,8 @@ pub use elevated_impl::run_windows_sandbox_capture_for_permission_profile as run
 #[cfg(target_os = "windows")]
 pub use helper_materialization::resolve_current_exe_for_launch;
 #[cfg(target_os = "windows")]
+pub use helper_materialization::resolve_exe_for_launch;
+#[cfg(target_os = "windows")]
 pub use hide_users::hide_current_user_profile_dir;
 #[cfg(target_os = "windows")]
 pub use hide_users::hide_newly_created_users;
@@ -178,6 +198,8 @@ pub use identity::require_logon_sandbox_creds;
 pub use identity::sandbox_setup_is_complete;
 #[cfg(target_os = "windows")]
 pub use ipc_framed::ErrorPayload;
+#[cfg(target_os = "windows")]
+pub use ipc_framed::ErrorStage;
 #[cfg(target_os = "windows")]
 pub use ipc_framed::ExitPayload;
 #[cfg(target_os = "windows")]
@@ -216,6 +238,8 @@ pub use logging::log_note;
 pub use logging::log_writer;
 #[cfg(target_os = "windows")]
 pub use path_normalization::canonicalize_path;
+#[cfg(target_os = "windows")]
+pub use process::ConsoleMode;
 #[cfg(target_os = "windows")]
 pub use process::PipeSpawnHandles;
 #[cfg(target_os = "windows")]
@@ -269,6 +293,8 @@ pub use setup_error::setup_error_path;
 #[cfg(target_os = "windows")]
 pub use setup_error::write_setup_error_report;
 #[cfg(target_os = "windows")]
+pub use stdio_bridge::forward_sandbox_session_stdio;
+#[cfg(target_os = "windows")]
 #[doc(hidden)]
 pub use token::LocalSid;
 #[cfg(target_os = "windows")]
@@ -286,7 +312,11 @@ pub use token::create_workspace_write_token_with_caps_from;
 #[cfg(target_os = "windows")]
 pub use token::get_current_token_for_restriction;
 #[cfg(target_os = "windows")]
+pub use unified_exec::WindowsSandboxSessionRequest;
+#[cfg(target_os = "windows")]
 pub use unified_exec::spawn_windows_sandbox_session_elevated_for_permission_profile;
+#[cfg(target_os = "windows")]
+pub use unified_exec::spawn_windows_sandbox_session_for_level;
 #[cfg(target_os = "windows")]
 pub use unified_exec::spawn_windows_sandbox_session_legacy;
 #[cfg(target_os = "windows")]
@@ -309,6 +339,12 @@ pub use winutil::string_from_sid_bytes;
 pub use winutil::to_wide;
 #[cfg(target_os = "windows")]
 pub use workspace_acl::is_command_cwd_root;
+#[cfg(target_os = "windows")]
+pub use wrapper::CODEX_WINDOWS_SANDBOX_ARG1;
+#[cfg(target_os = "windows")]
+pub use wrapper::create_windows_sandbox_command_args_for_permission_profile;
+#[cfg(target_os = "windows")]
+pub use wrapper::run_windows_sandbox_wrapper_main;
 
 #[cfg(not(target_os = "windows"))]
 pub use stub::CaptureResult;
@@ -321,7 +357,9 @@ pub use stub::run_windows_sandbox_legacy_preflight;
 mod windows_impl {
     use super::WindowsSandboxCancellationToken;
     use super::logging::log_failure;
+    use super::logging::log_note;
     use super::logging::log_success;
+    use super::process::ConsoleMode;
     use super::process::create_process_as_user;
     use super::sandbox_utils::ensure_codex_home_exists;
     use super::spawn_prep::LegacyAclSids;
@@ -339,6 +377,7 @@ mod windows_impl {
     use std::io;
     use std::path::Path;
     use std::ptr;
+    use std::sync::Arc;
     use std::time::Duration;
     use std::time::Instant;
     use windows_sys::Win32::Foundation::CloseHandle;
@@ -539,6 +578,7 @@ mod windows_impl {
                 &env_map,
                 logs_base_dir,
                 Some((in_r, out_w, err_w)),
+                ConsoleMode::Inherit,
                 use_private_desktop,
             )
         };
@@ -558,6 +598,7 @@ mod windows_impl {
             }
         };
         let pi = created.process_info;
+        let job = Arc::clone(&created.job);
         let _desktop = created;
 
         unsafe {
@@ -621,10 +662,30 @@ mod windows_impl {
             unsafe {
                 GetExitCodeProcess(pi.hProcess, &mut exit_code_u32);
             }
-        } else {
-            unsafe {
-                windows_sys::Win32::System::Threading::TerminateProcess(pi.hProcess, 1);
+        }
+        if timed_out || cancelled {
+            if let Err(job_err) = job.terminate() {
+                log_note(
+                    &format!("capture failed to terminate process tree: {job_err}"),
+                    logs_base_dir,
+                );
+                let root_result = unsafe {
+                    windows_sys::Win32::System::Threading::TerminateProcess(pi.hProcess, 1)
+                };
+                if root_result == 0 {
+                    log_note(
+                        &format!("capture failed to terminate root process: {}", unsafe {
+                            GetLastError()
+                        }),
+                        logs_base_dir,
+                    );
+                }
             }
+        } else if let Err(err) = job.preserve_descendants() {
+            log_note(
+                &format!("capture failed to preserve descendants after root exit: {err}"),
+                logs_base_dir,
+            );
         }
 
         unsafe {

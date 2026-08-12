@@ -4,15 +4,24 @@
 use codex_core::exec_env::create_env;
 use codex_protocol::config_types::ShellEnvironmentPolicy;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::permissions::FileSystemAccessMode;
+use codex_protocol::permissions::FileSystemPath;
+use codex_protocol::permissions::FileSystemSandboxEntry;
+use codex_protocol::permissions::FileSystemSandboxPolicy;
+use codex_protocol::permissions::FileSystemSpecialPath;
+use codex_protocol::permissions::NetworkSandboxPolicy;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
 use std::collections::HashMap;
 use std::io::Read;
 use std::io::Write;
 use std::net::Ipv4Addr;
 use std::net::TcpListener;
+use std::os::unix::fs::MetadataExt;
 use std::process::Output;
 use std::process::Stdio;
 use std::time::Duration;
+use tempfile::NamedTempFile;
 use tokio::process::Command;
 
 const BWRAP_UNAVAILABLE_ERR: &str = "bubblewrap is unavailable: no system bwrap was found";
@@ -28,6 +37,8 @@ const MANAGED_PROXY_PERMISSION_ERR_SNIPPETS: &[&str] = &[
 const PROXY_ENV_KEYS: &[&str] = &[
     "HTTP_PROXY",
     "HTTPS_PROXY",
+    "WS_PROXY",
+    "WSS_PROXY",
     "ALL_PROXY",
     "FTP_PROXY",
     "YARN_HTTP_PROXY",
@@ -119,14 +130,23 @@ async fn run_linux_sandbox_direct(
     env: HashMap<String, String>,
     timeout_ms: u64,
 ) -> Output {
-    let cwd = match std::env::current_dir() {
-        Ok(cwd) => cwd,
-        Err(err) => panic!("cwd should exist: {err}"),
-    };
-    let permission_profile_json = match serde_json::to_string(permission_profile) {
-        Ok(permission_profile_json) => permission_profile_json,
-        Err(err) => panic!("permission profile should serialize: {err}"),
-    };
+    let mut command =
+        linux_sandbox_command(command, permission_profile, allow_network_for_proxy, env);
+    tokio::time::timeout(Duration::from_millis(timeout_ms), command.output())
+        .await
+        .expect("sandbox command should not time out")
+        .expect("sandbox command should execute")
+}
+
+fn linux_sandbox_command(
+    command: &[&str],
+    permission_profile: &PermissionProfile,
+    allow_network_for_proxy: bool,
+    env: HashMap<String, String>,
+) -> Command {
+    let cwd = std::env::current_dir().expect("current directory should exist");
+    let permission_profile_json =
+        serde_json::to_string(permission_profile).expect("permission profile should serialize");
 
     let mut args = vec![
         "--sandbox-policy-cwd".to_string(),
@@ -148,14 +168,145 @@ async fn run_linux_sandbox_direct(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let output = match tokio::time::timeout(Duration::from_millis(timeout_ms), cmd.output()).await {
-        Ok(output) => output,
-        Err(err) => panic!("sandbox command should not time out: {err}"),
-    };
-    match output {
-        Ok(output) => output,
-        Err(err) => panic!("sandbox command should execute: {err}"),
+    cmd
+}
+
+#[tokio::test]
+async fn managed_proxy_full_filesystem_uses_minimal_dev_nodes() {
+    if let Some(skip_reason) = managed_proxy_skip_reason().await {
+        eprintln!("skipping managed proxy test: {skip_reason}");
+        return;
     }
+
+    let host_dev = std::fs::metadata("/dev").expect("host /dev should exist");
+    let host_dev_id = format!("{}:{}", host_dev.dev(), host_dev.ino());
+    let shared_memory_file = match NamedTempFile::new_in("/dev/shm") {
+        Ok(file) => {
+            std::fs::write(file.path(), "host-before").expect("seed /dev/shm file");
+            Some(file)
+        }
+        Err(err) => {
+            eprintln!("skipping /dev/shm interoperability check: {err}");
+            None
+        }
+    };
+
+    let mut env = create_env_from_core_vars();
+    strip_proxy_env(&mut env);
+    env.insert("HTTP_PROXY".to_string(), "http://127.0.0.1:9".to_string());
+    if let Some(file) = &shared_memory_file {
+        env.insert(
+            "CODEX_TEST_SHM_PATH".to_string(),
+            file.path().to_string_lossy().into_owned(),
+        );
+    }
+
+    let output = run_linux_sandbox_direct(
+        &[
+            "bash",
+            "-c",
+            concat!(
+                "set -e; ",
+                "for node in null zero urandom; do test -c \"/dev/$node\"; done; ",
+                "printf test >/dev/null; ",
+                "head -c 1 /dev/zero >/dev/null; ",
+                "head -c 1 /dev/urandom >/dev/null; ",
+                "if command -v python3 >/dev/null 2>&1; then ",
+                "python3 -c 'import os; assert len(os.urandom(16)) == 16'; ",
+                "fi; ",
+                "if [ -n \"${CODEX_TEST_SHM_PATH:-}\" ]; then ",
+                "test \"$(cat \"$CODEX_TEST_SHM_PATH\")\" = host-before; ",
+                "printf sandbox-after >\"$CODEX_TEST_SHM_PATH\"; ",
+                "fi; ",
+                "stat -c '%d:%i' /dev",
+            ),
+        ],
+        &PermissionProfile::Disabled,
+        /*allow_network_for_proxy*/ true,
+        env,
+        NETWORK_TIMEOUT_MS,
+    )
+    .await;
+
+    assert_eq!(
+        output.status.success(),
+        true,
+        "standard devices should be usable; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_ne!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        host_dev_id,
+        "/dev should be synthetic rather than inherited from the host"
+    );
+    if let Some(file) = shared_memory_file {
+        assert_eq!(
+            std::fs::read_to_string(file.path()).expect("read /dev/shm file"),
+            "sandbox-after"
+        );
+    }
+}
+
+#[tokio::test]
+async fn managed_proxy_bridges_release_command_output_after_exit() {
+    if let Some(skip_reason) = managed_proxy_skip_reason().await {
+        eprintln!("skipping managed proxy test: {skip_reason}");
+        return;
+    }
+
+    let mut env = create_env_from_core_vars();
+    strip_proxy_env(&mut env);
+    env.insert("HTTP_PROXY".to_string(), "http://127.0.0.1:9".to_string());
+
+    let output = run_linux_sandbox_direct(
+        &["bash", "-c", "printf 'bridge output closed\\n'"],
+        &PermissionProfile::Disabled,
+        /*allow_network_for_proxy*/ true,
+        env,
+        NETWORK_TIMEOUT_MS,
+    )
+    .await;
+
+    assert_eq!(output.status.success(), true);
+    assert_eq!(output.stdout, b"bridge output closed\n");
+}
+
+#[tokio::test]
+async fn managed_proxy_readiness_survives_closed_standard_descriptors() {
+    if let Some(skip_reason) = managed_proxy_skip_reason().await {
+        eprintln!("skipping managed proxy test: {skip_reason}");
+        return;
+    }
+
+    let mut env = create_env_from_core_vars();
+    strip_proxy_env(&mut env);
+    env.insert("HTTP_PROXY".to_string(), "http://127.0.0.1:9".to_string());
+
+    let mut command = linux_sandbox_command(
+        &["bash", "-c", "true"],
+        &PermissionProfile::Disabled,
+        /*allow_network_for_proxy*/ true,
+        env,
+    );
+    unsafe {
+        command.pre_exec(|| {
+            libc::close(libc::STDIN_FILENO);
+            libc::close(libc::STDOUT_FILENO);
+            Ok(())
+        });
+    }
+
+    let output = tokio::time::timeout(Duration::from_millis(NETWORK_TIMEOUT_MS), command.output())
+        .await
+        .expect("sandbox command should not time out")
+        .expect("sandbox command should execute");
+
+    assert_eq!(
+        output.status.success(),
+        true,
+        "managed proxy readiness should survive closed standard descriptors; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[tokio::test]
@@ -218,14 +369,40 @@ async fn managed_proxy_mode_routes_through_bridge_and_blocks_direct_egress() {
         "HTTP_PROXY".to_string(),
         format!("http://127.0.0.1:{proxy_port}"),
     );
+    env.insert(
+        "WSS_PROXY".to_string(),
+        format!("http://127.0.0.1:{proxy_port}"),
+    );
+
+    let sandbox_helper_dir = std::path::Path::new(env!("CARGO_BIN_EXE_codex-linux-sandbox"))
+        .parent()
+        .expect("sandbox helper should have a parent");
+    let file_system_sandbox_policy =
+        FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
+            path: FileSystemPath::Special {
+                value: FileSystemSpecialPath::Minimal,
+            },
+            access: FileSystemAccessMode::Read,
+            missing_path_behavior: None,
+        }])
+        .with_additional_readable_roots(
+            std::env::current_dir()
+                .expect("current directory should exist")
+                .as_path(),
+            &[AbsolutePathBuf::try_from(sandbox_helper_dir).expect("absolute helper dir")],
+        );
+    let permission_profile = PermissionProfile::from_runtime_permissions(
+        &file_system_sandbox_policy,
+        NetworkSandboxPolicy::Restricted,
+    );
 
     let routed_output = run_linux_sandbox_direct(
         &[
             "bash",
             "-c",
-            "proxy=\"${HTTP_PROXY#*://}\"; host=\"${proxy%%:*}\"; port=\"${proxy##*:}\"; exec 3<>/dev/tcp/${host}/${port}; printf 'GET http://example.com/ HTTP/1.1\\r\\nHost: example.com\\r\\n\\r\\n' >&3; IFS= read -r line <&3; printf '%s\\n' \"$line\"",
+            "proxy=\"${WSS_PROXY#*://}\"; host=\"${proxy%%:*}\"; port=\"${proxy##*:}\"; exec 3<>/dev/tcp/${host}/${port}; printf 'GET http://example.com/ HTTP/1.1\\r\\nHost: example.com\\r\\n\\r\\n' >&3; IFS= read -r line <&3; printf '%s\\n' \"$line\"",
         ],
-        &PermissionProfile::Disabled,
+        &permission_profile,
         /*allow_network_for_proxy*/ true,
         env.clone(),
         NETWORK_TIMEOUT_MS,

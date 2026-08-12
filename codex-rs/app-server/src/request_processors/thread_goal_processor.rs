@@ -4,6 +4,8 @@ use codex_goal_extension::GoalService;
 use codex_goal_extension::GoalServiceError;
 use codex_goal_extension::GoalSetRequest;
 use codex_goal_extension::GoalTokenBudgetUpdate;
+use codex_protocol::protocol::ThreadSettingsAppliedEvent;
+use codex_protocol::protocol::ThreadSettingsSnapshot;
 
 #[derive(Clone)]
 pub(crate) struct ThreadGoalRequestProcessor {
@@ -63,18 +65,11 @@ impl ThreadGoalRequestProcessor {
             .map(|()| None)
     }
 
-    pub(crate) async fn emit_resume_goal_snapshot_and_continue(
-        &self,
-        thread_id: ThreadId,
-        thread: &CodexThread,
-    ) {
+    pub(crate) async fn emit_resume_goal_snapshot(&self, thread_id: ThreadId) {
         if !self.config.features.enabled(Feature::Goals) {
             return;
         }
         self.emit_thread_goal_snapshot(thread_id).await;
-        // App-server owns resume response and snapshot ordering, so wait until
-        // those are sent before letting extensions react to the idle thread.
-        thread.emit_thread_idle_lifecycle_if_idle().await;
     }
 
     pub(crate) async fn pending_resume_goal_state(
@@ -94,6 +89,26 @@ impl ThreadGoalRequestProcessor {
         (emit_thread_goal_update, thread_goal_state_db)
     }
 
+    pub(crate) async fn restore_inherited_goal_runtime(&self, thread_id: ThreadId) {
+        if let Err(err) = self
+            .goal_service
+            .restore_thread_runtime_after_resume(thread_id)
+            .await
+        {
+            warn!("failed to restore inherited goal runtime for {thread_id}: {err}");
+        }
+    }
+
+    pub(crate) async fn flush_goal_progress_for_fork(
+        &self,
+        thread_id: ThreadId,
+    ) -> Result<(), String> {
+        self.goal_service
+            .flush_thread_goal_progress_for_fork(thread_id)
+            .await
+            .map_err(|err| err.to_string())
+    }
+
     async fn thread_goal_set_inner(
         &self,
         request_id: ConnectionRequestId,
@@ -107,6 +122,10 @@ impl ThreadGoalRequestProcessor {
         let state_db = self.state_db_for_materialized_thread(thread_id).await?;
         self.reconcile_thread_goal_rollout(thread_id, &state_db)
             .await?;
+        let max_goal_token_budget = match self.thread_manager.get_thread(thread_id).await {
+            Ok(thread) => thread.config().await.max_goal_token_budget,
+            Err(_) => self.config.max_goal_token_budget,
+        };
 
         let listener_command_tx = {
             let thread_state = self.thread_state_manager.thread_state(thread_id).await;
@@ -130,11 +149,58 @@ impl ThreadGoalRequestProcessor {
                         Some(token_budget) => GoalTokenBudgetUpdate::Set(token_budget),
                         None => GoalTokenBudgetUpdate::Keep,
                     },
+                    max_goal_token_budget,
                 },
             )
             .await
             .map_err(goal_service_error)?;
         let goal = ThreadGoal::from(outcome.goal.clone());
+
+        let persist_result = match self.thread_manager.get_thread(thread_id).await {
+            Ok(thread) => match thread.rollout_path() {
+                Some(path) if codex_rollout::existing_rollout_path(&path).await.is_none() => {
+                    // Goal-first threads need their settings captured when the goal creates the
+                    // rollout. Once materialized, normal settings updates own this event.
+                    let persisted_settings = thread
+                        .config_snapshot()
+                        .await
+                        .into_thread_settings_snapshot();
+                    let items = [
+                        thread_settings_applied_item(persisted_settings.clone()),
+                        outcome.thread_goal_updated_item(),
+                    ];
+                    match thread.append_rollout_items(&items).await {
+                        Err(err) => Err(err),
+                        Ok(()) => {
+                            // Catch up a settings update queued while the rollout materialized.
+                            let current_settings = thread
+                                .config_snapshot()
+                                .await
+                                .into_thread_settings_snapshot();
+                            if current_settings == persisted_settings {
+                                Ok(())
+                            } else {
+                                thread
+                                    .append_rollout_items(&[thread_settings_applied_item(
+                                        current_settings,
+                                    )])
+                                    .await
+                            }
+                        }
+                    }
+                }
+                Some(_) | None => {
+                    thread
+                        .append_rollout_items(&[outcome.thread_goal_updated_item()])
+                        .await
+                }
+            },
+            Err(_) => Ok(()),
+        };
+        if let Err(err) = persist_result {
+            warn!("failed to persist goal update for live thread {thread_id}: {err}");
+        }
+
         self.outgoing
             .send_response(
                 request_id.clone(),
@@ -255,6 +321,19 @@ impl ThreadGoalRequestProcessor {
             })?
             .ok_or_else(|| invalid_request(format!("thread not found: {thread_id}")))?,
         };
+
+        if let Ok(Some(metadata)) = state_db.get_thread(thread_id).await
+            && codex_rollout::plain_rollout_path(metadata.rollout_path.as_path())
+                == codex_rollout::plain_rollout_path(rollout_path.as_path())
+            && let Some(existing_path) =
+                codex_rollout::existing_rollout_path(metadata.rollout_path.as_path()).await
+            && codex_rollout::read_session_meta_line(existing_path.as_path())
+                .await
+                .is_ok_and(|session_meta| session_meta.meta.id == thread_id)
+        {
+            return Ok(());
+        }
+
         reconcile_rollout(
             Some(state_db),
             rollout_path.as_path(),
@@ -268,7 +347,7 @@ impl ThreadGoalRequestProcessor {
         Ok(())
     }
 
-    async fn emit_thread_goal_snapshot(&self, thread_id: ThreadId) {
+    pub(crate) async fn emit_thread_goal_snapshot(&self, thread_id: ThreadId) {
         let state_db = match self.state_db_for_materialized_thread(thread_id).await {
             Ok(state_db) => state_db,
             Err(err) => {
@@ -349,6 +428,12 @@ impl ThreadGoalRequestProcessor {
             ))
             .await;
     }
+}
+
+fn thread_settings_applied_item(thread_settings: ThreadSettingsSnapshot) -> RolloutItem {
+    RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(
+        ThreadSettingsAppliedEvent { thread_settings },
+    ))
 }
 
 pub(super) fn api_thread_goal_from_state(goal: codex_state::ThreadGoal) -> ThreadGoal {

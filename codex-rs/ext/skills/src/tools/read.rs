@@ -1,3 +1,4 @@
+use codex_analytics::InvocationType;
 use codex_extension_api::FunctionCallError;
 use codex_extension_api::ToolCall;
 use codex_extension_api::ToolExecutor;
@@ -8,27 +9,30 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
 
-use crate::catalog::SkillPackageId;
 use crate::catalog::SkillResourceId;
 use crate::provider::SkillReadRequest;
+use crate::render::build_alias_plan;
 
 use super::MAX_HANDLE_BYTES;
 use super::SkillToolAuthority;
 use super::SkillToolContext;
-use super::external_json_output;
+use super::pagination_cursor;
 use super::parse_args;
+use super::parse_pagination_cursor;
+use super::serialized_len;
 use super::skill_function_tool;
+use super::skill_json_output;
 use super::skill_tool_name;
 use super::validate_handle;
 
 const TOOL_NAME: &str = "read";
+const MAX_READ_RESPONSE_BYTES: usize = 512 * 1024;
 
 #[derive(Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
 struct ReadArgs {
-    authority: SkillToolAuthority,
     package: String,
-    resource: String,
+    resource: Option<String>,
+    cursor: Option<String>,
 }
 
 #[derive(Debug, Eq, JsonSchema, PartialEq, Serialize)]
@@ -36,6 +40,9 @@ struct ReadArgs {
 struct ReadResponse {
     resource: String,
     contents: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    skill_root: Option<String>,
+    next_cursor: Option<String>,
 }
 
 #[derive(Clone)]
@@ -51,38 +58,102 @@ impl ToolExecutor<ToolCall> for ReadTool {
     fn spec(&self) -> ToolSpec {
         skill_function_tool::<ReadArgs, ReadResponse>(
             TOOL_NAME,
-            "Read one complete resource from an enabled skill. Pass the exact authority and package returned by skills.list; resource identifiers remain opaque and are routed to that authority.",
+            "Read one page from a skill. Pass its provided package directly; root aliases are resolved automatically. Omit resource to read SKILL.md; to read another file, use the same package and pass the file's complete skill:// identifier as resource. For executor-backed skills, skill_root is the skill's absolute directory in the executor filesystem and can be used to locate bundled scripts. If the package is not provided, use skills.list to find it. Pass next_cursor back as cursor to continue.",
         )
     }
 
     fn handle(&self, call: ToolCall) -> ToolExecutorFuture<'_> {
         Box::pin(async move {
             let args: ReadArgs = parse_args(&call)?;
-            let authority = args.authority.into_authority();
             validate_handle("package", &args.package, MAX_HANDLE_BYTES)?;
-            validate_handle("resource", &args.resource, MAX_HANDLE_BYTES)?;
-
-            let catalog = self.context.catalog(&call.turn_id, args.authority).await;
-            let package_is_available = catalog.entries.iter().any(|entry| {
-                entry.enabled && entry.authority == authority && entry.id.0 == args.package
-            });
-            if !package_is_available {
-                return Err(FunctionCallError::RespondToModel(
-                    "skill package is not available from the requested authority".to_string(),
-                ));
+            if let Some(resource) = args.resource.as_deref() {
+                validate_handle("resource", resource, MAX_HANDLE_BYTES)?;
             }
 
-            let requested_resource = SkillResourceId::new(args.resource);
+            let mut selected_skill = None;
+            for selector in [
+                super::SkillToolAuthoritySelector::Orchestrator,
+                super::SkillToolAuthoritySelector::Executor,
+            ] {
+                let catalog = self.context.catalog(&call.turn_id, selector).await;
+                let alias_plan = build_alias_plan(
+                    &catalog
+                        .entries
+                        .iter()
+                        .filter(|entry| entry.is_model_visible())
+                        .collect::<Vec<_>>(),
+                );
+                if let Some(entry) = catalog.entries.into_iter().find(|entry| {
+                    entry.enabled
+                        && (entry.id.0 == args.package
+                            || alias_plan
+                                .as_ref()
+                                .and_then(|plan| plan.shorten(&entry.id.0))
+                                .is_some_and(|alias| alias == args.package))
+                        && SkillToolAuthority::from_authority(&entry.authority)
+                            .is_some_and(|authority| authority.selector() == selector)
+                }) {
+                    selected_skill = Some((entry, selector));
+                    break;
+                }
+            }
+            let Some((skill_entry, output_authority)) = selected_skill else {
+                return Err(FunctionCallError::RespondToModel(
+                    "skill package is not available".to_string(),
+                ));
+            };
+            let authority = skill_entry.authority.clone();
+            let package = skill_entry.id.clone();
+            let main_prompt = skill_entry.main_prompt.clone();
+            let requested_resource = match args.resource {
+                None => main_prompt.clone(),
+                Some(resource) if resource == main_prompt.as_str() => main_prompt.clone(),
+                Some(resource) => main_prompt
+                    .bind_environment_package_resource(&package, resource.clone())
+                    .unwrap_or_else(|| SkillResourceId::new(resource)),
+            };
+            let resolved_executor_roots = self
+                .context
+                .executor_query
+                .as_ref()
+                .map(|query| query.resolved_executor_roots.clone())
+                .unwrap_or_default();
+            let sandbox = requested_resource
+                .environment_path()
+                .and_then(|(environment_id, _)| {
+                    self.context.sandbox_contexts.as_ref().and_then(|contexts| {
+                        contexts.get(environment_id).map(|captured| {
+                            call.environments
+                                .iter()
+                                .find(|environment| environment.environment_id == environment_id)
+                                .map(|environment| environment.file_system_sandbox_context.clone())
+                                .unwrap_or_else(|| captured.clone())
+                        })
+                    })
+                });
+            if self.context.sandbox_contexts.is_some()
+                && requested_resource.environment_path().is_some()
+                && sandbox.is_none()
+            {
+                return Err(FunctionCallError::RespondToModel(
+                    "failed to read skill resource".to_string(),
+                ));
+            }
             let result = self
                 .context
-                .providers
-                .read(SkillReadRequest {
-                    authority,
-                    package: SkillPackageId(args.package),
-                    resource: requested_resource.clone(),
-                    host: None,
-                    mcp_resources: self.context.mcp_resources.clone(),
-                })
+                .thread_state
+                .read_skill(
+                    &self.context.providers,
+                    SkillReadRequest {
+                        authority,
+                        package,
+                        resource: requested_resource.clone(),
+                        resolved_executor_roots,
+                        sandbox,
+                        host_snapshot: None,
+                        mcp_resources: self.context.mcp_resources.clone(),
+                    },
+                )
                 .await
                 .map_err(|err| {
                     tracing::warn!(
@@ -99,11 +170,89 @@ impl ToolExecutor<ToolCall> for ReadTool {
                     "skill provider returned a different resource".to_string(),
                 ));
             }
+            if output_authority == super::SkillToolAuthoritySelector::Orchestrator
+                && let Some(state) = self
+                    .context
+                    .thread_state
+                    .shadow_selection_turn(&call.turn_id)
+            {
+                self.context
+                    .shadow_selection
+                    .record_invocation(&state, main_prompt.as_str());
+            }
 
-            external_json_output(&ReadResponse {
-                resource: result.resource.as_str().to_string(),
-                contents: result.contents,
-            })
+            let start = parse_pagination_cursor(
+                args.cursor.as_deref(),
+                result.contents.as_str(),
+                "skills.read",
+            )?;
+            if start > result.contents.len() || !result.contents.is_char_boundary(start) {
+                return Err(FunctionCallError::RespondToModel(
+                    "skills.read cursor is invalid".to_string(),
+                ));
+            }
+            let skill_root = if output_authority == super::SkillToolAuthoritySelector::Executor {
+                main_prompt
+                    .environment_path()
+                    .and_then(|(_, path)| path.parent())
+                    .map(|path| path.inferred_native_path_string())
+            } else {
+                None
+            };
+            let response = page_response(
+                result.resource.as_str(),
+                &result.contents,
+                skill_root.as_deref(),
+                start,
+            )?;
+            let output = skill_json_output(&response, output_authority)?;
+
+            if requested_resource == main_prompt
+                && args.cursor.is_none()
+                && let Some(analytics) = self.context.analytics.as_ref()
+            {
+                analytics.track_skill_invocation(
+                    &skill_entry,
+                    call.model.clone(),
+                    call.turn_id.clone(),
+                    InvocationType::Implicit,
+                );
+            }
+
+            Ok(output)
         })
     }
+}
+
+fn page_response(
+    resource: &str,
+    contents: &str,
+    skill_root: Option<&str>,
+    start: usize,
+) -> Result<ReadResponse, FunctionCallError> {
+    let response = |end, next_cursor| ReadResponse {
+        resource: resource.to_string(),
+        contents: contents[start..end].to_string(),
+        skill_root: skill_root.map(str::to_string),
+        next_cursor,
+    };
+    let complete = response(contents.len(), None);
+    if serialized_len(&complete)? <= MAX_READ_RESPONSE_BYTES {
+        return Ok(complete);
+    }
+
+    let mut end = contents.len();
+    while end > start {
+        end = start + (end - start) / 2;
+        while !contents.is_char_boundary(end) {
+            end -= 1;
+        }
+        let candidate = response(end, Some(pagination_cursor(contents, end)));
+        if serialized_len(&candidate)? <= MAX_READ_RESPONSE_BYTES {
+            return Ok(candidate);
+        }
+    }
+    Err(FunctionCallError::Fatal(
+        "skill resource handle leaves no room for contents".to_string(),
+    ))
 }

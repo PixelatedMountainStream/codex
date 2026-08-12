@@ -27,6 +27,7 @@ use codex_app_server_protocol::TurnPlanUpdatedNotification;
 use codex_app_server_protocol::TurnStartedNotification;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::WebSearchAction as ApiWebSearchAction;
+use codex_app_server_protocol::WebSearchItem as ApiWebSearchItem;
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
 use codex_protocol::models::PermissionProfile;
@@ -170,8 +171,10 @@ fn command_execution_started_and_completed_translate_to_thread_events() {
     let command_item = ThreadItem::CommandExecution {
         id: "cmd-1".to_string(),
         command: "ls".to_string(),
-        cwd: test_path_buf("/tmp/project").abs(),
+        cwd: test_path_buf("/tmp/project").abs().into(),
         process_id: Some("123".to_string()),
+        plugin_id: None,
+        script_path: None,
         source: CommandExecutionSource::UserShell,
         status: ApiCommandExecutionStatus::InProgress,
         command_actions: Vec::<CommandAction>::new(),
@@ -210,8 +213,10 @@ fn command_execution_started_and_completed_translate_to_thread_events() {
             item: ThreadItem::CommandExecution {
                 id: "cmd-1".to_string(),
                 command: "ls".to_string(),
-                cwd: test_path_buf("/tmp/project").abs(),
+                cwd: test_path_buf("/tmp/project").abs().into(),
                 process_id: Some("123".to_string()),
+                plugin_id: None,
+                script_path: None,
                 source: CommandExecutionSource::UserShell,
                 status: ApiCommandExecutionStatus::Completed,
                 command_actions: Vec::<CommandAction>::new(),
@@ -362,14 +367,15 @@ fn web_search_completion_preserves_query_and_action() {
 
     let collected = processor.collect_thread_events(ServerNotification::ItemCompleted(
         ItemCompletedNotification {
-            item: ThreadItem::WebSearch {
+            item: ThreadItem::WebSearch(ApiWebSearchItem {
                 id: "search-1".to_string(),
                 query: "rust async await".to_string(),
                 action: Some(ApiWebSearchAction::Search {
                     query: Some("rust async await".to_string()),
                     queries: None,
                 }),
-            },
+                results: None,
+            }),
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
             completed_at_ms: 0,
@@ -403,11 +409,12 @@ fn web_search_start_and_completion_reuse_item_id() {
 
     let started =
         processor.collect_thread_events(ServerNotification::ItemStarted(ItemStartedNotification {
-            item: ThreadItem::WebSearch {
+            item: ThreadItem::WebSearch(ApiWebSearchItem {
                 id: "search-1".to_string(),
                 query: String::new(),
                 action: None,
-            },
+                results: None,
+            }),
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
             started_at_ms: 0,
@@ -415,14 +422,15 @@ fn web_search_start_and_completion_reuse_item_id() {
 
     let completed = processor.collect_thread_events(ServerNotification::ItemCompleted(
         ItemCompletedNotification {
-            item: ThreadItem::WebSearch {
+            item: ThreadItem::WebSearch(ApiWebSearchItem {
                 id: "search-1".to_string(),
                 query: "rust async await".to_string(),
                 action: Some(ApiWebSearchAction::Search {
                     query: Some("rust async await".to_string()),
                     queries: None,
                 }),
-            },
+                results: None,
+            }),
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
             completed_at_ms: 0,
@@ -478,8 +486,10 @@ fn mcp_tool_call_begin_and_end_emit_item_events() {
                 tool: "tool_x".to_string(),
                 status: ApiMcpToolCallStatus::InProgress,
                 arguments: json!({ "key": "value" }),
+                app_context: None,
                 mcp_app_resource_uri: None,
                 plugin_id: None,
+                read_only_hint: None,
                 result: None,
                 error: None,
                 duration_ms: None,
@@ -496,8 +506,10 @@ fn mcp_tool_call_begin_and_end_emit_item_events() {
                 tool: "tool_x".to_string(),
                 status: ApiMcpToolCallStatus::Completed,
                 arguments: json!({ "key": "value" }),
+                app_context: None,
                 mcp_app_resource_uri: None,
                 plugin_id: None,
+                read_only_hint: None,
                 result: Some(Box::new(McpToolCallResult {
                     content: Vec::new(),
                     structured_content: None,
@@ -568,8 +580,10 @@ fn mcp_tool_call_failure_sets_failed_status() {
                 tool: "tool_y".to_string(),
                 status: ApiMcpToolCallStatus::Failed,
                 arguments: json!({ "param": 42 }),
+                app_context: None,
                 mcp_app_resource_uri: None,
                 plugin_id: None,
+                read_only_hint: None,
                 result: None,
                 error: Some(McpToolCallError {
                     message: "tool exploded".to_string(),
@@ -617,8 +631,10 @@ fn mcp_tool_call_defaults_arguments_and_preserves_structured_content() {
                 tool: "tool_z".to_string(),
                 status: ApiMcpToolCallStatus::InProgress,
                 arguments: serde_json::Value::Null,
+                app_context: None,
                 mcp_app_resource_uri: None,
                 plugin_id: None,
+                read_only_hint: None,
                 result: None,
                 error: None,
                 duration_ms: None,
@@ -635,8 +651,10 @@ fn mcp_tool_call_defaults_arguments_and_preserves_structured_content() {
                 tool: "tool_z".to_string(),
                 status: ApiMcpToolCallStatus::Completed,
                 arguments: serde_json::Value::Null,
+                app_context: None,
                 mcp_app_resource_uri: None,
                 plugin_id: None,
+                read_only_hint: None,
                 result: Some(Box::new(McpToolCallResult {
                     content: vec![json!({
                         "type": "text",
@@ -1222,6 +1240,7 @@ fn token_usage_update_is_emitted_on_turn_completion() {
                         total_tokens: 42,
                         input_tokens: 10,
                         cached_input_tokens: 3,
+                        cache_write_input_tokens: 4,
                         output_tokens: 29,
                         reasoning_output_tokens: 7,
                     },
@@ -1229,6 +1248,7 @@ fn token_usage_update_is_emitted_on_turn_completion() {
                         total_tokens: 42,
                         input_tokens: 10,
                         cached_input_tokens: 3,
+                        cache_write_input_tokens: 4,
                         output_tokens: 29,
                         reasoning_output_tokens: 7,
                     },
@@ -1266,6 +1286,7 @@ fn token_usage_update_is_emitted_on_turn_completion() {
                 usage: Usage {
                     input_tokens: 10,
                     cached_input_tokens: 3,
+                    cache_write_input_tokens: 4,
                     output_tokens: 29,
                     reasoning_output_tokens: 7,
                 },
@@ -1321,8 +1342,10 @@ fn turn_completion_reconciles_started_items_from_turn_items() {
             item: ThreadItem::CommandExecution {
                 id: "cmd-1".to_string(),
                 command: "ls".to_string(),
-                cwd: test_path_buf("/tmp/project").abs(),
+                cwd: test_path_buf("/tmp/project").abs().into(),
                 process_id: Some("123".to_string()),
+                plugin_id: None,
+                script_path: None,
                 source: CommandExecutionSource::UserShell,
                 status: ApiCommandExecutionStatus::InProgress,
                 command_actions: Vec::<CommandAction>::new(),
@@ -1361,8 +1384,10 @@ fn turn_completion_reconciles_started_items_from_turn_items() {
                 items: vec![ThreadItem::CommandExecution {
                     id: "cmd-1".to_string(),
                     command: "ls".to_string(),
-                    cwd: test_path_buf("/tmp/project").abs(),
+                    cwd: test_path_buf("/tmp/project").abs().into(),
                     process_id: Some("123".to_string()),
+                    plugin_id: None,
+                    script_path: None,
                     source: CommandExecutionSource::UserShell,
                     status: ApiCommandExecutionStatus::Completed,
                     command_actions: Vec::<CommandAction>::new(),

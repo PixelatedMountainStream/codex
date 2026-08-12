@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use bytes::Bytes;
 use codex_api::ApiError;
 use codex_api::ResponseEvent;
+use codex_protocol::ResponseItemId;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use futures::Stream;
@@ -272,11 +273,13 @@ async fn drive_stream<S, E>(
                         let effective_ns =
                             namespace.clone().or(decoded_ns).filter(|s| !s.is_empty());
                         let call_item = ResponseItem::FunctionCall {
-                            id: Some(item_id),
+                            id: Some(ResponseItemId::from_server(item_id)),
                             name: decoded_name,
                             namespace: effective_ns,
                             arguments: call.arguments,
+                            encrypted_function_args: None,
                             call_id,
+                            internal_chat_message_metadata_passthrough: None,
                         };
                         if tx
                             .send(Ok(ResponseEvent::OutputItemAdded(call_item.clone())))
@@ -296,11 +299,13 @@ async fn drive_stream<S, E>(
                     Some(ToolKind::Custom) => {
                         let input = extract_custom_input(&call.arguments);
                         let call_item = ResponseItem::CustomToolCall {
-                            id: Some(item_id),
+                            id: Some(ResponseItemId::from_server(item_id)),
                             status: None,
                             call_id,
                             name: call.name,
+                            namespace: None,
                             input,
+                            internal_chat_message_metadata_passthrough: None,
                         };
                         if tx
                             .send(Ok(ResponseEvent::OutputItemAdded(call_item.clone())))
@@ -326,11 +331,13 @@ async fn drive_stream<S, E>(
                             call.name
                         );
                         let call_item = ResponseItem::FunctionCall {
-                            id: Some(item_id),
+                            id: Some(ResponseItemId::from_server(item_id)),
                             name: call.name,
                             namespace: None,
                             arguments: call.arguments,
+                            encrypted_function_args: None,
                             call_id,
+                            internal_chat_message_metadata_passthrough: None,
                         };
                         if tx
                             .send(Ok(ResponseEvent::OutputItemAdded(call_item.clone())))
@@ -366,10 +373,11 @@ async fn drive_stream<S, E>(
             }]
         };
         let done_item = ResponseItem::Message {
-            id: Some(text_id),
+            id: Some(ResponseItemId::from_server(text_id)),
             role: "assistant".into(),
             content,
             phase: None,
+            internal_chat_message_metadata_passthrough: None,
         };
         if tx
             .send(Ok(ResponseEvent::OutputItemDone(done_item)))
@@ -393,11 +401,13 @@ async fn drive_stream<S, E>(
                 let (decoded_ns, decoded_name) = decode_name(&builder.name);
                 let effective_ns = namespace.clone().or(decoded_ns).filter(|s| !s.is_empty());
                 let call_item = ResponseItem::FunctionCall {
-                    id: Some(item_id.clone()),
+                    id: Some(ResponseItemId::from_server(item_id.clone())),
                     name: decoded_name,
                     namespace: effective_ns,
                     arguments: builder.arguments,
+                    encrypted_function_args: None,
                     call_id: builder.id,
+                    internal_chat_message_metadata_passthrough: None,
                 };
                 if tx
                     .send(Ok(ResponseEvent::OutputItemAdded(call_item.clone())))
@@ -419,11 +429,13 @@ async fn drive_stream<S, E>(
                 // Extract `input` from `{"input": "..."}` arguments JSON.
                 let input = extract_custom_input(&builder.arguments);
                 let call_item = ResponseItem::CustomToolCall {
-                    id: Some(item_id.clone()),
+                    id: Some(ResponseItemId::from_server(item_id.clone())),
                     status: None,
                     call_id: builder.id,
                     name: builder.name.clone(),
+                    namespace: None,
                     input,
+                    internal_chat_message_metadata_passthrough: None,
                 };
                 if tx
                     .send(Ok(ResponseEvent::OutputItemAdded(call_item.clone())))
@@ -448,11 +460,13 @@ async fn drive_stream<S, E>(
                     builder.name
                 );
                 let call_item = ResponseItem::FunctionCall {
-                    id: Some(item_id.clone()),
+                    id: Some(ResponseItemId::from_server(item_id.clone())),
                     name: builder.name,
                     namespace: None,
                     arguments: builder.arguments,
+                    encrypted_function_args: None,
                     call_id: builder.id,
+                    internal_chat_message_metadata_passthrough: None,
                 };
                 if tx
                     .send(Ok(ResponseEvent::OutputItemAdded(call_item.clone())))
@@ -538,10 +552,11 @@ async fn process_chunk(
                 // First text chunk — emit OutputItemAdded before the delta.
                 let text_id = Uuid::new_v4().to_string();
                 let added_item = ResponseItem::Message {
-                    id: Some(text_id.clone()),
+                    id: Some(ResponseItemId::from_server(text_id.clone())),
                     role: "assistant".into(),
                     content: vec![],
                     phase: None,
+                    internal_chat_message_metadata_passthrough: None,
                 };
                 tx.send(Ok(ResponseEvent::OutputItemAdded(added_item)))
                     .await

@@ -5,6 +5,7 @@ mod desired_state;
 mod enroll;
 mod protocol;
 mod segment;
+mod server_api;
 mod websocket;
 
 use self::auth::load_remote_control_auth;
@@ -12,10 +13,10 @@ use self::auth::recover_remote_control_auth;
 use self::desired_state::RemoteControlDesiredState;
 use self::desired_state::acquire_persistence_lock;
 use self::enroll::RemoteControlEnrollment;
-use self::enroll::enroll_remote_control_server;
 use self::enroll::load_persisted_remote_control_enrollment;
-use self::enroll::refresh_remote_control_server;
 use self::enroll::update_persisted_remote_control_enrollment;
+use self::server_api::enroll_remote_control_server;
+use self::server_api::refresh_remote_control_server;
 use crate::transport::remote_control::websocket::RemoteControlChannels;
 use crate::transport::remote_control::websocket::RemoteControlStatusPublisher;
 use crate::transport::remote_control::websocket::RemoteControlWebsocket;
@@ -64,6 +65,14 @@ use tracing::warn;
 pub struct RemoteControlStartConfig {
     pub remote_control_url: String,
     pub installation_id: String,
+    pub policy: RemoteControlPolicy,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteControlPolicy {
+    #[default]
+    Allowed,
+    DisabledByRequirements,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +104,7 @@ pub(super) struct QueuedServerEnvelope {
 
 #[derive(Clone)]
 pub struct RemoteControlHandle {
+    policy: RemoteControlPolicy,
     desired_state_tx: Arc<watch::Sender<RemoteControlDesiredState>>,
     desired_state_rpc_lock: Arc<Semaphore>,
     desired_state_persistence_lock: Arc<Semaphore>,
@@ -195,20 +205,64 @@ impl fmt::Display for RemoteControlUnavailable {
 
 impl Error for RemoteControlUnavailable {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoteControlDisabledByRequirements;
+
+impl fmt::Display for RemoteControlDisabledByRequirements {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "remote control is disabled by managed requirements")
+    }
+}
+
+impl Error for RemoteControlDisabledByRequirements {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteControlEnableError {
+    Unavailable(RemoteControlUnavailable),
+    DisabledByRequirements(RemoteControlDisabledByRequirements),
+}
+
+impl fmt::Display for RemoteControlEnableError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unavailable(err) => err.fmt(f),
+            Self::DisabledByRequirements(err) => err.fmt(f),
+        }
+    }
+}
+
+impl Error for RemoteControlEnableError {}
+
 impl RemoteControlHandle {
+    pub fn ensure_remote_control_allowed(&self) -> Result<(), RemoteControlDisabledByRequirements> {
+        match self.policy {
+            RemoteControlPolicy::Allowed => Ok(()),
+            RemoteControlPolicy::DisabledByRequirements => Err(RemoteControlDisabledByRequirements),
+        }
+    }
+
+    fn ensure_remote_control_allowed_io(&self) -> io::Result<()> {
+        self.ensure_remote_control_allowed()
+            .map_err(|err| io::Error::new(io::ErrorKind::PermissionDenied, err))
+    }
+
     pub fn enable_ephemeral(
         &self,
-    ) -> Result<RemoteControlStatusChangedNotification, RemoteControlUnavailable> {
+    ) -> Result<RemoteControlStatusChangedNotification, RemoteControlEnableError> {
         self.enable_with_preference(/*persistence_preference*/ None)
     }
 
     fn enable_with_preference(
         &self,
         persistence_preference: Option<bool>,
-    ) -> Result<RemoteControlStatusChangedNotification, RemoteControlUnavailable> {
+    ) -> Result<RemoteControlStatusChangedNotification, RemoteControlEnableError> {
+        self.ensure_remote_control_allowed()
+            .map_err(RemoteControlEnableError::DisabledByRequirements)?;
         if self.state_db.is_none() {
             warn!("remote control cannot be enabled because sqlite state db is unavailable");
-            return Err(RemoteControlUnavailable);
+            return Err(RemoteControlEnableError::Unavailable(
+                RemoteControlUnavailable,
+            ));
         }
 
         let mut effective_persistence_preference = persistence_preference;
@@ -255,6 +309,7 @@ impl RemoteControlHandle {
         &self,
         app_server_client_name: Option<&str>,
     ) -> io::Result<RemoteControlStatusChangedNotification> {
+        self.ensure_remote_control_allowed_io()?;
         let _transition = self
             .desired_state_rpc_lock
             .acquire()
@@ -334,6 +389,7 @@ impl RemoteControlHandle {
         params: RemoteControlPairingStartParams,
         app_server_client_name: Option<&str>,
     ) -> io::Result<RemoteControlPairingStartResponse> {
+        self.ensure_remote_control_allowed_io()?;
         if !self.desired_state_tx.borrow().is_enabled() {
             return Err(Self::pairing_disabled_error());
         }
@@ -564,6 +620,7 @@ impl RemoteControlHandle {
         &self,
         params: RemoteControlPairingStatusParams,
     ) -> io::Result<RemoteControlPairingStatusResponse> {
+        self.ensure_remote_control_allowed_io()?;
         if !self.desired_state_tx.borrow().is_enabled() {
             return Err(Self::pairing_disabled_error());
         }
@@ -663,6 +720,7 @@ impl RemoteControlHandle {
         &self,
         params: RemoteControlClientsListParams,
     ) -> io::Result<RemoteControlClientsListResponse> {
+        self.ensure_remote_control_allowed_io()?;
         clients::list_remote_control_clients(&self.remote_control_url, &self.auth_manager, params)
             .await
     }
@@ -671,6 +729,7 @@ impl RemoteControlHandle {
         &self,
         params: RemoteControlClientsRevokeParams,
     ) -> io::Result<RemoteControlClientsRevokeResponse> {
+        self.ensure_remote_control_allowed_io()?;
         clients::revoke_remote_control_client(&self.remote_control_url, &self.auth_manager, params)
             .await
     }
@@ -767,27 +826,39 @@ async fn refresh_pairing_enrollment(
     installation_id: &str,
     enrollment: &mut RemoteControlEnrollment,
 ) -> io::Result<()> {
-    if let Err(err) = refresh_remote_control_server(auth, installation_id, enrollment).await {
-        if err.kind() != io::ErrorKind::PermissionDenied {
-            return Err(err);
-        }
+    let mut refresh_result = refresh_remote_control_server(auth, installation_id, enrollment).await;
+    if refresh_result
+        .as_ref()
+        .is_err_and(|err| err.kind() == io::ErrorKind::PermissionDenied)
+    {
         let mut auth_recovery = auth_manager.unauthorized_recovery();
         let mut auth_change_rx = auth_manager.auth_change_receiver();
-        if !recover_remote_control_auth(&mut auth_recovery, &mut auth_change_rx).await {
-            return Err(err);
+        if recover_remote_control_auth(&mut auth_recovery, &mut auth_change_rx).await {
+            match load_remote_control_auth(auth_manager).await {
+                Ok(recovered_auth) if recovered_auth.account_id == enrollment.account_id => {
+                    *auth = recovered_auth;
+                    refresh_result =
+                        refresh_remote_control_server(auth, installation_id, enrollment).await;
+                }
+                Ok(_) | Err(_) => {
+                    enrollment.clear_server_token();
+                    refresh_result = Err(pairing_unavailable_error());
+                }
+            }
+        } else {
+            enrollment.clear_server_token();
         }
-        *auth = load_remote_control_auth(auth_manager)
-            .await
-            .map_err(|_| pairing_unavailable_error())?;
-        if auth.account_id != enrollment.account_id {
-            return Err(pairing_unavailable_error());
-        }
-        refresh_remote_control_server(auth, installation_id, enrollment).await?
     }
-    if replace_current_enrollment(current_enrollment, enrollment) {
-        Ok(())
-    } else {
+    if refresh_result
+        .as_ref()
+        .is_err_and(|err| err.kind() == io::ErrorKind::PermissionDenied)
+    {
+        enrollment.clear_server_token();
+    }
+    if !replace_current_enrollment(current_enrollment, enrollment) {
         Err(pairing_unavailable_error())
+    } else {
+        refresh_result
     }
 }
 
@@ -867,19 +938,21 @@ pub async fn start_remote_control(
     app_server_client_name_rx: Option<oneshot::Receiver<String>>,
     startup_mode: RemoteControlStartupMode,
 ) -> io::Result<(JoinHandle<()>, RemoteControlHandle)> {
+    let policy = config.policy;
     let state_db_available = state_db.is_some();
     let requested_initial_enabled = startup_mode == RemoteControlStartupMode::EnabledEphemeral;
-    let desired_state = if !state_db_available {
-        RemoteControlDesiredState::Disabled
-    } else {
-        match startup_mode {
-            RemoteControlStartupMode::ResolvePersisted => RemoteControlDesiredState::Unknown,
-            RemoteControlStartupMode::DisabledEphemeral => RemoteControlDesiredState::Disabled,
-            RemoteControlStartupMode::EnabledEphemeral => RemoteControlDesiredState::Enabled {
-                persistence_preference: None,
-            },
-        }
-    };
+    let desired_state =
+        if policy == RemoteControlPolicy::DisabledByRequirements || !state_db_available {
+            RemoteControlDesiredState::Disabled
+        } else {
+            match startup_mode {
+                RemoteControlStartupMode::ResolvePersisted => RemoteControlDesiredState::Unknown,
+                RemoteControlStartupMode::DisabledEphemeral => RemoteControlDesiredState::Disabled,
+                RemoteControlStartupMode::EnabledEphemeral => RemoteControlDesiredState::Enabled {
+                    persistence_preference: None,
+                },
+            }
+        };
     let initial_enabled = desired_state.is_enabled();
     if requested_initial_enabled && !state_db_available {
         warn!("remote control disabled because sqlite state db is unavailable");
@@ -995,6 +1068,7 @@ pub async fn start_remote_control(
     Ok((
         join_handle,
         RemoteControlHandle {
+            policy,
             desired_state_tx,
             desired_state_rpc_lock,
             desired_state_persistence_lock,

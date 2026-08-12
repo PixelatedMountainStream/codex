@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::num::NonZeroU64;
 use std::path::Path;
 
 use crate::HooksToml;
@@ -67,10 +68,6 @@ const RESERVED_MODEL_PROVIDER_IDS: [&str; 4] = [
 
 pub const DEFAULT_PROJECT_DOC_MAX_BYTES: usize = 32 * 1024;
 
-const fn default_allow_login_shell() -> Option<bool> {
-    Some(true)
-}
-
 fn default_history() -> Option<History> {
     Some(History::default())
 }
@@ -133,6 +130,21 @@ of strings; comma-separated strings are not supported. Use \
     }
 }
 
+/// Orchestrator-owned feature settings.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct OrchestratorToml {
+    pub skills: Option<OrchestratorFeatureToml>,
+    pub mcp: Option<OrchestratorFeatureToml>,
+}
+
+/// Settings for a feature owned by the orchestrator.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct OrchestratorFeatureToml {
+    pub enabled: Option<bool>,
+}
+
 /// Base config deserialized from ~/.codex/config.toml.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
@@ -181,7 +193,6 @@ pub struct ConfigToml {
     /// If `false`, the model can never use a login shell: `login = true`
     /// requests are rejected, and omitting `login` defaults to a non-login
     /// shell.
-    #[serde(default = "default_allow_login_shell")]
     pub allow_login_shell: Option<bool>,
 
     /// Sandbox mode to use.
@@ -275,7 +286,7 @@ pub struct ConfigToml {
     #[serde(default, deserialize_with = "deserialize_model_providers")]
     pub model_providers: HashMap<String, ModelProviderInfo>,
 
-    /// Maximum number of bytes to include from an AGENTS.md project doc file.
+    /// Maximum total bytes of project instruction content across all selected environments.
     #[serde(default = "default_project_doc_max_bytes")]
     pub project_doc_max_bytes: Option<usize>,
 
@@ -318,9 +329,6 @@ pub struct ConfigToml {
     /// Defaults to `$CODEX_HOME/log`.
     pub log_dir: Option<AbsolutePathBuf>,
 
-    /// Debugging and reproducibility settings.
-    pub debug: Option<DebugToml>,
-
     /// Optional URI-based file opener. If set, citations to files in the model
     /// output will be hyperlinked using the specified URI scheme.
     pub file_opener: Option<UriBasedFileOpener>,
@@ -343,9 +351,6 @@ pub struct ConfigToml {
     /// Optional verbosity control for GPT-5 models (Responses API `text.verbosity`).
     pub model_verbosity: Option<Verbosity>,
 
-    /// Override to force-enable reasoning summaries for the configured model.
-    pub model_supports_reasoning_summaries: Option<bool>,
-
     /// Optional path to a JSON model catalog (applied on startup only).
     /// Per-thread `config` overrides are accepted but do not reapply this (no-ops).
     pub model_catalog_json: Option<AbsolutePathBuf>,
@@ -363,6 +368,12 @@ pub struct ConfigToml {
     /// Optional product SKU forwarded on host-owned Codex Apps MCP requests.
     pub apps_mcp_product_sku: Option<String>,
 
+    /// Bounded, product-owned metadata attached to every Responses API request.
+    pub responses_api_metadata: Option<BTreeMap<String, String>>,
+
+    /// Orchestrator-owned feature settings.
+    pub orchestrator: Option<OrchestratorToml>,
+
     /// Base URL override for the built-in `openai` model provider.
     pub openai_base_url: Option<String>,
 
@@ -375,6 +386,10 @@ pub struct ConfigToml {
     /// `/v1/realtime`
     /// connection) without changing normal provider HTTP requests.
     pub experimental_realtime_ws_base_url: Option<String>,
+    /// Experimental / do not use. Overrides only the WebRTC realtime call
+    /// creation base URL. This is separate from `experimental_realtime_ws_base_url`
+    /// because WebRTC call creation is HTTP, while sideband control is websocket.
+    pub experimental_realtime_webrtc_call_base_url: Option<String>,
     /// Experimental / do not use. Selects the realtime websocket model/snapshot
     /// used for the `Op::RealtimeConversation` connection.
     pub experimental_realtime_ws_model: Option<String>,
@@ -408,7 +423,7 @@ pub struct ConfigToml {
     pub experimental_thread_store: Option<ThreadStoreToml>,
     pub projects: Option<HashMap<String, ProjectConfig>>,
 
-    /// Controls the web search tool mode: disabled, cached, or live.
+    /// Controls the web search tool mode: disabled, cached, indexed, or live.
     pub web_search: Option<WebSearchMode>,
 
     /// Nested tools section for feature toggles
@@ -419,6 +434,9 @@ pub struct ConfigToml {
 
     /// Agent-related settings (thread limits, etc.).
     pub agents: Option<AgentsToml>,
+
+    /// Goal-related settings.
+    pub goals: Option<GoalsToml>,
 
     /// Memories subsystem settings.
     pub memories: Option<MemoriesToml>,
@@ -497,38 +515,6 @@ pub struct ConfigToml {
     pub experimental_use_unified_exec_tool: Option<bool>,
     /// Preferred OSS provider for local models, e.g. "lmstudio" or "ollama".
     pub oss_provider: Option<String>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
-#[schemars(deny_unknown_fields)]
-pub struct ConfigLockfileToml {
-    pub version: u32,
-    pub codex_version: String,
-
-    /// Replayable effective config captured in the lockfile.
-    pub config: ConfigToml,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
-#[schemars(deny_unknown_fields)]
-pub struct DebugToml {
-    pub config_lockfile: Option<DebugConfigLockToml>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
-#[schemars(deny_unknown_fields)]
-pub struct DebugConfigLockToml {
-    /// Directory where Codex writes effective session config lock files.
-    pub export_dir: Option<AbsolutePathBuf>,
-
-    /// Lockfile to replay as the authoritative effective config.
-    pub load_path: Option<AbsolutePathBuf>,
-
-    /// Allow replaying a lock generated by a different Codex version.
-    pub allow_codex_version_mismatch: Option<bool>,
-
-    /// Save fields resolved from the model catalog/session configuration.
-    pub save_fields_resolved_from_model_catalog: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
@@ -625,11 +611,19 @@ pub struct ToolsToml {
     )]
     pub web_search: Option<WebSearchToolConfig>,
     pub experimental_request_user_input: Option<ExperimentalRequestUserInput>,
+    pub update_plan: Option<UpdatePlanToolConfig>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct ExperimentalRequestUserInput {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct UpdatePlanToolConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
@@ -661,17 +655,30 @@ where
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
+pub struct GoalsToml {
+    /// Maximum token budget allowed for a goal and default budget for new goals.
+    pub max_goal_token_budget: Option<NonZeroU64>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct AgentsToml {
-    /// Maximum number of agent threads that can be open concurrently.
-    /// When unset, no limit is enforced.
+    /// Whether multi-agent tools are enabled. Defaults to true.
+    /// An enabled `features.multi_agent_v2` setting takes precedence.
+    pub enabled: Option<bool>,
+    /// Maximum number of spawned agent threads that can be open concurrently per session.
+    /// When unset, the selected multi-agent backend uses its default.
+    #[serde(alias = "max_threads")]
     #[schemars(range(min = 1))]
-    pub max_threads: Option<usize>,
-    /// Maximum nesting depth allowed for spawned agent threads.
-    /// Root sessions start at depth 0.
-    #[schemars(range(min = 1))]
+    pub max_concurrent_threads_per_session: Option<usize>,
+    /// Maximum nesting depth for V1 agent threads. Ignored by V2.
     pub max_depth: Option<i32>,
-    /// Default maximum runtime in seconds for agent job workers.
-    #[schemars(range(min = 1))]
+    /// Default model for spawned subagents when the spawn call does not select one.
+    pub default_subagent_model: Option<String>,
+    /// Default reasoning effort for spawned subagents when the spawn call does not select one.
+    pub default_subagent_reasoning_effort: Option<ReasoningEffort>,
+    /// Removed agent-job setting retained as a no-op for compatibility.
+    #[schemars(skip)]
     pub job_max_runtime_seconds: Option<u64>,
     /// Whether to record a model-visible message when an agent turn is interrupted.
     /// Defaults to true.
@@ -901,18 +908,17 @@ pub fn validate_model_providers(
 ) -> Result<(), String> {
     validate_reserved_model_provider_ids(model_providers)?;
     for (key, provider) in model_providers {
-        if key == AMAZON_BEDROCK_PROVIDER_ID {
-            continue;
-        }
-        if provider.aws.is_some() {
-            return Err(format!(
-                "model_providers.{key}: provider aws is only supported for `{AMAZON_BEDROCK_PROVIDER_ID}`"
-            ));
-        }
-        if provider.name.trim().is_empty() {
-            return Err(format!(
-                "model_providers.{key}: provider name must not be empty"
-            ));
+        if key != AMAZON_BEDROCK_PROVIDER_ID {
+            if provider.aws.is_some() {
+                return Err(format!(
+                    "model_providers.{key}: provider aws is only supported for `{AMAZON_BEDROCK_PROVIDER_ID}`"
+                ));
+            }
+            if provider.name.trim().is_empty() {
+                return Err(format!(
+                    "model_providers.{key}: provider name must not be empty"
+                ));
+            }
         }
         provider
             .validate()
@@ -998,5 +1004,22 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("TOML list of strings"));
         assert!(message.contains("comma-separated strings are not supported"));
+    }
+
+    #[test]
+    fn amazon_bedrock_auth_command_must_not_be_empty() {
+        let err = toml::from_str::<ConfigToml>(
+            r#"
+[model_providers.amazon-bedrock.auth]
+command = "   "
+"#,
+        )
+        .expect_err("empty Amazon Bedrock auth command should be rejected");
+
+        assert!(
+            err.to_string().contains(
+                "model_providers.amazon-bedrock: provider auth.command must not be empty"
+            )
+        );
     }
 }

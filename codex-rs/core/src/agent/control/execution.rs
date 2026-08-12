@@ -1,6 +1,7 @@
 use super::AgentControl;
 use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErr;
+use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::Op;
@@ -32,15 +33,24 @@ impl AgentControl {
         thread_id: ThreadId,
         op: &Op,
     ) -> CodexResult<()> {
-        if !op_starts_turn(op) {
+        self.ensure_execution_capacity_for_turn_start(thread_id, op_starts_turn(op))
+            .await
+    }
+
+    pub(super) async fn ensure_execution_capacity_for_turn_start(
+        &self,
+        thread_id: ThreadId,
+        starts_turn: bool,
+    ) -> CodexResult<()> {
+        if !starts_turn {
             return Ok(());
         }
         let state = self.upgrade()?;
         let thread = state.get_thread(thread_id).await?;
-        if thread.codex.session.active_turn.lock().await.is_some() {
+        if thread.session.active_turn.lock().await.is_some() {
             return Ok(());
         }
-        let config = thread.codex.session.get_config().await;
+        let config = thread.session.get_config().await;
         let multi_agent_version = thread
             .multi_agent_version()
             .unwrap_or_else(|| config.multi_agent_version_from_features());
@@ -59,7 +69,9 @@ impl AgentControl {
         if self.agent_execution_limiter.has_capacity() {
             Ok(())
         } else {
-            Err(CodexErr::AgentLimitReached { max_threads })
+            Err(CodexErr::new(CodexErrorDetails::AgentLimitReached {
+                max_threads,
+            }))
         }
     }
 

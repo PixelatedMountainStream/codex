@@ -5,6 +5,7 @@ use codex_app_server_protocol::ModelServiceTier;
 use codex_app_server_protocol::ModelUpgradeInfo;
 use codex_app_server_protocol::ReasoningEffortOption;
 use codex_core::ThreadManager;
+use codex_http_client::HttpClientFactory;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ReasoningEffortPreset;
@@ -12,9 +13,10 @@ use codex_protocol::openai_models::ReasoningEffortPreset;
 pub async fn supported_models(
     thread_manager: Arc<ThreadManager>,
     include_hidden: bool,
+    http_client_factory: HttpClientFactory,
 ) -> Vec<Model> {
     thread_manager
-        .list_models(RefreshStrategy::OnlineIfUncached)
+        .list_models(RefreshStrategy::OnlineIfUncached, http_client_factory)
         .await
         .into_iter()
         .filter(|preset| include_hidden || preset.show_in_picker)
@@ -36,6 +38,7 @@ fn model_from_preset(preset: ModelPreset) -> Model {
         availability_nux: preset.availability_nux.map(Into::into),
         display_name: preset.display_name.to_string(),
         description: preset.description.to_string(),
+        model_specialty: preset.model_specialty,
         hidden: !preset.show_in_picker,
         supported_reasoning_efforts: reasoning_efforts_from_preset(
             preset.supported_reasoning_efforts,
@@ -43,6 +46,7 @@ fn model_from_preset(preset: ModelPreset) -> Model {
         default_reasoning_effort: preset.default_reasoning_effort,
         input_modalities: preset.input_modalities,
         supports_personality: preset.supports_personality,
+        multi_agent_version: preset.multi_agent_version.map(Into::into),
         additional_speed_tiers: preset.additional_speed_tiers,
         service_tiers: preset
             .service_tiers

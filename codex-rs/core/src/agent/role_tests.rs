@@ -1,11 +1,11 @@
 use super::*;
-use crate::SkillsManager;
 use crate::config::ConfigBuilder;
+use crate::plugins::plugins_manager_for_config;
 use crate::skills_load_input_from_config;
-use codex_config::ConfigLayerStackOrdering;
-use codex_core_plugins::PluginsManager;
 use codex_protocol::config_types::ServiceTier;
+use codex_protocol::models::BaseInstructionsProvenance;
 use codex_protocol::openai_models::ReasoningEffort;
+use codex_skills_extension::HostSkillsService;
 use codex_utils_absolute_path::test_support::PathExt;
 use pretty_assertions::assert_eq;
 use std::fs;
@@ -39,11 +39,7 @@ async fn write_role_config(home: &TempDir, name: &str, contents: &str) -> PathBu
 fn session_flags_layer_count(config: &Config) -> usize {
     config
         .config_layer_stack
-        .get_layers(
-            ConfigLayerStackOrdering::LowestPrecedenceFirst,
-            /*include_disabled*/ true,
-        )
-        .into_iter()
+        .all_layers_low_to_high()
         .filter(|layer| layer.name == ConfigLayerSource::SessionFlags)
         .count()
 }
@@ -69,21 +65,6 @@ async fn apply_role_returns_error_for_unknown_role() {
         .expect_err("unknown role should fail");
 
     assert_eq!(err, "unknown agent_type 'missing-role'");
-}
-
-#[tokio::test]
-#[ignore = "No role requiring it for now"]
-async fn apply_explorer_role_sets_model_and_adds_session_flags_layer() {
-    let (_home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
-    let before_layers = session_flags_layer_count(&config);
-
-    apply_role_to_config(&mut config, Some("explorer"))
-        .await
-        .expect("explorer role should apply");
-
-    assert_eq!(config.model.as_deref(), Some("gpt-5.4-mini"));
-    assert_eq!(config.model_reasoning_effort, Some(ReasoningEffort::Medium));
-    assert_eq!(session_flags_layer_count(&config), before_layers + 1);
 }
 
 #[tokio::test]
@@ -183,8 +164,8 @@ async fn apply_role_preserves_unspecified_keys() {
     config.main_execve_wrapper_exe = Some(PathBuf::from("/tmp/codex-execve-wrapper"));
     let role_path = write_role_config(
         &home,
-        "effort-only.toml",
-        "developer_instructions = \"Stay focused\"\nmodel_reasoning_effort = \"high\"",
+        "instructions-only.toml",
+        "developer_instructions = \"Stay focused\"",
     )
     .await;
     config.agent_roles.insert(
@@ -196,12 +177,23 @@ async fn apply_role_preserves_unspecified_keys() {
         },
     );
 
+    config.model = Some("spawn-model".to_string());
+    config.model_reasoning_effort = Some(ReasoningEffort::Low);
+    config.base_instructions = Some("inherited model instructions".to_string());
+    config.base_instructions_provenance = Some(BaseInstructionsProvenance::Model {
+        model: "parent-model".to_string(),
+    });
+    let base_instructions = config.base_instructions.clone();
+    let provenance = config.base_instructions_provenance.clone();
+
     apply_role_to_config(&mut config, Some("custom"))
         .await
         .expect("custom role should apply");
 
-    assert_eq!(config.model.as_deref(), Some("base-model"));
-    assert_eq!(config.model_reasoning_effort, Some(ReasoningEffort::High));
+    assert_eq!(
+        (config.model.as_deref(), config.model_reasoning_effort),
+        (Some("spawn-model"), Some(ReasoningEffort::Low)),
+    );
     assert_eq!(
         config.codex_linux_sandbox_exe,
         Some(PathBuf::from("/tmp/codex-linux-sandbox"))
@@ -210,6 +202,66 @@ async fn apply_role_preserves_unspecified_keys() {
         config.main_execve_wrapper_exe,
         Some(PathBuf::from("/tmp/codex-execve-wrapper"))
     );
+    assert_eq!(config.base_instructions, base_instructions);
+    assert_eq!(config.base_instructions_provenance, provenance);
+}
+
+#[tokio::test]
+async fn apply_role_regenerates_model_instructions_when_personality_changes() {
+    for (role_contents, provenance) in [
+        (
+            "personality = \"none\"",
+            BaseInstructionsProvenance::Model {
+                model: "parent-model".to_string(),
+            },
+        ),
+        (
+            "[features]\npersonality = false",
+            BaseInstructionsProvenance::Model {
+                model: "parent-model".to_string(),
+            },
+        ),
+        ("personality = \"none\"", BaseInstructionsProvenance::Custom),
+    ] {
+        let (home, mut config) = test_config_with_cli_overrides(vec![
+            (
+                "personality".to_string(),
+                TomlValue::String("friendly".to_string()),
+            ),
+            ("features.personality".to_string(), TomlValue::Boolean(true)),
+        ])
+        .await;
+        let role_path = write_role_config(&home, "personality-role.toml", role_contents).await;
+        config.agent_roles.insert(
+            "custom".to_string(),
+            AgentRoleConfig {
+                description: None,
+                config_file: Some(role_path),
+                nickname_candidates: None,
+            },
+        );
+        config.base_instructions = Some("inherited instructions".to_string());
+        config.base_instructions_provenance = Some(provenance.clone());
+
+        apply_role_to_config(&mut config, Some("custom"))
+            .await
+            .expect("custom role should apply");
+
+        let expected = match provenance {
+            BaseInstructionsProvenance::Model { .. } => (None, None),
+            BaseInstructionsProvenance::Custom => (
+                Some("inherited instructions".to_string()),
+                Some(BaseInstructionsProvenance::Custom),
+            ),
+        };
+        assert_eq!(
+            (
+                config.base_instructions,
+                config.base_instructions_provenance
+            ),
+            expected
+        );
+    }
 }
 
 #[tokio::test]
@@ -312,11 +364,7 @@ writable_roots = ["./sandbox-root"]
 
     let role_layer = config
         .config_layer_stack
-        .get_layers(
-            ConfigLayerStackOrdering::LowestPrecedenceFirst,
-            /*include_disabled*/ true,
-        )
-        .into_iter()
+        .all_layers_low_to_high()
         .rfind(|layer| layer.name == ConfigLayerSource::SessionFlags)
         .expect("expected a session flags layer");
     let sandbox_workspace_write = role_layer
@@ -415,19 +463,22 @@ enabled = false
         .await
         .expect("custom role should apply");
 
-    let plugins_manager = Arc::new(PluginsManager::new(home.path().to_path_buf()));
-    let skills_manager =
-        SkillsManager::new(home.path().abs(), /*bundled_skills_enabled*/ true);
+    let plugins_manager = Arc::new(plugins_manager_for_config(&config));
+    let skills_service =
+        HostSkillsService::new(home.path().abs(), /*bundled_skills_enabled*/ true);
     let plugins_input = config.plugins_config_input();
     let plugin_outcome = plugins_manager.plugins_for_config(&plugins_input).await;
     let effective_skill_roots = plugin_outcome.effective_plugin_skill_roots();
-    let skills_input = skills_load_input_from_config(&config, effective_skill_roots);
-    let outcome = skills_manager
-        .skills_for_config(
+    let plugin_skill_snapshots = plugins_manager.plugin_skill_snapshots_for_config(&plugins_input);
+    let skills_input = skills_load_input_from_config(&config, effective_skill_roots)
+        .with_plugin_skill_snapshots(plugin_skill_snapshots);
+    let snapshot = skills_service
+        .snapshot_for_config(
             &skills_input,
             Some(Arc::clone(&codex_exec_server::LOCAL_FS)),
         )
         .await;
+    let outcome = snapshot.outcome();
     let skill = outcome
         .skills
         .iter()

@@ -44,12 +44,9 @@ use std::time::Instant;
 use crate::app::app_server_requests::ResolvedAppServerRequest;
 use crate::app_command::AppCommand;
 use crate::app_event::HistoryLookupResponse;
-use crate::app_event::RealtimeAudioDeviceKind;
 use crate::app_server_approval_conversions::file_update_changes_to_display;
 use crate::approval_events::ApplyPatchApprovalRequestEvent;
 use crate::approval_events::ExecApprovalRequestEvent;
-#[cfg(not(target_os = "linux"))]
-use crate::audio_device::list_realtime_audio_device_names;
 use crate::bottom_pane::StatusLineItem;
 use crate::bottom_pane::StatusLineSetupView;
 use crate::bottom_pane::StatusSurfacePreviewData;
@@ -83,14 +80,12 @@ use crate::token_usage::TokenUsageInfo;
 use crate::version::CODEX_CLI_VERSION;
 use codex_app_server_protocol::AddCreditsNudgeCreditType;
 use codex_app_server_protocol::AddCreditsNudgeEmailStatus;
-use codex_app_server_protocol::AppInfo;
 use codex_app_server_protocol::AppSummary;
 use codex_app_server_protocol::CodexErrorInfo as AppServerCodexErrorInfo;
 use codex_app_server_protocol::CollabAgentTool;
 use codex_app_server_protocol::CollabAgentToolCallStatus;
 use codex_app_server_protocol::CommandExecutionRequestApprovalParams;
 use codex_app_server_protocol::CommandExecutionSource as ExecCommandSource;
-use codex_app_server_protocol::ConfigLayerSource;
 use codex_app_server_protocol::CreditsSnapshot;
 use codex_app_server_protocol::ErrorNotification;
 use codex_app_server_protocol::FileChangeRequestApprovalParams;
@@ -107,7 +102,7 @@ use codex_app_server_protocol::RequestId as AppServerRequestId;
 use codex_app_server_protocol::ReviewTarget;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
-use codex_app_server_protocol::SkillMetadata as ProtocolSkillMetadata;
+use codex_app_server_protocol::SkillMetadata;
 use codex_app_server_protocol::SkillsListResponse;
 use codex_app_server_protocol::ThreadGoal as AppThreadGoal;
 use codex_app_server_protocol::ThreadGoalStatus as AppThreadGoalStatus;
@@ -121,13 +116,12 @@ use codex_app_server_protocol::TurnCompletedNotification;
 use codex_app_server_protocol::TurnPlanStepStatus;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput;
-use codex_config::ConfigLayerStackOrdering;
 use codex_config::Constrained;
 use codex_config::ConstraintResult;
 use codex_config::types::ApprovalsReviewer;
 use codex_config::types::Notifications;
 use codex_config::types::WindowsSandboxModeToml;
-use codex_core_skills::model::SkillMetadata;
+use codex_connectors::AppInfo;
 use codex_features::FEATURES;
 use codex_features::Feature;
 #[cfg(test)]
@@ -166,16 +160,13 @@ use codex_terminal_detection::TerminalName;
 use codex_terminal_detection::terminal_info;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_cli::resume_hint;
-use codex_utils_plugins::mention_syntax::PLUGIN_TEXT_MENTION_SIGIL;
-use codex_utils_plugins::mention_syntax::TOOL_MENTION_SIGIL;
+use codex_utils_path_uri::PathUri;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
 use crossterm::event::KeyModifiers;
-use rand::Rng;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::Color;
 use ratatui::style::Modifier;
 use ratatui::style::Style;
 use ratatui::style::Stylize;
@@ -207,6 +198,8 @@ const CONNECTORS_SELECTION_VIEW_ID: &str = "connectors-selection";
 const PET_SELECTION_LOADING_VIEW_ID: &str = "pet-selection-loading";
 const AMBIENT_PET_WRAP_GAP_COLUMNS: u16 = 2;
 const TUI_STUB_MESSAGE: &str = "Not available in TUI yet.";
+const PARENT_OWNED_INPUT_MESSAGE: &str =
+    "This sub-agent is controlled by its parent. Direct input is disabled.";
 
 /// Choose the keybinding used to edit the most-recently queued message.
 ///
@@ -244,14 +237,24 @@ fn queued_message_edit_binding_for_terminal(terminal_info: TerminalInfo) -> KeyB
 }
 
 fn queued_message_edit_hint_binding(
-    bindings: &[KeyBinding],
+    keymap: &RuntimeKeymap,
     terminal_info: TerminalInfo,
-) -> Option<KeyBinding> {
+) -> Option<crate::key_hint::ShortcutHint> {
+    let configured = keymap.primary_hint(crate::keymap::KeymapContext::Chat, "edit_queued_message");
+    if matches!(
+        configured,
+        Some(crate::key_hint::ShortcutHint::Chord { .. })
+    ) {
+        return configured;
+    }
+
     let terminal_binding = queued_message_edit_binding_for_terminal(terminal_info);
-    bindings
+    keymap
+        .chat
+        .edit_queued_message
         .contains(&terminal_binding)
-        .then_some(terminal_binding)
-        .or_else(|| bindings.first().copied())
+        .then_some(crate::key_hint::ShortcutHint::Single(terminal_binding))
+        .or(configured)
 }
 
 fn normalize_thread_name(name: &str) -> Option<String> {
@@ -268,6 +271,7 @@ use crate::app_event::WindowsSandboxEnableMode;
 use crate::app_event_sender::AppEventSender;
 use crate::auto_review_denials;
 use crate::auto_review_denials::RecentAutoReviewDenials;
+use crate::bottom_pane::ApplyPatchApprovalRequest;
 use crate::bottom_pane::ApprovalRequest;
 use crate::bottom_pane::BottomPane;
 use crate::bottom_pane::BottomPaneParams;
@@ -275,15 +279,18 @@ use crate::bottom_pane::CancellationEvent;
 use crate::bottom_pane::CollaborationModeIndicator;
 use crate::bottom_pane::ColumnWidthMode;
 use crate::bottom_pane::DOUBLE_PRESS_QUIT_SHORTCUT_ENABLED;
+use crate::bottom_pane::ExecApprovalRequest;
 use crate::bottom_pane::ExperimentalFeatureItem;
 use crate::bottom_pane::ExperimentalFeaturesView;
 use crate::bottom_pane::GoalStatusIndicator;
 use crate::bottom_pane::HistoryEntry;
 use crate::bottom_pane::InputResult;
 use crate::bottom_pane::LocalImageAttachment;
+use crate::bottom_pane::McpElicitationApprovalRequest;
 use crate::bottom_pane::McpServerElicitationFormRequest;
 use crate::bottom_pane::MemoriesSettingsView;
 use crate::bottom_pane::MentionBinding;
+use crate::bottom_pane::PermissionsApprovalRequest;
 use crate::bottom_pane::QUIT_SHORTCUT_TIMEOUT;
 use crate::bottom_pane::QueuedInputAction;
 use crate::bottom_pane::SelectionAction;
@@ -368,6 +375,7 @@ use self::skills::collect_tool_mentions;
 use self::skills::find_app_mentions;
 use self::skills::find_skill_mentions_with_tool_mentions;
 use self::skills::is_app_mentionable;
+mod plugin_catalog;
 mod plugins;
 use self::plugins::PluginInstallAuthFlowState;
 use self::plugins::PluginListFetchState;
@@ -379,6 +387,8 @@ mod notifications;
 use self::notifications::Notification;
 mod permission_popups;
 mod permissions_menu;
+pub(crate) use self::permissions_menu::auto_review_available;
+pub(crate) use self::permissions_menu::cyber_model_approval_reviewer;
 mod protocol;
 mod protocol_requests;
 mod rate_limits;
@@ -388,21 +398,22 @@ use self::rate_limits::RateLimitWarningState;
 use self::rate_limits::app_server_rate_limit_error_kind;
 pub(crate) use self::rate_limits::fallback_limit_label;
 use self::rate_limits::is_app_server_cyber_policy_error;
+mod reset_credits;
 pub(crate) use self::rate_limits::limit_label_for_window;
-mod realtime;
+mod reasoning_shortcuts;
 mod rendering;
 mod replay;
-use self::realtime::RealtimeConversationUiState;
-mod reasoning_shortcuts;
 mod review;
 mod review_popups;
 use self::review::ReviewState;
 #[cfg(test)]
 pub(crate) use self::review_popups::show_review_commit_picker_with_entries;
+mod safety_buffering;
 mod service_tiers;
 mod settings;
 mod settings_popups;
 mod side;
+use self::safety_buffering::SafetyBufferingState;
 mod status_state;
 mod windows_sandbox_prompts;
 use self::status_state::StatusIndicatorState;
@@ -412,13 +423,17 @@ mod status_controls;
 mod status_surfaces;
 mod streaming;
 use self::status_surfaces::CachedProjectRootName;
+mod tokens;
+pub(crate) use self::tokens::TokenActivityView;
 mod tool_lifecycle;
 mod tool_requests;
 mod transcript;
+mod transcript_export;
 use self::transcript::TranscriptState;
 mod turn_lifecycle;
 mod turn_runtime;
 use self::turn_lifecycle::TurnLifecycleState;
+mod usage;
 mod user_messages;
 use self::user_messages::PendingSteer;
 use self::user_messages::PendingSteerCompareKey;
@@ -427,6 +442,7 @@ use self::user_messages::QueuedUserMessage;
 use self::user_messages::ShellEscapePolicy;
 use self::user_messages::ThreadComposerState;
 pub(crate) use self::user_messages::ThreadInputState;
+pub(crate) use self::user_messages::ThreadInputStateRestoreMode;
 pub(crate) use self::user_messages::UserMessage;
 use self::user_messages::UserMessageDisplay;
 #[cfg(test)]
@@ -434,6 +450,7 @@ use self::user_messages::UserMessageHistoryOverride;
 use self::user_messages::UserMessageHistoryRecord;
 use self::user_messages::app_server_text_elements;
 pub(crate) use self::user_messages::create_initial_user_message;
+pub(crate) use self::user_messages::mention_bindings_from_user_inputs;
 use self::user_messages::merge_user_messages;
 use self::user_messages::merge_user_messages_with_history_record;
 #[cfg(test)]
@@ -473,7 +490,6 @@ const APPROVE_FOR_ME_LABEL: &str = "Approve for me";
 const AUTO_REVIEW_DESCRIPTION: &str = "Only ask for actions detected as potentially unsafe.";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_STATUS_LINE_ITEMS: [&str; 2] = ["model-with-reasoning", "current-dir"];
-const MAX_AGENT_COPY_HISTORY: usize = 32;
 
 /// Common initialization parameters shared by all `ChatWidget` constructors.
 pub(crate) struct ChatWidgetInit {
@@ -488,6 +504,7 @@ pub(crate) struct ChatWidgetInit {
     pub(crate) initial_user_message: Option<UserMessage>,
     pub(crate) enhanced_keys_supported: bool,
     pub(crate) has_chatgpt_account: bool,
+    pub(crate) has_codex_backend_auth: bool,
     pub(crate) model_catalog: Arc<ModelCatalog>,
     pub(crate) feedback: codex_feedback::CodexFeedback,
     pub(crate) is_first_run: bool,
@@ -539,6 +556,7 @@ pub(crate) struct ChatWidget {
     /// The currently active collaboration mask, if any.
     active_collaboration_mask: Option<CollaborationModeMask>,
     has_chatgpt_account: bool,
+    has_codex_backend_auth: bool,
     model_catalog: Arc<ModelCatalog>,
     session_telemetry: SessionTelemetry,
     session_header: SessionHeader,
@@ -547,11 +565,24 @@ pub(crate) struct ChatWidget {
     runtime_model_provider_base_url: Option<String>,
     pub(crate) remote_connection: Option<RemoteConnectionStatus>,
     token_info: Option<TokenUsageInfo>,
+    token_usage_pending: bool,
     rate_limit_snapshots_by_limit_id: BTreeMap<String, RateLimitSnapshotDisplay>,
     refreshing_status_outputs: Vec<(u64, StatusHistoryHandle)>,
     next_status_refresh_request_id: u64,
+    refreshing_token_activity_output: Option<tokens::PendingTokenActivityOutput>,
+    completed_token_activity_output: Option<history_cell::CompositeHistoryCell>,
+    next_token_activity_request_id: u64,
+    pending_rate_limit_reset_request_id: Option<u64>,
+    pending_rate_limit_reset_idempotency_key: Option<String>,
+    rate_limit_reset_picker_request_id: Option<u64>,
+    pending_rate_limit_reset_hint_request_id: Option<u64>,
+    pending_usage_menu_rate_limit_request_id: Option<u64>,
+    pending_rate_limit_reset_hint: Option<PlainHistoryCell>,
+    available_rate_limit_reset_credits: Option<i64>,
+    next_rate_limit_reset_request_id: u64,
     plan_type: Option<PlanType>,
     codex_rate_limit_reached_type: Option<RateLimitReachedType>,
+    codex_spend_control_reached: Option<bool>,
     rate_limit_warnings: RateLimitWarningState,
     warning_display_state: WarningDisplayState,
     rate_limit_switch_prompt: RateLimitSwitchPromptState,
@@ -561,6 +592,7 @@ pub(crate) struct ChatWidget {
     stream_controller: Option<StreamController>,
     // Stream lifecycle controller for proposed plan output.
     plan_stream_controller: Option<PlanStreamController>,
+    pending_stream_consolidations: usize,
     /// Holds the platform clipboard lease so copied text remains available while supported.
     clipboard_lease: Option<crate::clipboard_copy::ClipboardLease>,
     copy_last_response_binding: Vec<KeyBinding>,
@@ -568,11 +600,12 @@ pub(crate) struct ChatWidget {
     collab_agent_metadata: HashMap<ThreadId, AgentMetadata>,
     pending_collab_spawn_requests: HashMap<String, multi_agents::SpawnRequestSummary>,
     suppressed_exec_calls: HashSet<String>,
-    skills_all: Vec<ProtocolSkillMetadata>,
+    skills_all: Vec<SkillMetadata>,
     skills_initial_state: Option<HashMap<AbsolutePathBuf, bool>>,
     last_unified_wait: Option<UnifiedExecWaitState>,
     unified_exec_wait_streak: Option<UnifiedExecWaitStreak>,
     turn_lifecycle: TurnLifecycleState,
+    safety_buffering: SafetyBufferingState,
     task_complete_pending: bool,
     unified_exec_processes: Vec<UnifiedExecProcessSummary>,
     /// Tracks per-server MCP startup state while startup is in progress.
@@ -596,6 +629,9 @@ pub(crate) struct ChatWidget {
     ide_context: IdeContextState,
     plugins_cache: PluginsCacheState,
     plugins_fetch_state: PluginListFetchState,
+    plugin_remote_sections_loading: bool,
+    plugin_remote_sections_loaded: bool,
+    plugin_remote_section_errors: Vec<crate::app_event::PluginRemoteSectionError>,
     plugin_install_apps_needing_auth: Vec<AppSummary>,
     plugin_install_auth_flow: Option<PluginInstallAuthFlowState>,
     plugins_active_tab_id: Option<String>,
@@ -604,12 +640,16 @@ pub(crate) struct ChatWidget {
     interrupts: InterruptManager,
     // Accumulates the current reasoning block text to extract a header
     reasoning_buffer: String,
-    // Accumulates full reasoning content for transcript-only recording
-    full_reasoning_buffer: String,
+    // Caches the first completed bold header so later deltas do not rescan the whole block.
+    reasoning_header: Option<String>,
+    // Preserves reasoning-summary part boundaries for transcript-only recording.
+    reasoning_summary_parts: Vec<String>,
     status_state: StatusState,
     review: ReviewState,
     // Active hook runs render in a dedicated live cell so they can run alongside tools.
     active_hook_cell: Option<HookCell>,
+    // Reused for built-in pet CDN requests so redirects remain route-aware.
+    pub(crate) pet_http_client: codex_http_client::RouteAwareClientPool,
     // Ambient companion rendered over the transcript area, never inside the footer rows.
     ambient_pet: Option<crate::pets::AmbientPet>,
     pet_picker_preview_state: crate::pets::PetPickerPreviewState,
@@ -628,6 +668,7 @@ pub(crate) struct ChatWidget {
     thread_name: Option<String>,
     thread_rename_block_message: Option<String>,
     active_side_conversation: bool,
+    blocks_direct_input: bool,
     normal_placeholder_text: String,
     side_placeholder_text: String,
     forked_from: Option<ThreadId>,
@@ -645,13 +686,13 @@ pub(crate) struct ChatWidget {
     // order.
     suppress_initial_user_message_submit: bool,
     input_queue: InputQueueState,
-    cancel_edit: CancelEditState,
+    safety_buffering_prompt: Option<UserMessage>,
     /// Main chat-surface bindings resolved from `tui.keymap.chat`.
     chat_keymap: ChatKeymap,
     /// Keybinding to show for popping the most-recently queued message back
     /// into the composer. This may differ from the first configured binding
     /// when the default set includes a terminal-specific fallback.
-    queued_message_edit_hint_binding: Option<KeyBinding>,
+    queued_message_edit_hint_binding: Option<crate::key_hint::ShortcutHint>,
     // Pending notification to show when unfocused on next Draw
     pending_notification: Option<Notification>,
     /// When `Some`, the user has pressed a quit shortcut and the second press
@@ -664,7 +705,7 @@ pub(crate) struct ChatWidget {
     quit_shortcut_key: Option<KeyBinding>,
     // Runtime metrics accumulated across delta snapshots for the active turn.
     turn_runtime_metrics: RuntimeMetricsSummary,
-    last_rendered_width: std::cell::Cell<Option<usize>>,
+    last_rendered_width: std::cell::Cell<Option<u16>>,
     // Feedback sink for /feedback
     feedback: codex_feedback::CodexFeedback,
     // Current session rollout path (if known)
@@ -674,7 +715,7 @@ pub(crate) struct ChatWidget {
     // App-server-backed command runner for status-line workspace metadata lookups.
     workspace_command_runner: Option<WorkspaceCommandRunner>,
     // Instruction source files loaded for the current session, supplied by app-server.
-    instruction_source_paths: Vec<AbsolutePathBuf>,
+    instruction_source_paths: Vec<PathUri>,
     // Runtime network proxy bind addresses from SessionConfigured.
     session_network_proxy: Option<SessionNetworkProxyRuntime>,
     // Shared latch so we only warn once about invalid status-line item IDs.
@@ -713,11 +754,20 @@ pub(crate) struct ChatWidget {
     status_line_git_summary_pending: bool,
     // True once we've attempted a Git summary lookup for the current CWD.
     status_line_git_summary_lookup_complete: bool,
+    // Cached workspace notification headline for the status line.
+    status_line_workspace_headline: Option<String>,
+    // Request ID for the async workspace headline fetch currently in flight.
+    status_line_workspace_headline_pending_request_id: Option<u64>,
+    // Request ID to assign to the next workspace headline fetch.
+    next_status_line_workspace_headline_request_id: u64,
+    // Last time a workspace headline fetch was requested.
+    status_line_workspace_headline_last_requested_at: Option<Instant>,
+    // Set after the backend reports the workspace-message feature gate is disabled.
+    status_line_workspace_messages_disabled: bool,
     // Current thread-goal status shown in the status line when plan mode is inactive.
     current_goal_status_indicator: Option<GoalStatusIndicator>,
     current_goal_status: Option<GoalStatusState>,
     external_editor_state: ExternalEditorState,
-    realtime_conversation: RealtimeConversationUiState,
     last_rendered_user_message_display: Option<UserMessageDisplay>,
     last_non_retry_error: Option<(String, String)>,
 }
@@ -759,13 +809,6 @@ pub(crate) enum InterruptedTurnNoticeMode {
     Suppress,
 }
 
-#[derive(Debug, Default)]
-struct CancelEditState {
-    prompt: Option<UserMessage>,
-    eligible: bool,
-    armed: bool,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReplayKind {
     ResumeInitialMessages,
@@ -775,6 +818,7 @@ pub(crate) enum ReplayKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SessionConfiguredDisplay {
     Normal,
+    PromptEdit,
     /// Apply session state without emitting the session info cell.
     Quiet,
     SideConversation,
@@ -828,6 +872,12 @@ fn exec_approval_request_from_params(
     params: CommandExecutionRequestApprovalParams,
     fallback_cwd: &AbsolutePathBuf,
 ) -> ExecApprovalRequestEvent {
+    // TODO(anp): Keep this as PathUri once `tui::approval_events::ExecApprovalRequestEvent` and
+    // approval rendering support foreign paths.
+    let cwd = params
+        .cwd
+        .and_then(|cwd| cwd.to_inferred_abs_path())
+        .unwrap_or_else(|| fallback_cwd.clone());
     ExecApprovalRequestEvent {
         call_id: params.item_id,
         command: params
@@ -835,12 +885,13 @@ fn exec_approval_request_from_params(
             .as_deref()
             .map(split_command_string)
             .unwrap_or_default(),
-        cwd: params.cwd.unwrap_or_else(|| fallback_cwd.clone()),
+        cwd,
         reason: params.reason,
         network_approval_context: params.network_approval_context,
         additional_permissions: params.additional_permissions,
         turn_id: params.turn_id,
         approval_id: params.approval_id,
+        environment_id: params.environment_id,
         proposed_execpolicy_amendment: params.proposed_execpolicy_amendment,
         proposed_network_policy_amendments: params.proposed_network_policy_amendments,
         available_decisions: params.available_decisions,
@@ -861,16 +912,16 @@ fn patch_approval_request_from_params(
 
 fn request_permissions_from_params(
     params: codex_app_server_protocol::PermissionsRequestApprovalParams,
-) -> RequestPermissionsEvent {
-    RequestPermissionsEvent {
+) -> std::io::Result<RequestPermissionsEvent> {
+    Ok(RequestPermissionsEvent {
         turn_id: params.turn_id,
         call_id: params.item_id,
         environment_id: params.environment_id,
         started_at_ms: params.started_at_ms,
         reason: params.reason,
-        permissions: params.permissions.into(),
+        permissions: params.permissions.try_into()?,
         cwd: Some(params.cwd),
-    }
+    })
 }
 
 fn token_usage_info_from_app_server(token_usage: ThreadTokenUsage) -> TokenUsageInfo {
@@ -923,15 +974,6 @@ impl ChatWidget {
             .unwrap_or_default()
     }
 
-    fn realtime_conversation_enabled(&self) -> bool {
-        self.config.features.enabled(Feature::RealtimeConversation)
-            && cfg!(not(target_os = "linux"))
-    }
-
-    fn realtime_audio_device_selection_enabled(&self) -> bool {
-        self.realtime_conversation_enabled()
-    }
-
     fn restore_retry_status_header_if_present(&mut self) {
         if let Some(header) = self.status_state.take_retry_status_header() {
             self.set_status_header(header);
@@ -943,10 +985,6 @@ impl ChatWidget {
         if !message.is_empty() {
             self.transcript.record_agent_markdown(message.to_string());
         }
-    }
-
-    fn record_visible_user_turn_for_copy(&mut self) {
-        self.transcript.record_visible_user_turn();
     }
 
     pub(crate) fn open_feedback_note(
@@ -1108,6 +1146,9 @@ impl ChatWidget {
         match info {
             Some(info) => self.apply_token_info(info),
             None => {
+                self.token_usage_pending = true;
+                self.bottom_pane
+                    .set_context_window_pending(/*pending*/ true);
                 self.bottom_pane
                     .set_context_window(/*percent*/ None, /*used_tokens*/ None);
                 self.token_info = None;
@@ -1116,6 +1157,9 @@ impl ChatWidget {
     }
 
     fn apply_token_info(&mut self, info: TokenUsageInfo) {
+        self.token_usage_pending = false;
+        self.bottom_pane
+            .set_context_window_pending(/*pending*/ false);
         let percent = self.context_remaining_percent(&info);
         let used_tokens = self.context_used_tokens(&info, percent.is_some());
         self.bottom_pane.set_context_window(percent, used_tokens);
@@ -1151,13 +1195,7 @@ impl ChatWidget {
     }
 
     pub(crate) fn handle_history_entry_response(&mut self, event: HistoryLookupResponse) {
-        let HistoryLookupResponse {
-            offset,
-            log_id,
-            entry,
-        } = event;
-        self.bottom_pane
-            .on_history_entry_response(log_id, offset, entry);
+        self.bottom_pane.on_history_lookup_response(event);
     }
 
     pub(crate) fn pre_draw_tick(&mut self) {
@@ -1177,12 +1215,14 @@ impl ChatWidget {
         {
             self.refresh_terminal_title();
         }
+        self.refresh_status_line_if_workspace_headline_due();
     }
 
     fn flush_active_cell(&mut self) {
-        if let Some(active) = self.transcript.active_cell.take() {
+        if let Some(active) = self.transcript.take_active_cell() {
             self.transcript.needs_final_message_separator = true;
             self.app_event_tx.send(AppEvent::InsertHistoryCell(active));
+            self.request_pending_usage_output_insertion();
         }
     }
 
@@ -1191,9 +1231,6 @@ impl ChatWidget {
     }
 
     fn add_boxed_history(&mut self, cell: Box<dyn HistoryCell>) {
-        if self.turn_lifecycle.agent_turn_running && !cell.display_lines(u16::MAX).is_empty() {
-            self.record_visible_turn_activity();
-        }
         // Keep the placeholder session header as the active cell until real session info arrives,
         // so we can merge headers instead of committing a duplicate box to history.
         let keep_placeholder_header_active = !self.is_session_configured()
@@ -1202,8 +1239,17 @@ impl ChatWidget {
                 .active_cell
                 .as_ref()
                 .is_some_and(|c| c.as_any().is::<history_cell::SessionHeaderHistoryCell>());
+        let history_width = self
+            .last_rendered_width
+            .get()
+            .map(|width| self.history_wrap_width(width))
+            .unwrap_or(u16::MAX);
 
-        if !keep_placeholder_header_active && !cell.display_lines(u16::MAX).is_empty() {
+        if !keep_placeholder_header_active
+            && !cell
+                .display_lines_for_mode(history_width, self.history_render_mode())
+                .is_empty()
+        {
             // Only break exec grouping if the cell renders visible lines.
             if !self.has_active_stream_tail() {
                 self.flush_active_cell();
@@ -1244,69 +1290,13 @@ impl ChatWidget {
             if self.review.is_review_mode {
                 return;
             }
-            let message = display.message.as_str();
-            let mention_start = |sigil: char, mention: &str| {
-                let token = format!("{sigil}{mention}");
-                message.match_indices(&token).find_map(|(start, _)| {
-                    let end = start + token.len();
-                    message
-                        .as_bytes()
-                        .get(end)
-                        .is_none_or(|byte| {
-                            !byte.is_ascii_alphanumeric() && !matches!(byte, b'_' | b'-')
-                        })
-                        .then_some(start)
-                })
-            };
-            let mut mention_bindings: Vec<MentionBinding> = items
-                .iter()
-                .filter_map(|item| match item {
-                    UserInput::Skill { name, path } => Some(MentionBinding {
-                        sigil: TOOL_MENTION_SIGIL,
-                        mention: name.clone(),
-                        path: path.to_string_lossy().into_owned(),
-                    }),
-                    UserInput::Mention { name, path } => {
-                        let plugin_id = path.strip_prefix("plugin://");
-                        let mention = if let Some(plugin_id) = plugin_id {
-                            plugin_id
-                                .split_once('@')
-                                .map(|(plugin_name, _)| plugin_name)
-                                .unwrap_or(plugin_id)
-                                .to_string()
-                        } else if path.starts_with("app://") {
-                            codex_connectors::metadata::connector_mention_slug_from_name(name)
-                        } else {
-                            name.clone()
-                        };
-                        let sigil = if plugin_id.is_some()
-                            && mention_start(PLUGIN_TEXT_MENTION_SIGIL, &mention).is_some()
-                        {
-                            PLUGIN_TEXT_MENTION_SIGIL
-                        } else {
-                            TOOL_MENTION_SIGIL
-                        };
-                        Some(MentionBinding {
-                            sigil,
-                            mention,
-                            path: path.clone(),
-                        })
-                    }
-                    UserInput::Text { .. }
-                    | UserInput::Image { .. }
-                    | UserInput::LocalImage { .. } => None,
-                })
-                .collect();
-            mention_bindings.sort_by_key(|binding| {
-                mention_start(binding.sigil, &binding.mention).unwrap_or(usize::MAX)
-            });
             self.bottom_pane
                 .record_replayed_user_message_history(HistoryEntry {
                     text: display.message.clone(),
                     text_elements: display.text_elements.clone(),
                     local_image_paths: display.local_images.clone(),
                     remote_image_urls: display.remote_image_urls.clone(),
-                    mention_bindings,
+                    mention_bindings: mention_bindings_from_user_inputs(items, &display.message),
                     pending_pastes: Vec::new(),
                 });
             self.on_user_message_display(display);
@@ -1345,7 +1335,6 @@ impl ChatWidget {
             || !display.local_images.is_empty()
             || !display.remote_image_urls.is_empty()
         {
-            self.record_visible_user_turn_for_copy();
             self.add_to_history(history_cell::new_user_prompt(
                 display.message,
                 display.text_elements,
@@ -1389,7 +1378,7 @@ impl ChatWidget {
 
     /// Mark the active cell as failed (✗) and flush it into history.
     fn finalize_active_cell_as_failed(&mut self) {
-        if let Some(mut cell) = self.transcript.active_cell.take() {
+        if let Some(mut cell) = self.transcript.take_active_cell() {
             // Insert finalized cell into history and keep grouping consistent.
             if let Some(exec) = cell.as_any_mut().downcast_mut::<ExecCell>() {
                 exec.mark_failed();
@@ -1397,6 +1386,7 @@ impl ChatWidget {
                 tool.mark_failed();
             }
             self.add_boxed_history(cell);
+            self.request_pending_usage_output_insertion();
         }
     }
 
@@ -1480,7 +1470,7 @@ impl ChatWidget {
     /// Merge the real session info cell with any placeholder header to avoid double boxes.
     fn apply_session_info_cell(&mut self, cell: history_cell::SessionInfoCell) {
         let mut session_info_cell = Some(Box::new(cell) as Box<dyn HistoryCell>);
-        let merged_header = if let Some(active) = self.transcript.active_cell.take() {
+        let merged_header = if let Some(active) = self.transcript.take_active_cell() {
             if active
                 .as_any()
                 .is::<history_cell::SessionHeaderHistoryCell>()
@@ -1602,7 +1592,6 @@ impl ChatWidget {
             if width == 0 {
                 None
             } else {
-                let width = u16::try_from(width).unwrap_or(u16::MAX);
                 let width = usize::from(self.history_wrap_width(width));
                 Some(crate::width::usable_content_width(width, reserved_cols).unwrap_or(1))
             }
@@ -1658,12 +1647,11 @@ impl ChatWidget {
 
     /// Update resize-sensitive chat widget state after the terminal width changes.
     ///
-    /// The app calls this even when terminal resize reflow is disabled so live stream wrapping
-    /// remains consistent with the current viewport. Finalized transcript rebuilding stays gated at
-    /// the app layer.
+    /// Live stream wrapping stays consistent with the current viewport while finalized transcript
+    /// rebuilding runs through app-level resize reflow.
     pub(crate) fn on_terminal_resize(&mut self, width: u16) {
         let had_rendered_width = self.last_rendered_width.get().is_some();
-        self.last_rendered_width.set(Some(width as usize));
+        self.last_rendered_width.set(Some(width));
         let stream_width = self.current_stream_width(/*reserved_cols*/ 2);
         let plan_stream_width = self.current_stream_width(/*reserved_cols*/ 4);
         if let Some(controller) = self.stream_controller.as_mut() {
@@ -1727,18 +1715,6 @@ impl ChatWidget {
         self.bottom_pane.insert_str(text);
     }
 
-    /// Replace the composer content with the provided text and reset cursor.
-    pub(crate) fn set_composer_text(
-        &mut self,
-        text: String,
-        text_elements: Vec<TextElement>,
-        local_image_paths: Vec<PathBuf>,
-    ) {
-        self.bottom_pane
-            .set_composer_text(text, text_elements, local_image_paths);
-        self.refresh_plan_mode_nudge();
-    }
-
     pub(crate) fn set_remote_image_urls(&mut self, remote_image_urls: Vec<String>) {
         self.bottom_pane.set_remote_image_urls(remote_image_urls);
     }
@@ -1783,6 +1759,15 @@ impl ChatWidget {
         T: Into<AppCommand>,
     {
         let op: AppCommand = op.into();
+        if self.blocks_direct_input
+            && matches!(
+                &op,
+                AppCommand::UserTurn { .. } | AppCommand::Review { .. } | AppCommand::Compact
+            )
+        {
+            self.add_error_message(PARENT_OWNED_INPUT_MESSAGE.to_string());
+            return false;
+        }
         self.prepare_local_op_submission(&op);
         if op.is_review() && !self.bottom_pane.is_task_running() {
             self.bottom_pane.set_task_running(/*running*/ true);
@@ -1812,12 +1797,15 @@ impl ChatWidget {
     }
 
     pub(crate) fn prepare_local_op_submission(&mut self, op: &AppCommand) {
-        if let AppCommand::Interrupt { behavior } = op
-            && self.turn_lifecycle.agent_turn_running
-        {
-            if *behavior == crate::app_command::InterruptBehavior::RestorePromptIfNoOutput {
-                self.arm_cancel_edit();
-            }
+        if matches!(
+            op,
+            AppCommand::Compact
+                | AppCommand::Review { .. }
+                | AppCommand::RunUserShellCommand { .. }
+        ) {
+            self.input_queue.user_turn_pending_start = true;
+        }
+        if matches!(op, AppCommand::Interrupt) && self.turn_lifecycle.agent_turn_running {
             if let Some(controller) = self.stream_controller.as_mut() {
                 controller.clear_queue();
             }
@@ -1856,7 +1844,6 @@ impl ChatWidget {
     pub(crate) fn sync_plugin_mentions_config(&mut self, config: &Config) {
         self.config.features = config.features.clone();
         self.config.config_layer_stack = config.config_layer_stack.clone();
-        self.config.realtime = config.realtime.clone();
         self.config.memories = config.memories.clone();
         self.config.terminal_resize_reflow = config.terminal_resize_reflow;
         self.sync_mentions_v2_enabled();
@@ -1886,12 +1873,12 @@ impl ChatWidget {
         self.current_rollout_path.clone()
     }
 
-    /// Returns a cache key describing the current in-flight active cell for the transcript overlay.
+    /// Returns a cache key describing the current in-flight cells for the transcript overlay.
     ///
     /// `Ctrl+T` renders committed transcript cells plus a render-only live tail derived from the
-    /// current active cell, and the overlay caches that tail; this key is what it uses to decide
-    /// whether it must recompute. When there is no active cell, this returns `None` so the overlay
-    /// can drop the tail entirely.
+    /// current active, hook, and asynchronous usage cells, and the overlay caches that tail; this
+    /// key is what it uses to decide whether it must recompute. When there are no live cells, this
+    /// returns `None` so the overlay can drop the tail entirely.
     ///
     /// If callers mutate the active cell's transcript output without bumping the revision (or
     /// providing an appropriate animation tick), the overlay will keep showing a stale tail while
@@ -1899,7 +1886,13 @@ impl ChatWidget {
     pub(crate) fn active_cell_transcript_key(&self) -> Option<ActiveCellTranscriptKey> {
         let cell = self.transcript.active_cell.as_ref();
         let hook_cell = self.active_hook_cell.as_ref();
-        if cell.is_none() && hook_cell.is_none() {
+        let token_activity_cell = self.pending_token_activity_output();
+        let rate_limit_reset_hint = self.pending_rate_limit_reset_hint();
+        if cell.is_none()
+            && hook_cell.is_none()
+            && token_activity_cell.is_none()
+            && rate_limit_reset_hint.is_none()
+        {
             return None;
         }
         Some(ActiveCellTranscriptKey {
@@ -1937,6 +1930,20 @@ impl ChatWidget {
             }
             lines.extend(hook_lines);
         }
+        if let Some(token_activity_cell) = self.pending_token_activity_output() {
+            let token_activity_lines = token_activity_cell.transcript_hyperlink_lines(width);
+            if !token_activity_lines.is_empty() && !lines.is_empty() {
+                lines.push(HyperlinkLine::from(""));
+            }
+            lines.extend(token_activity_lines);
+        }
+        if let Some(rate_limit_reset_hint) = self.pending_rate_limit_reset_hint() {
+            let hint_lines = rate_limit_reset_hint.transcript_hyperlink_lines(width);
+            if !hint_lines.is_empty() && !lines.is_empty() {
+                lines.push(HyperlinkLine::from(""));
+            }
+            lines.extend(hint_lines);
+        }
         (!lines.is_empty()).then_some(lines)
     }
 
@@ -1962,55 +1969,23 @@ impl ChatWidget {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
-impl ChatWidget {
-    pub(crate) fn update_recording_meter_in_place(&mut self, id: &str, text: &str) -> bool {
-        let updated = self.bottom_pane.update_recording_meter_in_place(id, text);
-        if updated {
-            self.request_redraw();
-        }
-        updated
-    }
-
-    pub(crate) fn remove_recording_meter_placeholder(&mut self, id: &str) {
-        self.bottom_pane.remove_recording_meter_placeholder(id);
-        // Ensure the UI redraws to reflect placeholder removal.
-        self.request_redraw();
-    }
-}
-
 fn has_websocket_timing_metrics(summary: RuntimeMetricsSummary) -> bool {
     summary.responses_api_overhead_ms > 0
         || summary.responses_api_inference_time_ms > 0
         || summary.responses_api_engine_iapi_ttft_ms > 0
         || summary.responses_api_engine_service_ttft_ms > 0
-        || summary.responses_api_engine_iapi_tbt_ms > 0
-        || summary.responses_api_engine_service_tbt_ms > 0
+        || summary.responses_api_engine_iapi_tbt_ms > 0.0
+        || summary.responses_api_engine_service_tbt_ms > 0.0
 }
 
 impl Drop for ChatWidget {
     fn drop(&mut self) {
-        self.reset_realtime_conversation_state();
         self.stop_rate_limit_poller();
     }
 }
 
-const PLACEHOLDERS: [&str; 8] = [
-    "Explain this codebase",
-    "Summarize recent commits",
-    "Implement {feature}",
-    "Find and fix a bug in @filename",
-    "Write tests for @filename",
-    "Improve documentation in @filename",
-    "Run /review on my current changes",
-    "Use /skills to list available skills",
-];
-
-const SIDE_PLACEHOLDERS: [&str; 3] = [
-    "Check recently modified functions for compatibility",
-    "How many files have been modified?",
-    "Will this algorithm scale well?",
-];
+const PLACEHOLDER: &str = "Ask Codex to do anything";
+const SIDE_PLACEHOLDER: &str = "Ask a follow-up question";
 
 // Extract the first bold (Markdown) element in the form **...** from `s`.
 // Returns the inner text if found; otherwise `None`.

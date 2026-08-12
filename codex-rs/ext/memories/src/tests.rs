@@ -19,6 +19,13 @@ use codex_utils_output_truncation::TruncationPolicy;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 
+use crate::backend::ListMemoriesRequest;
+use crate::backend::ListMemoriesResponse;
+use crate::backend::MemoriesBackend;
+use crate::backend::MemoryEntry;
+use crate::backend::MemoryEntryType;
+use crate::backend::SearchMatchMode;
+use crate::backend::SearchMemoriesRequest;
 use crate::extension::MemoriesExtension;
 use crate::extension::MemoriesExtensionConfig;
 use crate::local::LocalMemoriesBackend;
@@ -41,7 +48,7 @@ fn tools_are_not_contributed_without_thread_config() {
         extension
             .tools(
                 &ExtensionData::new("session"),
-                &ExtensionData::new("thread")
+                &ExtensionData::new("thread"),
             )
             .is_empty()
     );
@@ -181,7 +188,7 @@ async fn prompt_contribution_uses_memory_summary_when_enabled() {
     });
 
     let fragments = extension
-        .contribute(&ExtensionData::new("session"), &thread_store)
+        .contribute_thread_context(&ExtensionData::new("session"), &thread_store)
         .await;
 
     assert_eq!(fragments.len(), 1);
@@ -212,6 +219,7 @@ async fn add_ad_hoc_note_tool_creates_note_file() {
             call_id: "call-1".to_string(),
             tool_name: memory_tool_name(crate::ADD_AD_HOC_NOTE_TOOL_NAME),
             model: "gpt-test".to_string(),
+            codex_turn_metadata: None,
             truncation_policy: TruncationPolicy::Bytes(1024),
             conversation_history: codex_extension_api::ConversationHistory::default(),
             turn_item_emitter: Arc::new(NoopTurnItemEmitter),
@@ -256,6 +264,7 @@ async fn add_ad_hoc_note_tool_rejects_paths_as_filenames() {
             call_id: "call-1".to_string(),
             tool_name: memory_tool_name(crate::ADD_AD_HOC_NOTE_TOOL_NAME),
             model: "gpt-test".to_string(),
+            codex_turn_metadata: None,
             truncation_policy: TruncationPolicy::Bytes(1024),
             conversation_history: codex_extension_api::ConversationHistory::default(),
             turn_item_emitter: Arc::new(NoopTurnItemEmitter),
@@ -301,6 +310,7 @@ async fn read_tool_reads_memory_file() {
             call_id: "call-1".to_string(),
             tool_name: memory_tool_name(crate::READ_TOOL_NAME),
             model: "gpt-test".to_string(),
+            codex_turn_metadata: None,
             truncation_policy: TruncationPolicy::Bytes(1024),
             conversation_history: codex_extension_api::ConversationHistory::default(),
             turn_item_emitter: Arc::new(NoopTurnItemEmitter),
@@ -319,6 +329,73 @@ async fn read_tool_reads_memory_file() {
             "truncated": true
         }))
     );
+}
+
+#[tokio::test]
+async fn local_listing_and_search_ignore_symlinks() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let memory_root = tempdir.path().join("memories");
+    let outside_root = tempdir.path().join("outside");
+    std::fs::create_dir_all(memory_root.join("nested")).expect("create memories directory");
+    std::fs::create_dir_all(&outside_root).expect("create outside directory");
+    for (path, content) in [
+        (memory_root.join("a.md"), "visible needle"),
+        (memory_root.join("nested/z.md"), "nested needle"),
+        (outside_root.join("secret.md"), "outside needle"),
+    ] {
+        std::fs::write(path, content).expect("write memory fixture");
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside_root, memory_root.join("linked-directory"))
+        .expect("create memory fixture symlink");
+
+    let backend = LocalMemoriesBackend::from_memory_root(&memory_root);
+    let listing = backend
+        .list(ListMemoriesRequest {
+            path: None,
+            cursor: None,
+            max_results: 10,
+        })
+        .await
+        .expect("list visible memories");
+    assert_eq!(
+        listing,
+        ListMemoriesResponse {
+            path: None,
+            entries: vec![
+                MemoryEntry {
+                    path: "a.md".to_string(),
+                    entry_type: MemoryEntryType::File,
+                },
+                MemoryEntry {
+                    path: "nested".to_string(),
+                    entry_type: MemoryEntryType::Directory,
+                },
+            ],
+            next_cursor: None,
+            truncated: false,
+        }
+    );
+
+    let response = backend
+        .search(SearchMemoriesRequest {
+            queries: vec!["needle".to_string()],
+            match_mode: SearchMatchMode::Any,
+            path: None,
+            cursor: None,
+            context_lines: 0,
+            case_sensitive: false,
+            normalized: false,
+            max_results: 10,
+        })
+        .await
+        .expect("search visible memories");
+    let paths = response
+        .matches
+        .iter()
+        .map(|matched| matched.path.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(paths, vec!["a.md", "nested/z.md"]);
 }
 
 #[tokio::test]
@@ -349,6 +426,7 @@ async fn search_tool_accepts_multiple_queries() {
             call_id: "call-1".to_string(),
             tool_name: memory_tool_name(crate::SEARCH_TOOL_NAME),
             model: "gpt-test".to_string(),
+            codex_turn_metadata: None,
             truncation_policy: TruncationPolicy::Bytes(1024),
             conversation_history: codex_extension_api::ConversationHistory::default(),
             turn_item_emitter: Arc::new(NoopTurnItemEmitter),
@@ -423,6 +501,7 @@ async fn search_tool_accepts_windowed_all_match_mode() {
             call_id: "call-1".to_string(),
             tool_name: memory_tool_name(crate::SEARCH_TOOL_NAME),
             model: "gpt-test".to_string(),
+            codex_turn_metadata: None,
             truncation_policy: TruncationPolicy::Bytes(1024),
             conversation_history: codex_extension_api::ConversationHistory::default(),
             turn_item_emitter: Arc::new(NoopTurnItemEmitter),
@@ -477,6 +556,7 @@ async fn search_tool_rejects_legacy_single_query() {
             call_id: "call-1".to_string(),
             tool_name: memory_tool_name(crate::SEARCH_TOOL_NAME),
             model: "gpt-test".to_string(),
+            codex_turn_metadata: None,
             truncation_policy: TruncationPolicy::Bytes(1024),
             conversation_history: codex_extension_api::ConversationHistory::default(),
             turn_item_emitter: Arc::new(NoopTurnItemEmitter),

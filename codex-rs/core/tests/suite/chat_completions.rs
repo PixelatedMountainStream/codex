@@ -25,9 +25,11 @@ use codex_core::Prompt;
 use codex_core::ResponseEvent;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
+use codex_login::auth::AgentIdentityAuthPolicy;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::WireApi;
 use codex_otel::SessionTelemetry;
+use codex_protocol::ResponseItemId;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::models::ContentItem;
@@ -118,6 +120,7 @@ fn chat_provider(server: &MockServer) -> ModelProviderInfo {
         websocket_connect_timeout_ms: None,
         requires_openai_auth: false,
         supports_websockets: false,
+        supports_standalone_web_search: false,
     }
 }
 
@@ -168,14 +171,18 @@ async fn build_context(server: &MockServer) -> ChatTestContext {
         Some(AuthManager::from_auth_for_testing(CodexAuth::from_api_key(
             "unused-api-key",
         ))),
+        AgentIdentityAuthPolicy::JwtOnly,
         thread_id,
         provider,
         SessionSource::Exec,
+        "test_originator".to_string(),
         config.model_verbosity,
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
+        /*concurrent_reasoning_summaries_enabled*/ false,
         /*attestation_provider*/ None,
+        config.http_client_factory(),
     );
     let thread_id_str = thread_id.to_string();
     let metadata = make_responses_metadata(
@@ -208,6 +215,7 @@ fn user_prompt(text: &str) -> Prompt {
             text: text.to_string(),
         }],
         phase: None,
+        internal_chat_message_metadata_passthrough: None,
     });
     prompt
 }
@@ -537,17 +545,22 @@ async fn chat_function_call_output_in_history_sends_role_tool_message() {
             text: "list files".to_string(),
         }],
         phase: None,
+        internal_chat_message_metadata_passthrough: None,
     });
     prompt.input.push(ResponseItem::FunctionCall {
-        id: Some("item-fc-1".to_string()),
+        id: Some(ResponseItemId::from_server("item-fc-1".to_string())),
         name: "shell".to_string(),
         namespace: None,
         arguments: "{\"cmd\":\"ls\"}".to_string(),
+        encrypted_function_args: None,
         call_id: "call-hist-001".to_string(),
+        internal_chat_message_metadata_passthrough: None,
     });
     prompt.input.push(ResponseItem::FunctionCallOutput {
+        id: None,
         call_id: "call-hist-001".to_string(),
         output: FunctionCallOutputPayload::from_text("file1.txt\nfile2.txt".to_string()),
+        internal_chat_message_metadata_passthrough: None,
     });
     prompt.input.push(ResponseItem::Message {
         id: None,
@@ -556,6 +569,7 @@ async fn chat_function_call_output_in_history_sends_role_tool_message() {
             text: "what did ls return?".to_string(),
         }],
         phase: None,
+        internal_chat_message_metadata_passthrough: None,
     });
 
     let stream = session
@@ -639,6 +653,7 @@ fn chat_wire_api_config_round_trip() {
         websocket_connect_timeout_ms: None,
         requires_openai_auth: false,
         supports_websockets: false,
+        supports_standalone_web_search: false,
     };
 
     assert_eq!(
@@ -680,6 +695,7 @@ fn chat_provider_does_not_request_websocket_prewarm() {
         websocket_connect_timeout_ms: None,
         requires_openai_auth: false,
         supports_websockets: false,
+        supports_standalone_web_search: false,
     };
 
     assert_eq!(provider.wire_api, WireApi::Chat);

@@ -5,7 +5,11 @@ use crate::codex_thread::TryStartTurnIfIdleError;
 use crate::codex_thread::TryStartTurnIfIdleRejectionReason;
 use crate::state::ActiveTurn;
 use crate::state::TurnState;
+use crate::tasks::MailboxParentProvenance;
 use crate::tasks::RegularTask;
+use codex_features::Feature;
+use codex_history::CodexHarnessMetadata;
+use codex_history::ResponseItemEnvelope;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::models::ResponseItem;
 use std::sync::Arc;
@@ -24,9 +28,13 @@ impl Session {
         match active.as_mut() {
             Some(active_turn) => {
                 self.input_queue
-                    .extend_pending_input_for_turn_state(
+                    .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
                         active_turn.turn_state.as_ref(),
-                        input.into_iter().map(TurnInput::ResponseItem).collect(),
+                        input
+                            .into_iter()
+                            .map(ResponseItemEnvelope::new)
+                            .map(TurnInput::ResponseItem)
+                            .collect(),
                     )
                     .await;
                 Ok(())
@@ -35,27 +43,107 @@ impl Session {
         }
     }
 
-    /// Starts a regular turn with the provided items only if automatic idle work
+    /// Preserves trusted client provenance while items wait for an active turn.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "active turn checks and turn state updates must remain atomic"
+    )]
+    pub(crate) async fn inject_client_response_items(
+        &self,
+        items: Vec<ResponseItem>,
+        turn_context: &TurnContext,
+    ) {
+        let items = items
+            .into_iter()
+            .map(|item| self.annotate_client_response_item(item))
+            .collect::<Vec<_>>();
+        let mut active = self.active_turn.lock().await;
+        if let Some(active_turn) = active.as_mut() {
+            self.input_queue
+                .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
+                    active_turn.turn_state.as_ref(),
+                    items.into_iter().map(TurnInput::ResponseItem).collect(),
+                )
+                .await;
+            return;
+        }
+        drop(active);
+        self.record_annotated_conversation_items(turn_context, items)
+            .await;
+    }
+
+    pub(crate) fn annotate_client_response_item(&self, item: ResponseItem) -> ResponseItemEnvelope {
+        let metadata = (self.enabled(Feature::RetainClientDeveloperMessages)
+            && matches!(&item, ResponseItem::Message { role, .. } if role == "developer"))
+        .then_some(CodexHarnessMetadata {
+            client_authored: true,
+        });
+
+        ResponseItemEnvelope { item, metadata }
+    }
+
+    pub(crate) async fn record_annotated_conversation_items(
+        &self,
+        turn_context: &TurnContext,
+        items: Vec<ResponseItemEnvelope>,
+    ) {
+        if !self.enabled(Feature::RetainClientDeveloperMessages)
+            || items.iter().all(|item| item.metadata.is_none())
+        {
+            let items = items
+                .into_iter()
+                .map(ResponseItemEnvelope::into_item)
+                .collect::<Vec<_>>();
+            self.record_conversation_items(turn_context, &items).await;
+            return;
+        }
+
+        let mut annotated_items = Vec::with_capacity(items.len());
+        let mut image_preparations = Vec::new();
+        for envelope in items {
+            let (prepared_items, prepared_images) = self.prepare_conversation_items_for_history(
+                turn_context,
+                std::slice::from_ref(&envelope.item),
+            );
+            image_preparations.extend(prepared_images);
+
+            let mut metadata = envelope.metadata;
+            annotated_items.extend(prepared_items.into_owned().into_iter().map(|item| {
+                ResponseItemEnvelope {
+                    item,
+                    metadata: metadata.take(),
+                }
+            }));
+        }
+        self.record_prepared_conversation_items(turn_context, annotated_items, image_preparations)
+            .await;
+    }
+
+    /// Starts a regular turn with the provided input only if automatic idle work
     /// is allowed for the current session state.
     ///
     /// This is the shared gate for extension-initiated idle work. It refuses to
-    /// start a turn when user/client-triggered work is queued, any task is still
-    /// active, or the session is currently in Plan mode. Active Review tasks are
-    /// covered by the active-task check because Review turns are not steerable.
+    /// start a turn when user/client-triggered work is queued or any task is
+    /// still active. Work without user input is also rejected in Plan mode.
+    /// Active Review tasks are covered by the active-task check because Review
+    /// turns are not steerable.
     pub(crate) async fn try_start_turn_if_idle(
         self: &Arc<Self>,
-        input: Vec<ResponseItem>,
+        input: Vec<TurnInput>,
     ) -> Result<(), TryStartTurnIfIdleError> {
         if input.is_empty() {
             return Ok(());
         }
+        let has_user_input = input.iter().any(
+            |item| matches!(item, TurnInput::UserInput { content, .. } if !content.is_empty()),
+        );
         if self.input_queue.has_trigger_turn_mailbox_items().await {
             return Err(TryStartTurnIfIdleError::new(
                 TryStartTurnIfIdleRejectionReason::PendingTriggerTurn,
                 input,
             ));
         }
-        if self.collaboration_mode().await.mode == ModeKind::Plan {
+        if !has_user_input && self.collaboration_mode().await.mode == ModeKind::Plan {
             return Err(TryStartTurnIfIdleError::new(
                 TryStartTurnIfIdleRejectionReason::PlanMode,
                 input,
@@ -86,7 +174,7 @@ impl Session {
         let turn_context = self
             .new_default_turn_with_sub_id(uuid::Uuid::new_v4().to_string())
             .await;
-        if turn_context.collaboration_mode.mode == ModeKind::Plan {
+        if !has_user_input && turn_context.mode == ModeKind::Plan {
             self.clear_reserved_idle_turn(&turn_state).await;
             self.maybe_start_turn_for_pending_work().await;
             return Err(TryStartTurnIfIdleError::new(
@@ -94,7 +182,7 @@ impl Session {
                 input,
             ));
         }
-        self.maybe_emit_unknown_model_warning_for_turn(turn_context.as_ref())
+        self.maybe_emit_model_warnings_for_turn(turn_context.as_ref())
             .await;
         if self.input_queue.has_trigger_turn_mailbox_items().await {
             self.clear_reserved_idle_turn(&turn_state).await;
@@ -118,14 +206,36 @@ impl Session {
             ));
         }
 
-        self.input_queue
-            .extend_pending_input_for_turn_state(
-                turn_state.as_ref(),
-                input.into_iter().map(TurnInput::ResponseItem).collect(),
-            )
-            .await;
-        self.start_task(turn_context, Vec::new(), RegularTask::new())
-            .await;
+        if has_user_input
+            && turn_context
+                .turn_metadata_state
+                .can_start_root_turn(&turn_context.session_source)
+        {
+            turn_context
+                .turn_metadata_state
+                .set_root_turn_id(turn_context.sub_id.clone());
+        }
+        let task_input = if has_user_input {
+            self.clear_connector_selection().await;
+            for item in &input {
+                if let TurnInput::UserInput { content, .. } = item {
+                    turn_context.session_telemetry.user_prompt(content);
+                }
+            }
+            input
+        } else {
+            self.input_queue
+                .extend_pending_input_for_turn_state(turn_state.as_ref(), input)
+                .await;
+            Vec::new()
+        };
+        self.start_task(
+            turn_context,
+            task_input,
+            RegularTask::new(),
+            MailboxParentProvenance::Ignore,
+        )
+        .await;
         Ok(())
     }
 

@@ -6,8 +6,14 @@ use codex_protocol::config_types::ServiceTier;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ImageDetail;
 use pretty_assertions::assert_eq;
+use serde_json::value::RawValue;
+use std::sync::Arc;
 
 use super::*;
+
+fn empty_tools() -> Arc<RawValue> {
+    Arc::from(RawValue::from_string("[]".to_string()).expect("valid tool JSON"))
+}
 
 fn prompt_with_image_outputs() -> Prompt {
     Prompt {
@@ -20,8 +26,10 @@ fn prompt_with_image_outputs() -> Prompt {
                     detail: Some(ImageDetail::Original),
                 }],
                 phase: None,
+                internal_chat_message_metadata_passthrough: None,
             },
             ResponseItem::FunctionCallOutput {
+                id: None,
                 call_id: "function-call".to_string(),
                 output: FunctionCallOutputPayload::from_content_items(vec![
                     FunctionCallOutputContentItem::InputImage {
@@ -29,8 +37,10 @@ fn prompt_with_image_outputs() -> Prompt {
                         detail: Some(ImageDetail::High),
                     },
                 ]),
+                internal_chat_message_metadata_passthrough: None,
             },
             ResponseItem::CustomToolCallOutput {
+                id: None,
                 call_id: "custom-call".to_string(),
                 name: None,
                 output: FunctionCallOutputPayload::from_content_items(vec![
@@ -39,6 +49,7 @@ fn prompt_with_image_outputs() -> Prompt {
                         detail: Some(ImageDetail::Auto),
                     },
                 ]),
+                internal_chat_message_metadata_passthrough: None,
             },
         ],
         ..Default::default()
@@ -63,8 +74,10 @@ fn responses_lite_request_copies_strip_image_details() {
                     detail: None,
                 }],
                 phase: None,
+                internal_chat_message_metadata_passthrough: None,
             },
             ResponseItem::FunctionCallOutput {
+                id: None,
                 call_id: "function-call".to_string(),
                 output: FunctionCallOutputPayload::from_content_items(vec![
                     FunctionCallOutputContentItem::InputImage {
@@ -72,8 +85,10 @@ fn responses_lite_request_copies_strip_image_details() {
                         detail: None,
                     },
                 ]),
+                internal_chat_message_metadata_passthrough: None,
             },
             ResponseItem::CustomToolCallOutput {
+                id: None,
                 call_id: "custom-call".to_string(),
                 name: None,
                 output: FunctionCallOutputPayload::from_content_items(vec![
@@ -82,6 +97,7 @@ fn responses_lite_request_copies_strip_image_details() {
                         detail: None,
                     },
                 ]),
+                internal_chat_message_metadata_passthrough: None,
             },
         ]
     );
@@ -95,17 +111,17 @@ fn responses_lite_request_copies_strip_image_details() {
 #[test]
 fn serializes_text_verbosity_when_set() {
     let input: Vec<ResponseItem> = vec![];
-    let tools: Vec<serde_json::Value> = vec![];
     let req = ResponsesApiRequest {
         model: "gpt-5.4".to_string(),
         instructions: "i".to_string(),
         input,
-        tools,
+        tools: Some(empty_tools().into()),
         tool_choice: "auto".to_string(),
         parallel_tool_calls: true,
         reasoning: None,
         store: false,
         stream: true,
+        stream_options: None,
         include: vec![],
         prompt_cache_key: None,
         service_tier: None,
@@ -128,7 +144,6 @@ fn serializes_text_verbosity_when_set() {
 #[test]
 fn serializes_text_schema_with_strict_format() {
     let input: Vec<ResponseItem> = vec![];
-    let tools: Vec<serde_json::Value> = vec![];
     let schema = serde_json::json!({
         "type": "object",
         "properties": {
@@ -147,12 +162,13 @@ fn serializes_text_schema_with_strict_format() {
         model: "gpt-5.4".to_string(),
         instructions: "i".to_string(),
         input,
-        tools,
+        tools: Some(empty_tools().into()),
         tool_choice: "auto".to_string(),
         parallel_tool_calls: true,
         reasoning: None,
         store: false,
         stream: true,
+        stream_options: None,
         include: vec![],
         prompt_cache_key: None,
         service_tier: None,
@@ -203,17 +219,17 @@ fn serializes_text_schema_with_non_strict_format() {
 #[test]
 fn omits_text_when_not_set() {
     let input: Vec<ResponseItem> = vec![];
-    let tools: Vec<serde_json::Value> = vec![];
     let req = ResponsesApiRequest {
         model: "gpt-5.4".to_string(),
         instructions: "i".to_string(),
         input,
-        tools,
+        tools: Some(empty_tools().into()),
         tool_choice: "auto".to_string(),
         parallel_tool_calls: true,
         reasoning: None,
         store: false,
         stream: true,
+        stream_options: None,
         include: vec![],
         prompt_cache_key: None,
         service_tier: None,
@@ -231,12 +247,13 @@ fn serializes_flex_service_tier_when_set() {
         model: "gpt-5.4".to_string(),
         instructions: "i".to_string(),
         input: vec![],
-        tools: vec![],
+        tools: Some(empty_tools().into()),
         tool_choice: "auto".to_string(),
         parallel_tool_calls: true,
         reasoning: None,
         store: false,
         stream: true,
+        stream_options: None,
         include: vec![],
         prompt_cache_key: None,
         service_tier: Some(ServiceTier::Flex.to_string()),

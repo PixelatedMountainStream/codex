@@ -1,5 +1,5 @@
 use super::*;
-use codex_config::config_toml::ConfigToml;
+use codex_core::config::permission_profile_catalog;
 use futures::StreamExt;
 
 #[derive(Clone)]
@@ -16,7 +16,7 @@ pub(crate) struct CatalogRequestProcessor {
 const SKILLS_LIST_CWD_CONCURRENCY: usize = 5;
 
 fn skills_to_info(
-    skills: &[codex_core::skills::SkillMetadata],
+    skills: &[codex_skills::SkillMetadata],
     disabled_paths: &HashSet<AbsolutePathBuf>,
 ) -> Vec<codex_app_server_protocol::SkillMetadata> {
     skills
@@ -33,6 +33,8 @@ fn skills_to_info(
                         short_description: interface.short_description,
                         icon_small: interface.icon_small,
                         icon_large: interface.icon_large,
+                        icon_small_url: None,
+                        icon_large_url: None,
                         brand_color: interface.brand_color,
                         default_prompt: interface.default_prompt,
                     }
@@ -68,10 +70,12 @@ fn hooks_to_info(hooks: &[codex_hooks::HookListEntry]) -> Vec<HookMetadata> {
             key: hook.key.clone(),
             event_name: hook.event_name.into(),
             handler_type: hook.handler_type.into(),
+            execution_mode: hook.execution_mode.into(),
             matcher: hook.matcher.clone(),
             command: hook.command.clone(),
             timeout_sec: hook.timeout_sec,
             status_message: hook.status_message.clone(),
+            additional_context_limit: hook.additional_context_limit,
             source_path: hook.source_path.clone(),
             source: hook.source.into(),
             plugin_id: hook.plugin_id.clone(),
@@ -85,7 +89,7 @@ fn hooks_to_info(hooks: &[codex_hooks::HookListEntry]) -> Vec<HookMetadata> {
 }
 
 fn errors_to_info(
-    errors: &[codex_core::skills::SkillError],
+    errors: &[codex_skills::SkillError],
 ) -> Vec<codex_app_server_protocol::SkillErrorInfo> {
     errors
         .iter()
@@ -157,9 +161,13 @@ impl CatalogRequestProcessor {
         &self,
         params: ModelListParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        Self::list_models(self.thread_manager.clone(), params)
-            .await
-            .map(|response| Some(response.into()))
+        Self::list_models(
+            self.thread_manager.clone(),
+            self.config.http_client_factory(),
+            params,
+        )
+        .await
+        .map(|response| Some(response.into()))
     }
 
     pub(crate) async fn experimental_feature_list(
@@ -247,6 +255,7 @@ impl CatalogRequestProcessor {
 
     async fn list_models(
         thread_manager: Arc<ThreadManager>,
+        http_client_factory: codex_http_client::HttpClientFactory,
         params: ModelListParams,
     ) -> Result<ModelListResponse, JSONRPCErrorError> {
         let ModelListParams {
@@ -254,7 +263,12 @@ impl CatalogRequestProcessor {
             cursor,
             include_hidden,
         } = params;
-        let models = supported_models(thread_manager, include_hidden.unwrap_or(false)).await;
+        let models = supported_models(
+            thread_manager,
+            include_hidden.unwrap_or(false),
+            http_client_factory,
+        )
+        .await;
         let total = models.len();
 
         if total == 0 {
@@ -434,35 +448,15 @@ impl CatalogRequestProcessor {
                 .await
                 .map_err(|err| internal_error(format!("failed to reload config: {err}")))?,
         };
-        let effective_config: ConfigToml = config_layer_stack
-            .effective_config()
-            .try_into()
-            .map_err(|err| internal_error(format!("failed to read effective config: {err}")))?;
-        let mut profiles = vec![
-            PermissionProfileSummary {
-                id: BUILT_IN_PERMISSION_PROFILE_READ_ONLY.to_string(),
-                description: None,
-            },
-            PermissionProfileSummary {
-                id: BUILT_IN_PERMISSION_PROFILE_WORKSPACE.to_string(),
-                description: None,
-            },
-            PermissionProfileSummary {
-                id: BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS.to_string(),
-                description: None,
-            },
-        ];
-        let mut configured_profiles = effective_config
-            .permissions
+        let profiles = permission_profile_catalog(&config_layer_stack)
+            .map_err(|err| internal_error(format!("failed to resolve permission profiles: {err}")))?
             .into_iter()
-            .flat_map(|permissions| permissions.entries)
-            .map(|(id, profile)| PermissionProfileSummary {
-                id,
+            .map(|profile| PermissionProfileSummary {
+                id: profile.id,
                 description: profile.description,
+                allowed: profile.allowed,
             })
             .collect::<Vec<_>>();
-        configured_profiles.sort_by(|left, right| left.id.cmp(&right.id));
-        profiles.extend(configured_profiles);
         let total = profiles.len();
         let effective_limit = limit.unwrap_or(total as u32).max(1) as usize;
         let effective_limit = effective_limit.min(total);
@@ -511,19 +505,38 @@ impl CatalogRequestProcessor {
         let workspace_codex_plugins_enabled = self
             .workspace_codex_plugins_enabled(&config, auth.as_ref())
             .await;
-        let skills_manager = self.thread_manager.skills_manager();
+        let skills_service = self.thread_manager.skills_service();
         let plugins_manager = self.thread_manager.plugins_manager();
+        if force_reload
+            && workspace_codex_plugins_enabled
+            && config.features.enabled(Feature::Plugins)
+        {
+            plugins_manager.clear_cache();
+            skills_service.clear_cache();
+        }
+        // Plugin configuration is user-scoped; workspace skill rules are applied below.
+        let (effective_skill_roots, plugin_skill_snapshots) = if workspace_codex_plugins_enabled {
+            let plugins_input = config.plugins_config_input();
+            let plugins = plugins_manager.plugins_for_config(&plugins_input).await;
+            (
+                plugins.effective_plugin_skill_roots(),
+                plugins_manager.plugin_skill_snapshots_for_config(&plugins_input),
+            )
+        } else {
+            (Vec::new(), None)
+        };
         let fs = self
             .thread_manager
             .environment_manager()
             .default_environment()
             .map(|environment| environment.get_filesystem());
+        let skills_request = skills_service.for_request();
         let mut data = futures::stream::iter(cwds.into_iter().enumerate())
             .map(|(index, cwd)| {
-                let config = &config;
                 let fs = fs.clone();
-                let plugins_manager = &plugins_manager;
-                let skills_manager = &skills_manager;
+                let skills_request = &skills_request;
+                let effective_skill_roots = effective_skill_roots.clone();
+                let plugin_skill_snapshots = plugin_skill_snapshots.clone();
                 async move {
                     let (cwd_abs, config_layer_stack) = match self.resolve_cwd_config(&cwd).await {
                         Ok(resolved) => resolved,
@@ -542,26 +555,16 @@ impl CatalogRequestProcessor {
                             );
                         }
                     };
-                    let effective_skill_roots = if workspace_codex_plugins_enabled {
-                        let plugins_input = config.plugins_config_input();
-                        plugins_manager
-                            .effective_skill_roots_for_layer_stack(
-                                &config_layer_stack,
-                                &plugins_input,
-                            )
-                            .await
-                    } else {
-                        Vec::new()
-                    };
-                    let skills_input = codex_core::skills::SkillsLoadInput::new(
+                    let skills_input = codex_skills_extension::HostSkillsLoadInput::new(
                         cwd_abs.clone(),
                         effective_skill_roots,
                         config_layer_stack,
-                        config.bundled_skills_enabled(),
-                    );
-                    let outcome = skills_manager
-                        .skills_for_cwd(&skills_input, force_reload, fs)
+                    )
+                    .with_plugin_skill_snapshots(plugin_skill_snapshots);
+                    let snapshot = skills_request
+                        .snapshot_for_cwd(&skills_input, force_reload, fs)
                         .await;
+                    let outcome = snapshot.outcome();
                     let errors = errors_to_info(&outcome.errors);
                     let skills = skills_to_info(&outcome.skills, &outcome.disabled_paths);
                     (
@@ -590,7 +593,7 @@ impl CatalogRequestProcessor {
         self.skills_watcher
             .register_runtime_extra_roots(&extra_roots);
         self.thread_manager
-            .skills_manager()
+            .skills_service()
             .set_extra_roots(extra_roots);
         self.outgoing
             .send_server_notification(ServerNotification::SkillsChanged(
@@ -703,7 +706,7 @@ impl CatalogRequestProcessor {
             .await
             .map(|()| {
                 self.thread_manager.plugins_manager().clear_cache();
-                self.thread_manager.skills_manager().clear_cache();
+                self.thread_manager.skills_service().clear_cache();
                 SkillsConfigWriteResponse {
                     effective_enabled: enabled,
                 }

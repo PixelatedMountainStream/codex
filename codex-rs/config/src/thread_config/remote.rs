@@ -191,6 +191,7 @@ fn model_provider_from_proto(
         websocket_connect_timeout_ms: provider.websocket_connect_timeout_ms,
         requires_openai_auth: provider.requires_openai_auth,
         supports_websockets: provider.supports_websockets,
+        supports_standalone_web_search: provider.supports_standalone_web_search,
     };
     Ok((id, info))
 }
@@ -218,6 +219,7 @@ fn model_provider_to_proto(
         websocket_connect_timeout_ms,
         requires_openai_auth,
         supports_websockets,
+        supports_standalone_web_search,
     } = provider;
 
     proto::ModelProvider {
@@ -238,6 +240,7 @@ fn model_provider_to_proto(
         websocket_connect_timeout_ms,
         requires_openai_auth,
         supports_websockets,
+        supports_standalone_web_search,
     }
 }
 
@@ -423,6 +426,21 @@ mod tests {
     fn model_provider_proto_roundtrips_through_domain_type() {
         let expected = expected_provider();
         let proto = model_provider_to_proto("local", expected.clone());
+        assert!(proto.supports_standalone_web_search);
+        let (id, actual) = model_provider_from_proto(proto).expect("model provider from proto");
+
+        assert_eq!(id, "local");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn model_provider_proto_defaults_standalone_web_search_to_false() {
+        let expected = ModelProviderInfo {
+            supports_standalone_web_search: false,
+            ..expected_provider()
+        };
+        let proto = model_provider_to_proto("local", expected.clone());
+        assert!(!proto.supports_standalone_web_search);
         let (id, actual) = model_provider_from_proto(proto).expect("model provider from proto");
 
         assert_eq!(id, "local");
@@ -475,6 +493,7 @@ mod tests {
                             websocket_connect_timeout_ms: Some(10_000),
                             requires_openai_auth: false,
                             supports_websockets: true,
+                            supports_standalone_web_search: true,
                         }],
                         features: HashMap::from([
                             ("plugins".to_string(), false),
@@ -538,6 +557,7 @@ mod tests {
             websocket_connect_timeout_ms: Some(10_000),
             requires_openai_auth: false,
             supports_websockets: true,
+            supports_standalone_web_search: true,
             aws: None,
         }
     }

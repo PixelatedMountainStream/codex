@@ -1,5 +1,5 @@
 #![cfg(not(target_os = "windows"))]
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used)]
 
 use anyhow::Context;
 use anyhow::Result;
@@ -383,6 +383,7 @@ async fn mcp_tool_call_output_exceeds_limit_truncated_for_model() -> Result<()> 
         servers.insert(
             server_name.to_string(),
             codex_config::types::McpServerConfig {
+                auth: Default::default(),
                 transport: codex_config::types::McpServerTransportConfig::Stdio {
                     command: rmcp_test_server_bin,
                     args: Vec::new(),
@@ -394,6 +395,7 @@ async fn mcp_tool_call_output_exceeds_limit_truncated_for_model() -> Result<()> 
                 enabled: true,
                 required: false,
                 supports_parallel_tool_calls: false,
+                omit_tools_from: None,
                 disabled_reason: None,
                 startup_timeout_sec: Some(std::time::Duration::from_secs(10)),
                 tool_timeout_sec: None,
@@ -474,13 +476,14 @@ async fn mcp_image_output_preserves_image_and_no_text_summary() -> Result<()> {
     let rmcp_test_server_bin = stdio_server_bin()?;
 
     // 1x1 PNG data URL
-    let openai_png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/ee9bQAAAABJRU5ErkJggg==";
+    let openai_png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
 
     let mut builder = test_codex().with_config(move |config| {
         let mut servers = config.mcp_servers.get().clone();
         servers.insert(
             server_name.to_string(),
             McpServerConfig {
+                auth: Default::default(),
                 transport: McpServerTransportConfig::Stdio {
                     command: rmcp_test_server_bin,
                     args: Vec::new(),
@@ -495,6 +498,7 @@ async fn mcp_image_output_preserves_image_and_no_text_summary() -> Result<()> {
                 enabled: true,
                 required: false,
                 supports_parallel_tool_calls: false,
+                omit_tools_from: None,
                 disabled_reason: None,
                 startup_timeout_sec: Some(Duration::from_secs(10)),
                 tool_timeout_sec: None,
@@ -773,6 +777,7 @@ async fn mcp_tool_call_output_not_truncated_with_custom_limit() -> Result<()> {
         servers.insert(
             server_name.to_string(),
             codex_config::types::McpServerConfig {
+                auth: Default::default(),
                 transport: codex_config::types::McpServerTransportConfig::Stdio {
                     command: rmcp_test_server_bin,
                     args: Vec::new(),
@@ -784,6 +789,7 @@ async fn mcp_tool_call_output_not_truncated_with_custom_limit() -> Result<()> {
                 enabled: true,
                 required: false,
                 supports_parallel_tool_calls: false,
+                omit_tools_from: None,
                 disabled_reason: None,
                 startup_timeout_sec: Some(std::time::Duration::from_secs(10)),
                 tool_timeout_sec: None,

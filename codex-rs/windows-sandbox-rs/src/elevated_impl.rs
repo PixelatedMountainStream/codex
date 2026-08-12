@@ -15,6 +15,7 @@ pub struct ElevatedSandboxProfileCaptureRequest<'a> {
     pub cancellation: Option<crate::WindowsSandboxCancellationToken>,
     pub use_private_desktop: bool,
     pub proxy_enforced: bool,
+    pub network_proxy_restricting_sid: Option<String>,
     pub read_roots_override: Option<&'a [PathBuf]>,
     pub read_roots_include_platform_defaults: bool,
     pub write_roots_override: Option<&'a [PathBuf]>,
@@ -30,6 +31,7 @@ mod windows_impl {
     use crate::env::ensure_non_interactive_pager;
     use crate::env::inherit_path_env;
     use crate::env::normalize_null_device_env;
+    use crate::identity::refresh_logon_sandbox_creds;
     use crate::identity::require_logon_sandbox_creds;
     use crate::ipc_framed::EmptyPayload;
     use crate::ipc_framed::FramedMessage;
@@ -43,6 +45,7 @@ mod windows_impl {
     use crate::logging::log_start;
     use crate::logging::log_success;
     use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
+    use crate::runner_client::retry_runner_spawn_once;
     use crate::runner_client::spawn_runner_transport;
     use crate::sandbox_utils::ensure_codex_home_exists;
     use crate::sandbox_utils::inject_git_safe_directory;
@@ -108,6 +111,7 @@ mod windows_impl {
             cancellation,
             use_private_desktop,
             proxy_enforced,
+            network_proxy_restricting_sid,
             read_roots_override,
             read_roots_include_platform_defaults,
             write_roots_override,
@@ -148,6 +152,7 @@ mod windows_impl {
             &deny_read_paths_override,
             &deny_write_paths_override,
             proxy_enforced,
+            crate::WindowsSandboxProxySettingsMode::Reconcile,
         )?;
         // Build capability SID for ACL grants.
         let caps = load_or_create_cap_sids(codex_home)?;
@@ -187,17 +192,39 @@ mod windows_impl {
                 codex_home: sandbox_base.clone(),
                 real_codex_home: codex_home.to_path_buf(),
                 cap_sids,
+                network_proxy_restricting_sid,
                 timeout_ms,
                 tty: false,
                 stdin_open: false,
                 use_private_desktop,
             };
-            let transport = spawn_runner_transport(
-                codex_home,
-                cwd,
-                &sandbox_creds,
-                logs_base_dir,
-                spawn_request,
+            let transport = retry_runner_spawn_once(
+                sandbox_creds,
+                &spawn_request.command,
+                |sandbox_creds| {
+                    spawn_runner_transport(
+                        codex_home,
+                        cwd,
+                        &sandbox_creds,
+                        logs_base_dir,
+                        spawn_request.clone(),
+                    )
+                },
+                || {
+                    refresh_logon_sandbox_creds(
+                        &permissions,
+                        cwd,
+                        &env_map,
+                        codex_home,
+                        read_roots_override,
+                        read_roots_include_platform_defaults,
+                        write_roots_override,
+                        &deny_read_paths_override,
+                        &deny_write_paths_override,
+                        proxy_enforced,
+                        crate::WindowsSandboxProxySettingsMode::Reconcile,
+                    )
+                },
             )?;
             let (pipe_write, mut pipe_read) = transport.into_files();
             let cancel_writer = spawn_cancel_writer(&pipe_write, cancellation)?;

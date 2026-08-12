@@ -1,5 +1,7 @@
-use codex_core_skills::SkillLoadOutcome;
-use codex_core_skills::SkillMetadata;
+use std::collections::HashMap;
+
+use crate::SkillLoadOutcome;
+use codex_skills::SkillMetadata;
 
 use crate::catalog::SkillAuthority;
 use crate::catalog::SkillCatalog;
@@ -18,12 +20,10 @@ use crate::provider::SkillSearchRequest;
 
 const HOST_AUTHORITY_ID: &str = "host";
 
-/// Host-owned skill provider backed by the already-loaded turn skills.
+/// Host-owned skill provider backed by an immutable service snapshot.
 ///
-/// The provider intentionally does not reload or cache host skills. Core owns
-/// skill loading, including plugin roots, runtime extra roots, and the primary
-/// environment filesystem. This adapter only maps that loaded outcome into the
-/// skills-extension catalog/read contract.
+/// Discovery and caching belong to `HostSkillsService`; this provider only maps a
+/// snapshot into the authority-aware catalog/read contract.
 #[derive(Clone, Default)]
 pub struct HostSkillProvider;
 
@@ -36,24 +36,24 @@ impl HostSkillProvider {
 impl SkillProvider for HostSkillProvider {
     fn list(&self, query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog> {
         Box::pin(async move {
-            let Some(host_loaded_skills) = query.host else {
+            let Some(host_snapshot) = query.host_snapshot else {
                 return Err(SkillProviderError::new(
-                    "host skill provider requires loaded host skills",
+                    "host skill provider requires a host skills snapshot",
                 ));
             };
 
-            Ok(catalog_from_outcome(host_loaded_skills.outcome()))
+            Ok(catalog_from_outcome(host_snapshot.outcome()))
         })
     }
 
     fn read(&self, request: SkillReadRequest) -> SkillProviderFuture<'_, SkillReadResult> {
         Box::pin(async move {
-            let Some(host_loaded_skills) = request.host else {
+            let Some(host_snapshot) = request.host_snapshot else {
                 return Err(SkillProviderError::new(
-                    "host skill provider requires loaded host skills",
+                    "host skill provider requires a host skills snapshot",
                 ));
             };
-            let Some(skill) = host_loaded_skills.outcome().skills.iter().find(|skill| {
+            let Some(skill) = host_snapshot.outcome().skills.iter().find(|skill| {
                 let skill_path = skill.path_to_skills_md.to_string_lossy();
                 skill_path == request.resource.as_str()
                     || skill_path.replace('\\', "/") == request.resource.as_str()
@@ -64,15 +64,12 @@ impl SkillProvider for HostSkillProvider {
                 )));
             };
 
-            let contents = host_loaded_skills
-                .read_skill_text(skill)
-                .await
-                .map_err(|err| {
-                    SkillProviderError::new(format!(
-                        "failed to read host skill resource {}: {err}",
-                        request.resource.as_str()
-                    ))
-                })?;
+            let contents = host_snapshot.read_skill_text(skill).await.map_err(|err| {
+                SkillProviderError::new(format!(
+                    "failed to read host skill resource {}: {err}",
+                    request.resource.as_str()
+                ))
+            })?;
 
             Ok(SkillReadResult {
                 resource: request.resource,
@@ -87,6 +84,11 @@ impl SkillProvider for HostSkillProvider {
 }
 
 fn catalog_from_outcome(outcome: &SkillLoadOutcome) -> SkillCatalog {
+    let root_order_by_path = outcome
+        .skill_roots_in_discovery_order()
+        .enumerate()
+        .map(|(index, root)| (root.as_path(), index))
+        .collect::<HashMap<_, _>>();
     let mut catalog = SkillCatalog {
         entries: Vec::new(),
         warnings: outcome
@@ -103,7 +105,19 @@ fn catalog_from_outcome(outcome: &SkillLoadOutcome) -> SkillCatalog {
     };
 
     for (skill, enabled) in outcome.skills_with_enabled() {
-        catalog.push_entry(catalog_entry_from_skill(skill, enabled));
+        let mut entry = catalog_entry_from_skill(skill, enabled);
+        if let Some(discovery_path) =
+            outcome.skill_discovery_path_for_path(&skill.path_to_skills_md)
+        {
+            entry = entry.with_display_path(discovery_path.to_string_lossy().replace('\\', "/"));
+        }
+        if let Some(root) = outcome.skill_root_for_path(&skill.path_to_skills_md) {
+            entry = entry.with_alias_root(root.to_string_lossy().replace('\\', "/"));
+            if let Some(root_order) = root_order_by_path.get(root.as_path()) {
+                entry = entry.with_alias_root_order(*root_order);
+            }
+        }
+        catalog.push_entry(entry);
     }
 
     catalog
@@ -121,6 +135,7 @@ fn catalog_entry_from_skill(skill: &SkillMetadata, enabled: bool) -> SkillCatalo
     )
     .with_short_description(skill.short_description.clone())
     .with_display_path(display_path)
+    .with_prompt_scope(skill.scope)
     .with_dependencies(skill.dependencies.clone());
 
     if !enabled {
@@ -132,3 +147,7 @@ fn catalog_entry_from_skill(skill: &SkillMetadata, enabled: bool) -> SkillCatalo
 
     entry
 }
+
+#[cfg(test)]
+#[path = "host_tests.rs"]
+mod tests;

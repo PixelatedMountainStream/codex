@@ -316,11 +316,15 @@ fn token_delta_since_last_accounting(last: &TokenUsage, current: &TokenUsage) ->
         cached_input_tokens: current
             .cached_input_tokens
             .saturating_sub(last.cached_input_tokens),
+        cache_write_input_tokens: current
+            .cache_write_input_tokens
+            .saturating_sub(last.cache_write_input_tokens),
         output_tokens: current.output_tokens.saturating_sub(last.output_tokens),
         reasoning_output_tokens: current
             .reasoning_output_tokens
             .saturating_sub(last.reasoning_output_tokens),
         total_tokens: current.total_tokens.saturating_sub(last.total_tokens),
+        codex_rollout_budget_units: None,
     };
     goal_token_delta_for_usage(&delta)
 }

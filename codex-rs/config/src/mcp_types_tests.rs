@@ -1,7 +1,34 @@
 use super::*;
+use codex_utils_path_uri::LegacyAppPathString;
 use pretty_assertions::assert_eq;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::Path;
+
+#[test]
+fn app_tool_approval_restrictions_never_weaken_either_policy() {
+    use AppToolApproval::Approve;
+    use AppToolApproval::Auto;
+    use AppToolApproval::Prompt;
+    use AppToolApproval::Writes;
+
+    let modes = [Approve, Auto, Writes, Prompt];
+    let expected = [
+        [Approve, Auto, Writes, Prompt],
+        [Auto, Auto, Prompt, Prompt],
+        [Writes, Prompt, Writes, Prompt],
+        [Prompt, Prompt, Prompt, Prompt],
+    ];
+
+    for (parent_index, parent) in modes.into_iter().enumerate() {
+        for (requested_index, requested) in modes.into_iter().enumerate() {
+            assert_eq!(
+                parent.restrict_to(requested),
+                expected[parent_index][requested_index],
+                "parent: {parent:?}, requested: {requested:?}",
+            );
+        }
+    }
+}
 
 #[test]
 fn deserialize_stdio_command_server_config() {
@@ -24,6 +51,7 @@ fn deserialize_stdio_command_server_config() {
     );
     assert!(cfg.enabled);
     assert!(!cfg.required);
+    assert_eq!(cfg.omit_tools_from, None);
     assert!(cfg.enabled_tools.is_none());
     assert!(cfg.disabled_tools.is_none());
 }
@@ -52,38 +80,12 @@ fn deserialize_stdio_command_server_config_with_args() {
 }
 
 #[test]
-fn deserialize_remote_stdio_server_requires_absolute_cwd() {
-    let missing_cwd = toml::from_str::<McpServerConfig>(
-        r#"
-            command = "echo"
-            environment_id = "remote"
-        "#,
-    )
-    .expect_err("remote stdio MCP should require cwd");
-    assert!(
-        missing_cwd
-            .to_string()
-            .contains("remote stdio MCP servers require an absolute cwd"),
-        "unexpected error: {missing_cwd}"
-    );
-
-    let relative_cwd = toml::from_str::<McpServerConfig>(
-        r#"
-            command = "echo"
-            environment_id = "remote"
-            cwd = "relative"
-        "#,
-    )
-    .expect_err("remote stdio MCP should require absolute cwd");
-    assert!(
-        relative_cwd.to_string().contains("got `relative`"),
-        "unexpected error: {relative_cwd}"
-    );
-}
-
-#[test]
-fn deserialize_remote_stdio_server_accepts_absolute_cwd() {
-    let cwd = std::env::temp_dir();
+fn deserialize_remote_stdio_server_accepts_foreign_absolute_cwd() {
+    #[cfg(not(windows))]
+    let cwd = r"C:\Users\openai\share";
+    #[cfg(windows)]
+    let cwd = "/home/openai/share";
+    let expected_cwd = LegacyAppPathString::from_path(Path::new(cwd));
     let cfg: McpServerConfig = match toml::from_str(&format!(
         r#"
             command = "echo"
@@ -102,7 +104,7 @@ fn deserialize_remote_stdio_server_accepts_absolute_cwd() {
             args: vec![],
             env: None,
             env_vars: Vec::new(),
-            cwd: Some(cwd),
+            cwd: Some(expected_cwd),
         }
     );
 }
@@ -223,7 +225,7 @@ fn deserialize_stdio_command_server_config_with_cwd() {
             args: vec![],
             env: None,
             env_vars: Vec::new(),
-            cwd: Some(PathBuf::from("/tmp")),
+            cwd: Some(LegacyAppPathString::from_path(Path::new("/tmp"))),
         }
     );
 }
@@ -271,6 +273,7 @@ fn deserialize_streamable_http_server_config() {
             bearer_token_env_var: None,
             http_headers: None,
             env_http_headers: None,
+            http_headers_helper: None,
         }
     );
     assert!(cfg.enabled);
@@ -293,6 +296,7 @@ fn deserialize_streamable_http_server_config_with_env_var() {
             bearer_token_env_var: Some("GITHUB_TOKEN".to_string()),
             http_headers: None,
             env_http_headers: None,
+            http_headers_helper: None,
         }
     );
     assert!(cfg.enabled);
@@ -305,6 +309,7 @@ fn deserialize_streamable_http_server_config_with_headers() {
             url = "https://example.com/mcp"
             http_headers = { "X-Foo" = "bar" }
             env_http_headers = { "X-Token" = "TOKEN_ENV" }
+            http_headers_helper = "auth-cli headers"
         "#,
     )
     .expect("should deserialize http config with headers");
@@ -319,8 +324,20 @@ fn deserialize_streamable_http_server_config_with_headers() {
                 "X-Token".to_string(),
                 "TOKEN_ENV".to_string()
             )])),
+            http_headers_helper: Some("auth-cli headers".to_string()),
         }
     );
+}
+
+#[test]
+fn rejects_http_headers_helper_outside_local_http_servers() {
+    for contents in [
+        "command = \"server\"\nhttp_headers_helper = \"auth-cli headers\"",
+        "url = \"https://example.com/mcp\"\nhttp_headers_helper = \"  \"",
+        "url = \"https://example.com/mcp\"\nenvironment_id = \"remote\"\nhttp_headers_helper = \"auth-cli headers\"",
+    ] {
+        toml::from_str::<McpServerConfig>(contents).expect_err("invalid helper placement");
+    }
 }
 
 #[test]
@@ -388,6 +405,41 @@ fn deserialize_server_config_with_parallel_tool_calls() {
 }
 
 #[test]
+fn serialize_round_trips_server_config_with_omitted_tool_exposure_surfaces() {
+    for omitted_surfaces in [
+        vec![],
+        vec![ToolExposureSurface::CodeMode],
+        vec![ToolExposureSurface::Deferred],
+        vec![ToolExposureSurface::Direct],
+        vec![ToolExposureSurface::CodeMode, ToolExposureSurface::Deferred],
+        vec![ToolExposureSurface::CodeMode, ToolExposureSurface::Direct],
+        vec![ToolExposureSurface::Deferred, ToolExposureSurface::Direct],
+        vec![
+            ToolExposureSurface::CodeMode,
+            ToolExposureSurface::Deferred,
+            ToolExposureSurface::Direct,
+        ],
+    ] {
+        let serialized_surfaces = omitted_surfaces
+            .iter()
+            .map(|surface| format!("\"{surface}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let config = format!("command = \"echo\"\nomit_tools_from = [{serialized_surfaces}]\n");
+        let cfg: McpServerConfig =
+            toml::from_str(&config).expect("should deserialize omitted MCP exposure surfaces");
+        assert_eq!(cfg.omit_tools_from, Some(omitted_surfaces.clone()));
+
+        let serialized = toml::to_string(&cfg).expect("should serialize MCP config");
+        assert!(serialized.contains(&format!("omit_tools_from = [{serialized_surfaces}]")));
+
+        let round_tripped: McpServerConfig =
+            toml::from_str(&serialized).expect("should deserialize serialized MCP config");
+        assert_eq!(round_tripped, cfg);
+    }
+}
+
+#[test]
 fn deserialize_server_config_with_default_tool_approval_mode() {
     let cfg: McpServerConfig = toml::from_str(
         r#"
@@ -451,6 +503,7 @@ fn deserialize_ignores_unknown_server_fields() {
     assert_eq!(
         cfg,
         McpServerConfig {
+            auth: Default::default(),
             transport: McpServerTransportConfig::Stdio {
                 command: "echo".to_string(),
                 args: vec![],
@@ -462,6 +515,7 @@ fn deserialize_ignores_unknown_server_fields() {
             enabled: true,
             required: false,
             supports_parallel_tool_calls: false,
+            omit_tools_from: None,
             disabled_reason: None,
             startup_timeout_sec: None,
             tool_timeout_sec: None,

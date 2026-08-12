@@ -1,19 +1,23 @@
 use anyhow::Result;
 use codex_config::types::McpServerConfig;
 use codex_config::types::McpServerTransportConfig;
+use codex_core::StartThreadOptions;
 use codex_core::config::Config;
 use codex_extension_api::ExtensionRegistryBuilder;
 use codex_features::Feature;
+use codex_history::RolloutItem;
+use codex_history::RolloutLine;
 use codex_login::CodexAuth;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::WebSearchMode;
+use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
+use codex_protocol::dynamic_tools::DynamicToolNamespaceSpec;
+use codex_protocol::dynamic_tools::DynamicToolNamespaceTool;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
-use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
@@ -62,7 +66,7 @@ async fn new_thread_is_recorded_in_state_db() -> Result<()> {
 
     let thread_id = test.session_configured.thread_id;
     let rollout_path = test.codex.rollout_path().expect("rollout path");
-    let db_path = codex_state::state_db_path(test.config.sqlite_home.as_path());
+    let db_path = test.config.sqlite.state_db_path();
 
     for _ in 0..100 {
         if tokio::fs::try_exists(&db_path).await.unwrap_or(false) {
@@ -117,18 +121,28 @@ async fn resume_restores_dynamic_tools_from_rollout_with_sqlite_enabled() -> Res
     )
     .await;
 
-    let dynamic_tool = DynamicToolSpec {
-        namespace: None,
-        name: "resume_lookup".to_string(),
-        description: "Look up a value after resume.".to_string(),
-        input_schema: json!({
-            "type": "object",
-            "properties": { "query": { "type": "string" } },
-            "required": ["query"],
-            "additionalProperties": false,
-        }),
-        defer_loading: false,
-    };
+    let namespace = "resume_tools";
+    let namespace_description = "Tools available after resume.";
+    let tool_name = "resume_lookup";
+    let tool_description = "Look up a value after resume.";
+    let input_schema = json!({
+        "type": "object",
+        "properties": { "query": { "type": "string" } },
+        "required": ["query"],
+        "additionalProperties": false,
+    });
+    let dynamic_tool = DynamicToolSpec::Namespace(DynamicToolNamespaceSpec {
+        name: namespace.to_string(),
+        description: namespace_description.to_string(),
+        tools: vec![DynamicToolNamespaceTool::Function(
+            DynamicToolFunctionSpec {
+                name: tool_name.to_string(),
+                description: tool_description.to_string(),
+                input_schema: input_schema.clone(),
+                defer_loading: false,
+            },
+        )],
+    });
     let mut builder = test_codex().with_config(|config| {
         config
             .features
@@ -138,7 +152,10 @@ async fn resume_restores_dynamic_tools_from_rollout_with_sqlite_enabled() -> Res
     let base_test = builder.build(&server).await?;
     let started = base_test
         .thread_manager
-        .start_thread_with_tools(base_test.config.clone(), vec![dynamic_tool.clone()])
+        .start_thread(StartThreadOptions {
+            dynamic_tools: vec![dynamic_tool],
+            ..StartThreadOptions::new(base_test.config.clone())
+        })
         .await?;
     let rollout_path = started
         .session_configured
@@ -164,6 +181,7 @@ async fn resume_restores_dynamic_tools_from_rollout_with_sqlite_enabled() -> Res
     })
     .await;
 
+    started.thread.shutdown_and_wait().await?;
     let mut resume_builder = test_codex().with_config(|config| {
         config
             .features
@@ -182,17 +200,144 @@ async fn resume_restores_dynamic_tools_from_rollout_with_sqlite_enabled() -> Res
         .get("tools")
         .and_then(serde_json::Value::as_array)
         .expect("resumed request tools");
-    let restored_tool = tools
+    let restored_namespace = tools
         .iter()
-        .find(|tool| tool.get("name") == Some(&json!(dynamic_tool.name.as_str())))
-        .expect("dynamic tool should be restored from rollout metadata");
+        .find(|tool| tool.get("name") == Some(&json!(namespace)))
+        .expect("dynamic tool namespace should be restored from rollout metadata");
     assert_eq!(
-        restored_tool.get("description"),
-        Some(&json!(dynamic_tool.description.as_str()))
+        restored_namespace,
+        &json!({
+            "type": "namespace",
+            "name": namespace,
+            "description": namespace_description,
+            "tools": [{
+                "type": "function",
+                "name": tool_name,
+                "description": tool_description,
+                "strict": false,
+                "parameters": input_schema,
+            }],
+        })
     );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_restores_legacy_dynamic_tools_from_rollout_with_sqlite_enabled() -> Result<()> {
+    let server = start_mock_server().await;
+    let mock = mount_sse_sequence(
+        &server,
+        vec![
+            responses::sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+            responses::sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
+        ],
+    )
+    .await;
+
+    let namespace = "resume_tools";
+    let tool_name = "resume_lookup";
+    let tool_description = "Look up a value after resume.";
+    let input_schema = json!({
+        "type": "object",
+        "properties": { "query": { "type": "string" } },
+        "required": ["query"],
+        "additionalProperties": false,
+    });
+    let mut builder = test_codex().with_config(|config| {
+        config
+            .features
+            .enable(Feature::Sqlite)
+            .expect("test config should allow feature update");
+    });
+    let base_test = builder.build(&server).await?;
+    let started = base_test
+        .thread_manager
+        .start_thread(StartThreadOptions::new(base_test.config.clone()))
+        .await?;
+    let rollout_path = started
+        .session_configured
+        .rollout_path
+        .clone()
+        .expect("rollout path");
+
+    started
+        .thread
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "persist this thread".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+    wait_for_event(&started.thread, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    started.thread.submit(Op::Shutdown).await?;
+    wait_for_event(&started.thread, |event| {
+        matches!(event, EventMsg::ShutdownComplete)
+    })
+    .await;
+
+    let mut rollout_lines = fs::read_to_string(&rollout_path)?
+        .lines()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<serde_json::Result<Vec<_>>>()?;
+    rollout_lines.first_mut().expect("session metadata line")["payload"]["dynamic_tools"] = json!([{
+        "namespace": namespace,
+        "name": tool_name,
+        "description": tool_description,
+        "inputSchema": input_schema,
+        "exposeToContext": true,
+    }]);
+    let rollout = rollout_lines
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<serde_json::Result<Vec<_>>>()?
+        .join("\n");
+    fs::write(&rollout_path, format!("{rollout}\n"))?;
+
+    let mut resume_builder = test_codex().with_config(|config| {
+        config
+            .features
+            .enable(Feature::Sqlite)
+            .expect("test config should allow feature update");
+    });
+    let resumed = resume_builder
+        .resume(&server, base_test.home.clone(), rollout_path)
+        .await?;
+    resumed.submit_turn("use the restored tool").await?;
+
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    let resumed_body = requests[1].body_json();
+    let tools = resumed_body
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .expect("resumed request tools");
+    let restored_namespace = tools
+        .iter()
+        .find(|tool| tool.get("name") == Some(&json!(namespace)))
+        .expect("dynamic tool namespace should be restored from rollout metadata");
     assert_eq!(
-        restored_tool.get("parameters"),
-        Some(&dynamic_tool.input_schema)
+        restored_namespace,
+        &json!({
+            "type": "namespace",
+            "name": namespace,
+            "description": "Tools in the resume_tools namespace.",
+            "tools": [{
+                "type": "function",
+                "name": tool_name,
+                "description": tool_description,
+                "strict": false,
+                "parameters": input_schema,
+            }],
+        })
     );
 
     Ok(())
@@ -216,6 +361,7 @@ async fn backfill_scans_existing_rollouts() -> Result<()> {
             fs::create_dir_all(parent).expect("should create rollout directory");
             let session_meta_line = SessionMetaLine {
                 meta: SessionMeta {
+                    session_id: thread_id.into(),
                     id: thread_id,
                     forked_from_id: None,
                     parent_thread_id: None,
@@ -231,8 +377,13 @@ async fn backfill_scans_existing_rollouts() -> Result<()> {
                     model_provider: None,
                     base_instructions: None,
                     dynamic_tools: None,
+                    selected_capability_roots: Vec::new(),
                     memory_mode: None,
+                    history_mode: Default::default(),
+                    history_base: None,
+                    subagent_history_start_ordinal: None,
                     multi_agent_version: None,
+                    context_window: None,
                 },
                 git: None,
             };
@@ -240,10 +391,12 @@ async fn backfill_scans_existing_rollouts() -> Result<()> {
             let lines = [
                 RolloutLine {
                     timestamp: "2026-01-27T12:00:00Z".to_string(),
+                    ordinal: None,
                     item: RolloutItem::SessionMeta(session_meta_line),
                 },
                 RolloutLine {
                     timestamp: "2026-01-27T12:00:01Z".to_string(),
+                    ordinal: None,
                     item: RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
                         client_id: None,
                         message: "hello from backfill".to_string(),
@@ -271,7 +424,7 @@ async fn backfill_scans_existing_rollouts() -> Result<()> {
 
     let test = builder.build(&server).await?;
 
-    let db_path = codex_state::state_db_path(test.config.sqlite_home.as_path());
+    let db_path = test.config.sqlite.state_db_path();
     let rollout_path = test.config.codex_home.join(&rollout_rel_path);
     let default_provider = test.config.model_provider_id.clone();
 
@@ -322,7 +475,7 @@ async fn user_messages_persist_in_state_db() -> Result<()> {
     });
     let test = builder.build(&server).await?;
 
-    let db_path = codex_state::state_db_path(test.config.sqlite_home.as_path());
+    let db_path = test.config.sqlite.state_db_path();
     for _ in 0..100 {
         if tokio::fs::try_exists(&db_path).await.unwrap_or(false) {
             break;
@@ -515,6 +668,7 @@ async fn mcp_call_marks_thread_memory_mode_polluted_when_configured() -> Result<
         servers.insert(
             server_name.to_string(),
             McpServerConfig {
+                auth: Default::default(),
                 transport: McpServerTransportConfig::Stdio {
                     command: rmcp_test_server_bin,
                     args: Vec::new(),
@@ -529,6 +683,7 @@ async fn mcp_call_marks_thread_memory_mode_polluted_when_configured() -> Result<
                 enabled: true,
                 required: false,
                 supports_parallel_tool_calls: false,
+                omit_tools_from: None,
                 disabled_reason: None,
                 startup_timeout_sec: Some(Duration::from_secs(10)),
                 tool_timeout_sec: None,

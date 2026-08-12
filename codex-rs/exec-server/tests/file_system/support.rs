@@ -7,11 +7,13 @@ use codex_exec_server::ExecServerRuntimePaths;
 use codex_exec_server::ExecutorFileSystem;
 use codex_exec_server::FileSystemSandboxContext;
 use codex_exec_server::LocalFileSystem;
+use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSandboxEntry;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
+use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_utils_absolute_path::AbsolutePathBuf;
 
@@ -76,10 +78,7 @@ pub(crate) fn absolute_path(path: std::path::PathBuf) -> AbsolutePathBuf {
         "path must be absolute: {}",
         path.display()
     );
-    match AbsolutePathBuf::try_from(path) {
-        Ok(path) => path,
-        Err(err) => panic!("path should be absolute: {err}"),
-    }
+    AbsolutePathBuf::try_from(path).expect("path should be absolute")
 }
 
 pub(crate) fn read_only_sandbox(readable_root: std::path::PathBuf) -> FileSystemSandboxContext {
@@ -89,6 +88,7 @@ pub(crate) fn read_only_sandbox(readable_root: std::path::PathBuf) -> FileSystem
             path: readable_root,
         },
         access: FileSystemAccessMode::Read,
+        missing_path_behavior: None,
     }])
 }
 
@@ -101,12 +101,29 @@ pub(crate) fn workspace_write_sandbox(
             path: writable_root,
         },
         access: FileSystemAccessMode::Write,
+        missing_path_behavior: None,
     }])
 }
 
-fn sandbox_context(entries: Vec<FileSystemSandboxEntry>) -> FileSystemSandboxContext {
-    FileSystemSandboxContext::from_permission_profile(PermissionProfile::from_runtime_permissions(
-        &FileSystemSandboxPolicy::restricted(entries),
-        NetworkSandboxPolicy::Restricted,
-    ))
+fn sandbox_context(mut entries: Vec<FileSystemSandboxEntry>) -> FileSystemSandboxContext {
+    if cfg!(windows) {
+        // Restricted-token sandboxing cannot enforce read restrictions, so leave the root
+        // readable while exercising the requested write restrictions.
+        entries.push(FileSystemSandboxEntry::new(
+            FileSystemPath::Special {
+                value: FileSystemSpecialPath::Root,
+            },
+            FileSystemAccessMode::Read,
+        ));
+    }
+    let mut sandbox = FileSystemSandboxContext::from_permission_profile(
+        PermissionProfile::from_runtime_permissions(
+            &FileSystemSandboxPolicy::restricted(entries),
+            NetworkSandboxPolicy::Restricted,
+        ),
+    );
+    if cfg!(windows) {
+        sandbox.windows_sandbox_level = WindowsSandboxLevel::RestrictedToken;
+    }
+    sandbox
 }

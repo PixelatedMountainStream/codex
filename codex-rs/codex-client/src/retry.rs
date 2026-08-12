@@ -1,5 +1,5 @@
-use crate::error::TransportError;
-use crate::request::Request;
+use codex_http_client::Request;
+use codex_http_client::TransportError;
 use rand::Rng;
 use std::future::Future;
 use std::time::Duration;
@@ -29,7 +29,9 @@ impl RetryOn {
                 (self.retry_429 && status.as_u16() == 429)
                     || (self.retry_5xx && status.is_server_error())
             }
-            TransportError::Timeout | TransportError::Network(_) => self.retry_transport,
+            TransportError::Timeout
+            | TransportError::Connection(_)
+            | TransportError::Network(_) => self.retry_transport,
             _ => false,
         }
     }

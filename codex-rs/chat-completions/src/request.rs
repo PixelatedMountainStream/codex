@@ -30,7 +30,30 @@ pub fn build_chat_request(
     }
 
     // Translate tools and populate the reverse map.
-    let chat_tools = translate_tools(&req.tools, tool_map)?;
+    //
+    // `ResponsesApiRequest.tools` is an opaque `ResponsesApiTools` wrapper
+    // around a shared `RawValue`; its raw-JSON accessor is crate-private to
+    // `codex-api`, so we round-trip through its public `Serialize` impl to
+    // recover the tool definitions as a `Vec<Value>`.
+    let tools_json: Vec<Value> = match &req.tools {
+        Some(tools) => {
+            let value = serde_json::to_value(tools).map_err(|e| ApiError::InvalidRequest {
+                message: format!("failed to serialize tools: {e}"),
+            })?;
+            match value {
+                Value::Array(items) => items,
+                other => {
+                    return Err(ApiError::InvalidRequest {
+                        message: format!(
+                            "expected tools to serialize to a JSON array, got {other}"
+                        ),
+                    });
+                }
+            }
+        }
+        None => Vec::new(),
+    };
+    let chat_tools = translate_tools(&tools_json, tool_map)?;
 
     // Build messages.
     let mut messages: Vec<Value> = Vec::new();
@@ -71,7 +94,9 @@ pub fn build_chat_request(
                 }));
             }
 
-            ResponseItem::FunctionCallOutput { call_id, output } => {
+            ResponseItem::FunctionCallOutput {
+                call_id, output, ..
+            } => {
                 let content = output.body.to_text().unwrap_or_default();
                 messages.push(json!({
                     "role": "tool",
@@ -119,9 +144,10 @@ pub fn build_chat_request(
             | ResponseItem::WebSearchCall { .. }
             | ResponseItem::ImageGenerationCall { .. }
             | ResponseItem::Compaction { .. }
-            | ResponseItem::CompactionTrigger
+            | ResponseItem::CompactionTrigger {}
             | ResponseItem::ContextCompaction { .. }
             | ResponseItem::AgentMessage { .. }
+            | ResponseItem::AdditionalTools { .. }
             | ResponseItem::Other => {}
         }
     }
@@ -158,7 +184,7 @@ fn join_content_text(content: &[ContentItem]) -> String {
             ContentItem::InputText { text } | ContentItem::OutputText { text } => {
                 Some(text.as_str())
             }
-            ContentItem::InputImage { .. } => None,
+            ContentItem::InputImage { .. } | ContentItem::InputAudio { .. } => None,
         })
         .collect::<Vec<_>>()
         .join("")
@@ -175,12 +201,13 @@ mod tests {
             model: "gpt-4o".into(),
             instructions: String::new(),
             input,
-            tools: vec![],
+            tools: None,
             tool_choice: String::new(),
             parallel_tool_calls: false,
             reasoning: None,
             store: false,
             stream: true,
+            stream_options: None,
             include: vec![],
             service_tier: None,
             prompt_cache_key: None,
@@ -198,6 +225,7 @@ mod tests {
                 text: "Hello".into(),
             }],
             phase: None,
+            internal_chat_message_metadata_passthrough: None,
         }]);
         let mut map = ToolReverseMap::new();
         let body = build_chat_request(&req, &mut map).expect("should succeed");
@@ -239,11 +267,13 @@ mod tests {
     #[test]
     fn translates_function_call_output() {
         let item = ResponseItem::FunctionCallOutput {
+            id: None,
             call_id: "call_1".into(),
             output: FunctionCallOutputPayload {
                 body: FunctionCallOutputBody::Text("result text".into()),
                 success: None,
             },
+            internal_chat_message_metadata_passthrough: None,
         };
         let req = minimal_req(vec![item]);
         let mut map = ToolReverseMap::new();
@@ -261,7 +291,9 @@ mod tests {
             name: "my_fn".into(),
             namespace: Some("myns".into()),
             arguments: "{}".into(),
+            encrypted_function_args: None,
             call_id: "call_ns_1".into(),
+            internal_chat_message_metadata_passthrough: None,
         };
         let req = minimal_req(vec![item]);
         let mut map = ToolReverseMap::new();

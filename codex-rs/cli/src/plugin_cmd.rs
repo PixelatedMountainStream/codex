@@ -4,12 +4,14 @@ use anyhow::bail;
 use clap::Parser;
 use codex_core::config::Config;
 use codex_core::config::find_codex_home;
+use codex_core::plugins_manager_for_config;
 use codex_core_plugins::ConfiguredMarketplace;
 use codex_core_plugins::OPENAI_BUNDLED_MARKETPLACE_NAME;
 use codex_core_plugins::PluginInstallOutcome;
 use codex_core_plugins::PluginInstallRequest;
 use codex_core_plugins::PluginsConfigInput;
 use codex_core_plugins::PluginsManager;
+use codex_core_plugins::allowed_configured_marketplace_names;
 use codex_core_plugins::installed_marketplaces::marketplace_install_root;
 use codex_core_plugins::installed_marketplaces::resolve_configured_marketplace_root;
 use codex_core_plugins::marketplace::MarketplaceListError;
@@ -17,8 +19,10 @@ use codex_core_plugins::marketplace::MarketplacePluginAuthPolicy;
 use codex_core_plugins::marketplace::MarketplacePluginInstallPolicy;
 use codex_core_plugins::marketplace::MarketplacePluginSource;
 use codex_core_plugins::marketplace::find_marketplace_manifest_path;
+use codex_login::AuthManager;
 use codex_plugin::PluginId;
 use codex_plugin::validate_plugin_segment;
+use codex_protocol::auth::AuthMode;
 use codex_utils_cli::CliConfigOverrides;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -145,10 +149,13 @@ pub async fn run_plugin_add(
         &plugin_name,
     )?;
     let outcome = manager
-        .install_plugin(PluginInstallRequest {
-            plugin_name,
-            marketplace_path: marketplace.path,
-        })
+        .install_plugin(
+            &plugins_input.config_layer_stack,
+            PluginInstallRequest {
+                plugin_name,
+                marketplace_path: marketplace.path,
+            },
+        )
         .await?;
 
     if json {
@@ -222,7 +229,7 @@ pub async fn run_plugin_list(
                 .is_none_or(|name| marketplace.name == *name)
         })
         .collect::<Vec<_>>();
-    let marketplace_sources = configured_marketplace_sources(&plugins_input);
+    let marketplace_sources = configured_marketplace_sources(&plugins_input, codex_home.as_path());
 
     if args.json {
         let output = JsonPluginListOutput::from_marketplaces(
@@ -276,6 +283,20 @@ pub async fn run_plugin_list(
                         }
                         if let Some(sha) = sha {
                             parts.push(format!("sha `{sha}`"));
+                        }
+                        parts.join(", ")
+                    }
+                    codex_core_plugins::marketplace::MarketplacePluginSource::Npm {
+                        package,
+                        version,
+                        registry,
+                    } => {
+                        let mut parts = vec![package.clone()];
+                        if let Some(version) = version {
+                            parts.push(format!("version `{version}`"));
+                        }
+                        if let Some(registry) = registry {
+                            parts.push(format!("registry `{registry}`"));
                         }
                         parts.join(", ")
                     }
@@ -406,6 +427,13 @@ enum JsonPluginSource {
         #[serde(skip_serializing_if = "Option::is_none")]
         sha: Option<String>,
     },
+    Npm {
+        package: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        version: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        registry: Option<String>,
+    },
 }
 
 impl JsonPluginSource {
@@ -431,6 +459,15 @@ impl JsonPluginSource {
                 ref_name,
                 sha,
             } => Self::Git { url, ref_name, sha },
+            MarketplacePluginSource::Npm {
+                package,
+                version,
+                registry,
+            } => Self::Npm {
+                package,
+                version,
+                registry,
+            },
         }
     }
 }
@@ -444,6 +481,7 @@ pub(crate) struct JsonMarketplaceSource {
 
 pub(crate) fn configured_marketplace_sources(
     plugins_input: &PluginsConfigInput,
+    codex_home: &Path,
 ) -> HashMap<String, JsonMarketplaceSource> {
     let Some(user_config) = plugins_input.config_layer_stack.effective_user_config() else {
         return HashMap::new();
@@ -454,9 +492,12 @@ pub(crate) fn configured_marketplace_sources(
     else {
         return HashMap::new();
     };
+    let allowed_marketplace_names =
+        allowed_configured_marketplace_names(&plugins_input.config_layer_stack, codex_home);
 
     marketplaces
         .iter()
+        .filter(|(marketplace_name, _)| allowed_marketplace_names.contains(*marketplace_name))
         .filter_map(|(marketplace_name, marketplace)| {
             let source_type = marketplace
                 .get("source_type")
@@ -549,12 +590,21 @@ async fn load_plugin_command_context(
         .await
         .context("failed to load configuration")?;
     let plugins_input = config.plugins_config_input();
-    let manager = PluginsManager::new(codex_home.to_path_buf());
+    let manager = plugins_manager_for_config(&config);
+    manager.set_auth_mode(load_cli_auth_mode(&config).await);
     Ok(PluginCommandContext {
         codex_home: codex_home.to_path_buf(),
         plugins_input,
         manager,
     })
+}
+
+pub(crate) async fn load_cli_auth_mode(config: &Config) -> Option<AuthMode> {
+    AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ true)
+        .await
+        .auth()
+        .await
+        .map(|auth| auth.api_auth_mode())
 }
 
 struct PluginSelection {
@@ -690,11 +740,16 @@ pub(crate) fn configured_marketplace_snapshot_issues(
     else {
         return Vec::new();
     };
+    let allowed_marketplace_names =
+        allowed_configured_marketplace_names(&plugins_input.config_layer_stack, codex_home);
 
     let default_install_root = marketplace_install_root(codex_home);
     let mut manifest_paths = Vec::new();
     let mut issues = Vec::new();
     for (configured_name, marketplace) in configured_marketplaces {
+        if !allowed_marketplace_names.contains(configured_name) {
+            continue;
+        }
         if marketplace_name.is_some_and(|name| configured_name != name) {
             continue;
         }

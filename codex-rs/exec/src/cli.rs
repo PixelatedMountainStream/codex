@@ -39,16 +39,6 @@ pub struct Cli {
     #[arg(long = "ignore-rules", global = true, default_value_t = false)]
     pub ignore_rules: bool,
 
-    /// Legacy compatibility trap for the removed `--full-auto` flag.
-    #[arg(
-        long = "full-auto",
-        hide = true,
-        global = true,
-        default_value_t = false,
-        conflicts_with = "dangerously_bypass_approvals_and_sandbox"
-    )]
-    pub removed_full_auto: bool,
-
     /// Path to a JSON Schema file describing the model's final response shape.
     #[arg(long = "output-schema", value_name = "FILE", global = true)]
     pub output_schema: Option<PathBuf>,
@@ -96,18 +86,6 @@ impl std::ops::Deref for Cli {
 impl std::ops::DerefMut for Cli {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.shared.0
-    }
-}
-
-impl Cli {
-    pub fn removed_full_auto_warning(&self) -> Option<&'static str> {
-        if self.removed_full_auto {
-            return Some(
-                "warning: `--full-auto` is deprecated; use `--sandbox workspace-write` instead.",
-            );
-        }
-
-        None
     }
 }
 
@@ -167,8 +145,32 @@ pub enum Command {
     /// Resume a previous session by id or pick the most recent with --last.
     Resume(ResumeArgs),
 
+    /// Fork a previous session by id into a new session.
+    Fork(ForkArgs),
+
     /// Run a code review against the current repository.
     Review(ReviewArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ForkArgs {
+    /// Conversation/session id (UUID) or thread name to fork.
+    #[arg(value_name = "SESSION_ID")]
+    pub session_id: String,
+
+    /// Optional image(s) to attach to the prompt sent after forking.
+    #[arg(
+        long = "image",
+        short = 'i',
+        value_name = "FILE",
+        value_delimiter = ',',
+        num_args = 1
+    )]
+    pub images: Vec<PathBuf>,
+
+    /// Optional prompt to send after forking. If `-` is used, read from stdin.
+    #[arg(value_name = "PROMPT", value_hint = clap::ValueHint::Other)]
+    pub prompt: Option<String>,
 }
 
 #[derive(Args, Debug)]

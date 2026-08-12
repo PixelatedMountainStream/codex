@@ -180,9 +180,14 @@ impl ToolOutput for codex_protocol::mcp::CallToolResult {
     }
 
     fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue {
-        serde_json::to_value(self).unwrap_or_else(|err| {
+        let mut result = serde_json::to_value(self).unwrap_or_else(|err| {
             JsonValue::String(format!("failed to serialize mcp result: {err}"))
-        })
+        });
+        // MCP result metadata is private to clients and must not reach Code Mode.
+        if let JsonValue::Object(fields) = &mut result {
+            fields.remove("_meta");
+        }
+        result
     }
 }
 
@@ -201,6 +206,9 @@ fn response_input_to_code_mode_result(response: ResponseInputItem) -> JsonValue 
                             image_url,
                             detail: detail.or(Some(DEFAULT_IMAGE_DETAIL)),
                         }
+                    }
+                    codex_protocol::models::ContentItem::InputAudio { audio_url } => {
+                        FunctionCallOutputContentItem::InputAudio { audio_url }
                     }
                 })
                 .collect::<Vec<_>>(),
@@ -233,8 +241,14 @@ fn content_items_to_code_mode_result(items: &[FunctionCallOutputContentItem]) ->
                 {
                     Some(image_url.clone())
                 }
+                FunctionCallOutputContentItem::InputAudio { audio_url }
+                    if !audio_url.trim().is_empty() =>
+                {
+                    Some(audio_url.clone())
+                }
                 FunctionCallOutputContentItem::InputText { .. }
                 | FunctionCallOutputContentItem::InputImage { .. }
+                | FunctionCallOutputContentItem::InputAudio { .. }
                 | FunctionCallOutputContentItem::EncryptedContent { .. } => None,
             })
             .collect::<Vec<_>>()

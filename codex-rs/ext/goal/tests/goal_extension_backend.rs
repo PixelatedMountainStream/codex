@@ -1,3 +1,7 @@
+#![recursion_limit = "256"]
+#![allow(clippy::expect_used)]
+
+use codex_utils_absolute_path::test_support::PathExt;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::PoisonError;
@@ -8,6 +12,7 @@ use codex_analytics::AnalyticsEventsClient;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::ExtensionEventSink;
 use codex_extension_api::ExtensionRegistryBuilder;
+use codex_extension_api::ExtensionWarning;
 use codex_extension_api::FunctionCallError;
 use codex_extension_api::NoopTurnItemEmitter;
 use codex_extension_api::ThreadResumeInput;
@@ -22,6 +27,7 @@ use codex_extension_api::ToolPayload;
 use codex_extension_api::TurnErrorInput;
 use codex_extension_api::TurnStartInput;
 use codex_extension_api::TurnStopInput;
+use codex_goal_extension::GoalExtensionConfig;
 use codex_goal_extension::GoalObjectiveUpdate;
 use codex_goal_extension::GoalRuntimeHandle;
 use codex_goal_extension::GoalService;
@@ -88,6 +94,55 @@ async fn installed_goal_tools_create_goal_and_fill_empty_preview() -> anyhow::Re
     assert_eq!(
         metadata.preview.as_deref(),
         Some("ship goal extension backend")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn installed_goal_tools_apply_maximum_token_budget() -> anyhow::Result<()> {
+    let runtime = test_runtime().await?;
+    let thread_id = test_thread_id()?;
+    seed_thread_metadata(runtime.as_ref(), thread_id).await?;
+    let harness = GoalExtensionHarness::new(runtime.clone(), thread_id).await?;
+    harness.thread_store.insert(GoalExtensionConfig {
+        enabled: true,
+        max_goal_token_budget: Some(100),
+    });
+    let tools = harness.tools();
+    let create_tool = tool_by_name(&tools, "create_goal");
+
+    let result = create_tool
+        .handle(tool_call(
+            "create_goal",
+            "call-oversized-goal",
+            json!({ "objective": "oversized goal", "token_budget": 101 }),
+        ))
+        .await;
+    let error = match result {
+        Ok(_) => panic!("goal budget above the configured maximum should fail"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error,
+        FunctionCallError::RespondToModel(
+            "goal token budget 101 exceeds the maximum allowed goal token budget of 100"
+                .to_string()
+        )
+    );
+    assert_eq!(
+        runtime.thread_goals().get_thread_goal(thread_id).await?,
+        None
+    );
+
+    let invocation = tool_call(
+        "create_goal",
+        "call-default-goal-budget",
+        json!({ "objective": "default goal budget" }),
+    );
+    let output = create_tool.handle(invocation.clone()).await?;
+    assert_eq!(
+        output.code_mode_result(&invocation.payload)["goal"]["tokenBudget"],
+        json!(100)
     );
     Ok(())
 }
@@ -935,6 +990,7 @@ async fn goal_service_external_set_active_resets_baseline_without_live_thread() 
                 objective: GoalObjectiveUpdate::Set("new objective"),
                 status: Some(ThreadGoalStatus::Active),
                 token_budget: GoalTokenBudgetUpdate::Keep,
+                max_goal_token_budget: None,
             },
         )
         .await?;
@@ -1064,6 +1120,7 @@ async fn goal_service_sets_gets_and_clears_thread_goal() -> anyhow::Result<()> {
                 objective: GoalObjectiveUpdate::Set(" ship goal API ownership "),
                 status: None,
                 token_budget: GoalTokenBudgetUpdate::Set(Some(123)),
+                max_goal_token_budget: None,
             },
         )
         .await?;
@@ -1088,6 +1145,84 @@ async fn goal_service_sets_gets_and_clears_thread_goal() -> anyhow::Result<()> {
         api.get_thread_goal(runtime.as_ref(), thread_id).await?
     );
     assert!(!api.clear_thread_goal(runtime.as_ref(), thread_id).await?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn goal_service_enforces_maximum_token_budget_on_creation_and_updates() -> anyhow::Result<()>
+{
+    let runtime = test_runtime().await?;
+    let thread_id = test_thread_id()?;
+    seed_thread_metadata(runtime.as_ref(), thread_id).await?;
+    let service = GoalService::new();
+
+    let goal = service
+        .set_thread_goal(
+            runtime.as_ref(),
+            GoalSetRequest {
+                thread_id,
+                objective: GoalObjectiveUpdate::Set("bounded goal"),
+                status: None,
+                token_budget: GoalTokenBudgetUpdate::Keep,
+                max_goal_token_budget: Some(100),
+            },
+        )
+        .await?;
+    assert_eq!(goal.goal.token_budget, Some(100));
+
+    let error = service
+        .set_thread_goal(
+            runtime.as_ref(),
+            GoalSetRequest {
+                thread_id,
+                objective: GoalObjectiveUpdate::Keep,
+                status: None,
+                token_budget: GoalTokenBudgetUpdate::Set(Some(101)),
+                max_goal_token_budget: Some(100),
+            },
+        )
+        .await
+        .expect_err("goal budget above the configured maximum should fail");
+    assert_eq!(
+        error.to_string(),
+        "goal token budget 101 exceeds the maximum allowed goal token budget of 100"
+    );
+    assert_eq!(
+        service
+            .get_thread_goal(runtime.as_ref(), thread_id)
+            .await?
+            .expect("goal should remain unchanged")
+            .token_budget,
+        Some(100)
+    );
+
+    let goal = service
+        .set_thread_goal(
+            runtime.as_ref(),
+            GoalSetRequest {
+                thread_id,
+                objective: GoalObjectiveUpdate::Keep,
+                status: None,
+                token_budget: GoalTokenBudgetUpdate::Set(Some(99)),
+                max_goal_token_budget: Some(100),
+            },
+        )
+        .await?;
+    assert_eq!(goal.goal.token_budget, Some(99));
+
+    let goal = service
+        .set_thread_goal(
+            runtime.as_ref(),
+            GoalSetRequest {
+                thread_id,
+                objective: GoalObjectiveUpdate::Keep,
+                status: None,
+                token_budget: GoalTokenBudgetUpdate::Set(None),
+                max_goal_token_budget: Some(100),
+            },
+        )
+        .await?;
+    assert_eq!(goal.goal.token_budget, Some(100));
     Ok(())
 }
 
@@ -1119,7 +1254,10 @@ async fn installed_tools_with_start(
         /*metrics_client*/ None,
         Weak::new(),
         goal_service,
-        |_| true,
+        |_| GoalExtensionConfig {
+            enabled: true,
+            max_goal_token_budget: None,
+        },
     );
     let registry = builder.build();
     let session_store = ExtensionData::new("session-1");
@@ -1130,6 +1268,9 @@ async fn installed_tools_with_start(
                 config: &(),
                 session_source: &session_source,
                 persistent_thread_state_available,
+                environments: &[],
+                mcp_resource_client: None,
+                extension_metrics: None,
                 session_store: &session_store,
                 thread_store: &thread_store,
             })
@@ -1170,7 +1311,10 @@ impl GoalExtensionHarness {
             /*metrics_client*/ None,
             Weak::new(),
             Arc::clone(&goal_service),
-            |_| true,
+            |_| GoalExtensionConfig {
+                enabled: true,
+                max_goal_token_budget: None,
+            },
         );
         let registry = builder.build();
         let session_store = ExtensionData::new("session-1");
@@ -1182,6 +1326,9 @@ impl GoalExtensionHarness {
                     config: &(),
                     session_source: &session_source,
                     persistent_thread_state_available: true,
+                    environments: &[],
+                    mcp_resource_client: None,
+                    extension_metrics: None,
                     session_store: &session_store,
                     thread_store: &thread_store,
                 })
@@ -1318,7 +1465,7 @@ impl GoalExtensionHarness {
     fn runtime_handle(&self) -> Arc<GoalRuntimeHandle> {
         self.thread_store
             .get::<GoalRuntimeHandle>()
-            .unwrap_or_else(|| panic!("goal runtime handle should exist"))
+            .expect("goal runtime handle should exist")
     }
 }
 
@@ -1329,7 +1476,7 @@ fn tool_by_name<'a>(
     tools
         .iter()
         .find(|tool| tool.tool_name().namespace.is_none() && tool.tool_name().name == name)
-        .unwrap_or_else(|| panic!("missing tool {name}"))
+        .expect("requested goal tool should exist")
 }
 
 fn tool_call(tool_name: &str, call_id: &str, arguments: serde_json::Value) -> ToolCall {
@@ -1338,6 +1485,7 @@ fn tool_call(tool_name: &str, call_id: &str, arguments: serde_json::Value) -> To
         call_id: call_id.to_string(),
         tool_name: codex_extension_api::ToolName::plain(tool_name),
         model: "gpt-test".to_string(),
+        codex_turn_metadata: None,
         truncation_policy: TruncationPolicy::Bytes(1024),
         conversation_history: codex_extension_api::ConversationHistory::default(),
         turn_item_emitter: Arc::new(NoopTurnItemEmitter),
@@ -1350,7 +1498,11 @@ fn tool_call(tool_name: &str, call_id: &str, arguments: serde_json::Value) -> To
 
 async fn test_runtime() -> anyhow::Result<Arc<codex_state::StateRuntime>> {
     let tempdir = TempDir::new()?;
-    codex_state::StateRuntime::init(tempdir.keep(), "test-provider".to_string()).await
+    codex_state::StateRuntime::init(
+        codex_state::SqliteConfig::new_for_testing(tempdir.keep().as_path().abs()),
+        "test-provider".to_string(),
+    )
+    .await
 }
 
 fn test_thread_id() -> anyhow::Result<ThreadId> {
@@ -1364,7 +1516,8 @@ async fn seed_thread_metadata(
     let builder = codex_state::ThreadMetadataBuilder::new(
         thread_id,
         runtime
-            .codex_home()
+            .sqlite()
+            .home()
             .join(format!("rollout-{thread_id}.jsonl")),
         chrono::Utc::now(),
         SessionSource::Cli,
@@ -1406,6 +1559,10 @@ impl ExtensionEventSink for RecordingEventSink {
     fn emit(&self, event: Event) {
         self.events().push(event);
     }
+
+    fn emit_warning(&self, _warning: ExtensionWarning) {
+        panic!("goal extension tests do not emit warnings");
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1437,9 +1594,11 @@ fn token_usage(
     TokenUsage {
         input_tokens,
         cached_input_tokens,
+        cache_write_input_tokens: 0,
         output_tokens,
         reasoning_output_tokens,
         total_tokens,
+        codex_rollout_budget_units: None,
     }
 }
 

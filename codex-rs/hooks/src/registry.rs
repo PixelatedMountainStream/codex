@@ -1,10 +1,7 @@
-use codex_config::ConfigLayerStack;
-use codex_plugin::PluginHookSource;
-use tokio::process::Command;
-
 use crate::engine::ClaudeHooksEngine;
 use crate::engine::CommandShell;
 use crate::engine::HookListEntry;
+use crate::engine::command_runner::CommandHookRuntime;
 use crate::events::compact::PostCompactRequest;
 use crate::events::compact::PreCompactOutcome;
 use crate::events::compact::PreCompactRequest;
@@ -15,6 +12,8 @@ use crate::events::post_tool_use::PostToolUseOutcome;
 use crate::events::post_tool_use::PostToolUseRequest;
 use crate::events::pre_tool_use::PreToolUseOutcome;
 use crate::events::pre_tool_use::PreToolUseRequest;
+use crate::events::session_end::SessionEndOutcome;
+use crate::events::session_end::SessionEndRequest;
 use crate::events::session_start::SessionStartOutcome;
 use crate::events::session_start::SessionStartRequest;
 use crate::events::stop::StopOutcome;
@@ -25,6 +24,13 @@ use crate::types::Hook;
 use crate::types::HookEvent;
 use crate::types::HookPayload;
 use crate::types::HookResponse;
+use async_channel::Receiver;
+use codex_config::ConfigLayerStack;
+use codex_plugin::PluginHookSource;
+use codex_protocol::ThreadId;
+use codex_protocol::shell_environment::scrub_non_inheritable_env_vars;
+use std::time::Duration;
+use tokio::process::Command;
 
 #[derive(Default, Clone)]
 pub struct HooksConfig {
@@ -50,35 +56,57 @@ pub struct Hooks {
     engine: ClaudeHooksEngine,
 }
 
-impl Default for Hooks {
-    fn default() -> Self {
-        Self::new(HooksConfig::default())
-    }
-}
-
 impl Hooks {
-    pub fn new(config: HooksConfig) -> Self {
+    /// Bind this session's hook runtime and output files to its thread.
+    pub fn new(
+        config: HooksConfig,
+        thread_id: ThreadId,
+    ) -> (Self, Receiver<codex_protocol::protocol::HookCompletedEvent>) {
+        let (result_sender, result_receiver) = async_channel::unbounded();
+        let hooks = Self::from_config(config, |shell| {
+            CommandHookRuntime::new(shell, thread_id, result_sender)
+        });
+        (hooks, result_receiver)
+    }
+
+    /// Preserve in-flight background hooks while applying a refreshed configuration.
+    pub fn reconfigured(&self, config: HooksConfig) -> Self {
+        Self::from_config(config, |shell| {
+            self.engine.command_runtime.reconfigured(shell)
+        })
+    }
+
+    fn from_config(
+        config: HooksConfig,
+        build_runtime: impl FnOnce(CommandShell) -> CommandHookRuntime,
+    ) -> Self {
         let after_agent = config
             .legacy_notify_argv
             .filter(|argv| !argv.is_empty() && !argv[0].is_empty())
             .map(crate::notify_hook)
             .into_iter()
             .collect();
+        let command_runtime = build_runtime(CommandShell {
+            program: config.shell_program.unwrap_or_default(),
+            args: config.shell_args,
+        });
         let engine = ClaudeHooksEngine::new(
             config.feature_enabled,
             config.bypass_hook_trust,
             config.config_layer_stack.as_ref(),
             config.plugin_hook_sources,
             config.plugin_hook_load_warnings,
-            CommandShell {
-                program: config.shell_program.unwrap_or_default(),
-                args: config.shell_args,
-            },
+            command_runtime,
         );
         Self {
             after_agent,
             engine,
         }
+    }
+
+    /// Abort and join outstanding async hooks during session shutdown.
+    pub async fn shutdown(&self) {
+        self.engine.command_runtime.shutdown().await;
     }
 
     pub fn startup_warnings(&self) -> &[String] {
@@ -125,6 +153,13 @@ impl Hooks {
         request: &PermissionRequestRequest,
     ) -> Vec<codex_protocol::protocol::HookRunSummary> {
         self.engine.preview_permission_request(request)
+    }
+
+    /// Maximum configured timeout among PermissionRequest hooks.
+    ///
+    /// Matching handlers run concurrently, so their aggregate timeout is bounded by this maximum.
+    pub fn max_permission_request_timeout(&self) -> Duration {
+        self.engine.max_permission_request_timeout()
     }
 
     pub fn preview_post_tool_use(
@@ -203,6 +238,14 @@ impl Hooks {
     pub async fn run_stop(&self, request: StopRequest) -> StopOutcome {
         self.engine.run_stop(request).await
     }
+
+    pub fn preview_session_end(&self) -> Vec<codex_protocol::protocol::HookRunSummary> {
+        self.engine.preview_session_end()
+    }
+
+    pub async fn run_session_end(&self, request: SessionEndRequest) -> SessionEndOutcome {
+        self.engine.run_session_end(request).await
+    }
 }
 
 pub fn list_hooks(config: HooksConfig) -> HookListOutcome {
@@ -229,5 +272,6 @@ pub fn command_from_argv(argv: &[String]) -> Option<Command> {
     }
     let mut command = Command::new(program);
     command.args(args);
+    scrub_non_inheritable_env_vars(command.as_std_mut());
     Some(command)
 }

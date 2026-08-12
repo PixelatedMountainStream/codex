@@ -85,14 +85,12 @@ impl AgentStatusThreadPreview {
         let mut activity = Vec::new();
         for event in events {
             let item = match event {
-                ThreadBufferedEvent::Notification(ServerNotification::ItemCompleted(event)) => {
-                    &event.item
-                }
-                ThreadBufferedEvent::Notification(ServerNotification::ItemStarted(event)) => {
-                    &event.item
-                }
-                ThreadBufferedEvent::Notification(_)
-                | ThreadBufferedEvent::Request(_)
+                ThreadBufferedEvent::Notification(notification) => match notification.as_ref() {
+                    ServerNotification::ItemCompleted(event) => &event.item,
+                    ServerNotification::ItemStarted(event) => &event.item,
+                    _ => continue,
+                },
+                ThreadBufferedEvent::Request(_)
                 | ThreadBufferedEvent::HistoryEntryResponse(_)
                 | ThreadBufferedEvent::FeedbackSubmission(_) => continue,
             };
@@ -178,17 +176,20 @@ fn activity_summary(item: &ThreadItem) -> Option<String> {
             };
             return bounded_summary(&format!("{action} {agent_path}"));
         }
-        ThreadItem::WebSearch { query, .. } => {
-            return bounded_summary(&format!("Web search: {query}"));
+        ThreadItem::WebSearch(item) => {
+            return bounded_summary(&format!("Web search: {}", item.query));
         }
         ThreadItem::ImageView { path, .. } => {
-            return bounded_summary(&format!("Viewed {}", path.display()));
+            let path = path.render_for_ui();
+            return bounded_summary(&format!("Viewed {path}"));
         }
-        ThreadItem::ImageGeneration { .. } => return Some("Generated an image".to_string()),
+        ThreadItem::ImageGeneration(_) => return Some("Generated an image".to_string()),
         ThreadItem::EnteredReviewMode { .. } => return Some("Entered review mode".to_string()),
         ThreadItem::ExitedReviewMode { .. } => return Some("Exited review mode".to_string()),
         ThreadItem::ContextCompaction { .. } => return Some("Compacted context".to_string()),
-        ThreadItem::UserMessage { .. } | ThreadItem::HookPrompt { .. } => return None,
+        ThreadItem::UserMessage { .. } | ThreadItem::HookPrompt { .. } | ThreadItem::Sleep(_) => {
+            return None;
+        }
     };
     bounded_summary(summary)
 }

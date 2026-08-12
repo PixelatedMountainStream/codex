@@ -1,18 +1,20 @@
 use crate::JsonSchema;
 use crate::LoadableToolSpec;
+use crate::ResponsesApiNamespace;
 use crate::ResponsesApiNamespaceTool;
 use crate::ResponsesApiTool;
 use crate::ToolSearchSourceInfo;
 use crate::ToolSpec;
 use crate::default_namespace_description;
+use codex_protocol::DEFAULT_FUNCTION_NAMESPACE;
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct ToolSearchEntry {
     pub search_text: String,
     pub output: LoadableToolSpec,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct ToolSearchInfo {
     pub entry: ToolSearchEntry,
     pub source_info: Option<ToolSearchSourceInfo>,
@@ -36,23 +38,40 @@ impl ToolSearchInfo {
             ToolSpec::Function(mut tool) => {
                 tool.defer_loading = Some(true);
                 tool.output_schema = None;
-                LoadableToolSpec::Function(tool)
+                LoadableToolSpec::Namespace(ResponsesApiNamespace {
+                    name: DEFAULT_FUNCTION_NAMESPACE.to_string(),
+                    description: default_namespace_description(DEFAULT_FUNCTION_NAMESPACE),
+                    tools: vec![ResponsesApiNamespaceTool::Function(tool)],
+                })
+            }
+            ToolSpec::Freeform(mut tool) => {
+                tool.defer_loading = Some(true);
+                LoadableToolSpec::Namespace(ResponsesApiNamespace {
+                    name: DEFAULT_FUNCTION_NAMESPACE.to_string(),
+                    description: default_namespace_description(DEFAULT_FUNCTION_NAMESPACE),
+                    tools: vec![ResponsesApiNamespaceTool::Custom(tool)],
+                })
             }
             ToolSpec::Namespace(mut namespace) => {
                 if namespace.description.trim().is_empty() {
                     namespace.description = default_namespace_description(&namespace.name);
                 }
                 for tool in &mut namespace.tools {
-                    let ResponsesApiNamespaceTool::Function(tool) = tool;
-                    tool.defer_loading = Some(true);
-                    tool.output_schema = None;
+                    match tool {
+                        ResponsesApiNamespaceTool::Function(tool) => {
+                            tool.defer_loading = Some(true);
+                            tool.output_schema = None;
+                        }
+                        ResponsesApiNamespaceTool::Custom(tool) => {
+                            tool.defer_loading = Some(true);
+                        }
+                    }
                 }
                 LoadableToolSpec::Namespace(namespace)
             }
-            ToolSpec::ToolSearch { .. }
-            | ToolSpec::ImageGeneration { .. }
-            | ToolSpec::WebSearch { .. }
-            | ToolSpec::Freeform(_) => return None,
+            ToolSpec::ToolSearch { .. } | ToolSpec::WebSearch { .. } => {
+                return None;
+            }
         };
 
         Some(Self {
@@ -74,15 +93,20 @@ fn default_tool_search_text(spec: &ToolSpec) -> String {
             push_search_part(&mut parts, namespace.name.clone());
             push_search_part(&mut parts, namespace.description.clone());
             for tool in &namespace.tools {
-                let ResponsesApiNamespaceTool::Function(tool) = tool;
-                append_function_search_text(tool, &mut parts);
+                match tool {
+                    ResponsesApiNamespaceTool::Function(tool) => {
+                        append_function_search_text(tool, &mut parts);
+                    }
+                    ResponsesApiNamespaceTool::Custom(tool) => {
+                        push_search_part(&mut parts, tool.name.clone());
+                        push_search_part(&mut parts, tool.description.clone());
+                        push_search_part(&mut parts, tool.format.syntax.clone());
+                    }
+                }
             }
         }
         ToolSpec::ToolSearch { description, .. } => {
             push_search_part(&mut parts, description.clone());
-        }
-        ToolSpec::ImageGeneration { .. } => {
-            push_search_part(&mut parts, "image generation".to_string());
         }
         ToolSpec::WebSearch { .. } => {
             push_search_part(&mut parts, "web search".to_string());

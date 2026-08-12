@@ -11,9 +11,12 @@ use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::Result;
 use codex_app_server_protocol::ServerNotification;
+use codex_app_server_protocol::ServerNotificationEnvelope;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::ServerRequestPayload;
 use codex_app_server_protocol::ServerResponse;
+use codex_diagnostics::Gauge;
+use codex_diagnostics::GaugeGuard;
 use codex_otel::span_w3c_trace_context;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::W3cTraceContext;
@@ -38,6 +41,9 @@ use codex_protocol::account::PlanType;
 
 pub(crate) type ClientRequestResult = std::result::Result<Result, JSONRPCErrorError>;
 
+static IN_FLIGHT_REQUESTS: Gauge = Gauge::new("app.requests.in_flight");
+static PENDING_SERVER_REQUESTS: Gauge = Gauge::new("app.server_requests.pending");
+
 /// Stable identifier for a client request scoped to a transport connection.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct ConnectionRequestId {
@@ -52,6 +58,7 @@ pub(crate) struct RequestContext {
     request_id: ConnectionRequestId,
     span: Span,
     parent_trace: Option<W3cTraceContext>,
+    _diagnostics_guard: Arc<GaugeGuard>,
 }
 
 impl RequestContext {
@@ -64,6 +71,7 @@ impl RequestContext {
             request_id,
             span,
             parent_trace,
+            _diagnostics_guard: Arc::new(IN_FLIGHT_REQUESTS.track()),
         }
     }
 
@@ -115,6 +123,7 @@ struct PendingCallbackEntry {
     callback: oneshot::Sender<ClientRequestResult>,
     thread_id: Option<ThreadId>,
     request: ServerRequest,
+    _diagnostics_guard: GaugeGuard,
 }
 
 impl ThreadScopedOutgoingMessageSender {
@@ -160,7 +169,7 @@ impl ThreadScopedOutgoingMessageSender {
     pub(crate) async fn send_server_notification(&self, notification: ServerNotification) {
         self.outgoing
             .analytics_events_client
-            .track_notification(notification.clone());
+            .track_notification(&notification);
         if self.connection_ids.is_empty() {
             return;
         }
@@ -302,6 +311,7 @@ impl OutgoingMessageSender {
                     callback: tx_approve,
                     thread_id,
                     request: request.clone(),
+                    _diagnostics_guard: PENDING_SERVER_REQUESTS.track(),
                 },
             );
         }
@@ -504,7 +514,20 @@ impl OutgoingMessageSender {
     where
         T: Into<ClientResponsePayload>,
     {
-        self.send_response_as(request_id, response.into()).await;
+        self.send_response_as_inner(request_id, response.into(), /*thread_originator*/ None)
+            .await;
+    }
+
+    pub(crate) async fn send_response_with_thread_originator<T>(
+        &self,
+        request_id: ConnectionRequestId,
+        response: T,
+        thread_originator: String,
+    ) where
+        T: Into<ClientResponsePayload>,
+    {
+        self.send_response_as_inner(request_id, response.into(), Some(thread_originator))
+            .await;
     }
 
     pub(crate) async fn send_response_as(
@@ -512,45 +535,59 @@ impl OutgoingMessageSender {
         request_id: ConnectionRequestId,
         response: ClientResponsePayload,
     ) {
+        self.send_response_as_inner(request_id, response, /*thread_originator*/ None)
+            .await;
+    }
+
+    async fn send_response_as_inner(
+        &self,
+        request_id: ConnectionRequestId,
+        response: ClientResponsePayload,
+        thread_originator: Option<String>,
+    ) {
         let connection_id = request_id.connection_id;
         let request_id_for_analytics = request_id.request_id.clone();
-        let serialized_response = response
-            .into_jsonrpc_parts_and_payload(request_id.request_id.clone())
-            .map(|(id, result, response)| {
-                if let Some(response) = response {
-                    self.analytics_events_client.track_response(
+        match thread_originator {
+            Some(thread_originator) => {
+                self.analytics_events_client
+                    .track_response_with_thread_originator(
                         connection_id.0,
                         request_id_for_analytics,
-                        response,
+                        &response,
+                        thread_originator,
                     );
-                }
-                (id, result)
-            });
-        let request_context = self.take_request_context(&request_id).await;
-
-        match serialized_response {
-            Ok((id, result)) => {
-                let outgoing_message = OutgoingMessage::Response(OutgoingResponse { id, result });
-                self.send_outgoing_message_to_connection(
-                    request_context,
-                    connection_id,
-                    outgoing_message,
-                    "response",
-                )
-                .await;
             }
-            Err(err) => {
-                self.send_error_inner(
-                    request_context,
-                    request_id,
-                    internal_error(format!("failed to serialize response: {err}")),
-                )
-                .await;
+            None => {
+                self.analytics_events_client.track_response(
+                    connection_id.0,
+                    request_id_for_analytics,
+                    &response,
+                );
             }
         }
+        let response = Box::new(response);
+        let request_context = self.take_request_context(&request_id).await;
+        let outgoing_message = OutgoingMessage::Response(OutgoingResponse {
+            id: request_id.request_id,
+            result: response,
+        });
+        self.send_outgoing_message_to_connection(
+            request_context,
+            connection_id,
+            outgoing_message,
+            "response",
+        )
+        .await;
     }
 
     pub(crate) async fn send_server_notification(&self, notification: ServerNotification) {
+        if matches!(
+            notification,
+            ServerNotification::ThreadArchived(_) | ServerNotification::ThreadUnarchived(_)
+        ) {
+            self.analytics_events_client
+                .track_notification(&notification);
+        }
         self.send_server_notification_to_connections(&[], notification)
             .await;
     }
@@ -564,7 +601,7 @@ impl OutgoingMessageSender {
             targeted_connections = connection_ids.len(),
             "app-server event: {notification}"
         );
-        let outgoing_message = OutgoingMessage::AppServerNotification(notification.clone());
+        let outgoing_message = timestamped_server_notification(notification);
         if connection_ids.is_empty() {
             if let Err(err) = self
                 .sender
@@ -598,7 +635,7 @@ impl OutgoingMessageSender {
         notification: ServerNotification,
     ) {
         tracing::trace!("app-server event: {notification}");
-        let outgoing_message = OutgoingMessage::AppServerNotification(notification.clone());
+        let outgoing_message = timestamped_server_notification(notification);
         let (write_complete_tx, write_complete_rx) = oneshot::channel();
         if let Err(err) = self
             .sender
@@ -692,6 +729,13 @@ fn now_unix_timestamp_ms() -> u64 {
         .unwrap_or_default()
 }
 
+fn timestamped_server_notification(notification: ServerNotification) -> OutgoingMessage {
+    OutgoingMessage::AppServerNotification(ServerNotificationEnvelope {
+        notification,
+        emitted_at_ms: Some(now_unix_timestamp_ms().try_into().unwrap_or_default()),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -732,9 +776,14 @@ mod tests {
                 login_id: Some(Uuid::nil().to_string()),
                 success: true,
                 error: None,
+                onboarding_entrypoint: None,
             });
 
-        let jsonrpc_notification = OutgoingMessage::AppServerNotification(notification);
+        let jsonrpc_notification =
+            OutgoingMessage::AppServerNotification(ServerNotificationEnvelope {
+                notification,
+                emitted_at_ms: Some(1_234),
+            });
         assert_eq!(
             json!({
                 "method": "account/login/completed",
@@ -742,7 +791,9 @@ mod tests {
                     "loginId": Uuid::nil().to_string(),
                     "success": true,
                     "error": null,
+                    "onboardingEntrypoint": null,
                 },
+                "emittedAtMs": 1_234,
             }),
             serde_json::to_value(jsonrpc_notification)
                 .expect("ensure the strum macros serialize the method field correctly"),
@@ -757,9 +808,9 @@ mod tests {
                 login_id: Some(Uuid::nil().to_string()),
                 success: true,
                 error: None,
+                onboarding_entrypoint: None,
             });
 
-        let jsonrpc_notification = OutgoingMessage::AppServerNotification(notification);
         assert_eq!(
             json!({
                 "method": "account/login/completed",
@@ -767,9 +818,10 @@ mod tests {
                     "loginId": Uuid::nil().to_string(),
                     "success": true,
                     "error": null,
+                    "onboardingEntrypoint": null,
                 },
             }),
-            serde_json::to_value(jsonrpc_notification)
+            serde_json::to_value(notification)
                 .expect("ensure the notification serializes correctly"),
             "ensure the notification serializes correctly"
         );
@@ -790,12 +842,12 @@ mod tests {
                     secondary: None,
                     credits: None,
                     individual_limit: None,
-                    plan_type: Some(PlanType::Plus),
+                    spend_control_reached: None,
+                    plan_type: Some(PlanType::SelfServeBusinessProLite),
                     rate_limit_reached_type: None,
                 },
             });
 
-        let jsonrpc_notification = OutgoingMessage::AppServerNotification(notification);
         assert_eq!(
             json!({
                 "method": "account/rateLimits/updated",
@@ -811,12 +863,13 @@ mod tests {
                         "secondary": null,
                         "credits": null,
                         "individualLimit": null,
-                        "planType": "plus",
+                        "spendControlReached": null,
+                        "planType": "self_serve_business_prolite",
                         "rateLimitReachedType": null
                     }
                 },
             }),
-            serde_json::to_value(jsonrpc_notification)
+            serde_json::to_value(notification)
                 .expect("ensure the notification serializes correctly"),
             "ensure the notification serializes correctly"
         );
@@ -825,20 +878,19 @@ mod tests {
     #[test]
     fn verify_account_updated_notification_serialization() {
         let notification = ServerNotification::AccountUpdated(AccountUpdatedNotification {
-            auth_mode: Some(AuthMode::ApiKey),
-            plan_type: None,
+            auth_mode: Some(AuthMode::Chatgpt),
+            plan_type: Some(PlanType::SelfServeBusinessProLite),
         });
 
-        let jsonrpc_notification = OutgoingMessage::AppServerNotification(notification);
         assert_eq!(
             json!({
                 "method": "account/updated",
                 "params": {
-                    "authMode": "apikey",
-                    "planType": null
+                    "authMode": "chatgpt",
+                    "planType": "self_serve_business_prolite"
                 },
             }),
-            serde_json::to_value(jsonrpc_notification)
+            serde_json::to_value(notification)
                 .expect("ensure the notification serializes correctly"),
             "ensure the notification serializes correctly"
         );
@@ -853,7 +905,6 @@ mod tests {
             range: None,
         });
 
-        let jsonrpc_notification = OutgoingMessage::AppServerNotification(notification);
         assert_eq!(
             json!( {
                 "method": "configWarning",
@@ -862,7 +913,7 @@ mod tests {
                     "details": "error loading config: bad config",
                 },
             }),
-            serde_json::to_value(jsonrpc_notification)
+            serde_json::to_value(notification)
                 .expect("ensure the notification serializes correctly"),
             "ensure the notification serializes correctly"
         );
@@ -875,7 +926,6 @@ mod tests {
             message: "Automatic approval review denied the requested action.".to_string(),
         });
 
-        let jsonrpc_notification = OutgoingMessage::AppServerNotification(notification);
         assert_eq!(
             json!({
                 "method": "guardianWarning",
@@ -884,7 +934,7 @@ mod tests {
                     "message": "Automatic approval review denied the requested action.",
                 },
             }),
-            serde_json::to_value(jsonrpc_notification)
+            serde_json::to_value(notification)
                 .expect("ensure the notification serializes correctly"),
             "ensure the notification serializes correctly"
         );
@@ -900,7 +950,6 @@ mod tests {
             reason: ModelRerouteReason::HighRiskCyberActivity,
         });
 
-        let jsonrpc_notification = OutgoingMessage::AppServerNotification(notification);
         assert_eq!(
             json!({
                 "method": "model/rerouted",
@@ -912,7 +961,7 @@ mod tests {
                     "reason": "highRiskCyberActivity",
                 },
             }),
-            serde_json::to_value(jsonrpc_notification)
+            serde_json::to_value(notification)
                 .expect("ensure the notification serializes correctly"),
             "ensure the notification serializes correctly"
         );
@@ -926,7 +975,6 @@ mod tests {
             verifications: vec![ModelVerification::TrustedAccessForCyber],
         });
 
-        let jsonrpc_notification = OutgoingMessage::AppServerNotification(notification);
         assert_eq!(
             json!({
                 "method": "model/verification",
@@ -936,7 +984,7 @@ mod tests {
                     "verifications": ["trustedAccessForCyber"],
                 },
             }),
-            serde_json::to_value(jsonrpc_notification)
+            serde_json::to_value(notification)
                 .expect("ensure the notification serializes correctly"),
             "ensure the notification serializes correctly"
         );
@@ -951,7 +999,6 @@ mod tests {
                 metadata: json!({"presentation": "inline"}),
             });
 
-        let jsonrpc_notification = OutgoingMessage::AppServerNotification(notification);
         assert_eq!(
             json!({
                 "method": "turn/moderationMetadata",
@@ -961,7 +1008,7 @@ mod tests {
                     "metadata": {"presentation": "inline"},
                 },
             }),
-            serde_json::to_value(jsonrpc_notification)
+            serde_json::to_value(notification)
                 .expect("ensure the notification serializes correctly"),
             "ensure the notification serializes correctly"
         );
@@ -977,6 +1024,7 @@ mod tests {
                 item_id: "item-1".to_string(),
                 started_at_ms: 0,
                 approval_id: None,
+                environment_id: None,
                 reason: None,
                 network_approval_context: None,
                 command: Some("echo hi".to_string()),
@@ -1043,7 +1091,10 @@ mod tests {
                     panic!("expected response message");
                 };
                 assert_eq!(response.id, request_id.request_id);
-                assert_eq!(response.result, json!({}));
+                assert_eq!(
+                    serde_json::to_value(response.result).expect("result should serialize"),
+                    json!({})
+                );
             }
             other => panic!("expected targeted response envelope, got: {other:?}"),
         }
@@ -1116,6 +1167,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_server_notification_to_connections_reuses_timestamp() {
+        let (tx, mut rx) = mpsc::channel::<OutgoingEnvelope>(2);
+        let outgoing =
+            OutgoingMessageSender::new(tx, codex_analytics::AnalyticsEventsClient::disabled());
+
+        outgoing
+            .send_server_notification_to_connections(
+                &[ConnectionId(1), ConnectionId(2)],
+                ServerNotification::ConfigWarning(ConfigWarningNotification {
+                    summary: "test".to_string(),
+                    details: None,
+                    path: None,
+                    range: None,
+                }),
+            )
+            .await;
+
+        let timestamps = [
+            rx.recv()
+                .await
+                .expect("first connection should receive notification"),
+            rx.recv()
+                .await
+                .expect("second connection should receive notification"),
+        ]
+        .map(|envelope| match envelope {
+            OutgoingEnvelope::ToConnection {
+                message: OutgoingMessage::AppServerNotification(envelope),
+                ..
+            } => envelope.emitted_at_ms,
+            _ => panic!("expected targeted server notification"),
+        });
+
+        assert_eq!(timestamps[0], timestamps[1]);
+    }
+
+    #[tokio::test]
     async fn send_server_notification_to_connection_and_wait_tracks_write_completion() {
         let (tx, mut rx) = mpsc::channel::<OutgoingEnvelope>(4);
         let outgoing =
@@ -1148,7 +1236,14 @@ mod tests {
             panic!("expected targeted server notification envelope");
         };
         assert_eq!(connection_id, ConnectionId(42));
-        assert!(matches!(message, OutgoingMessage::AppServerNotification(_)));
+        let OutgoingMessage::AppServerNotification(envelope) = message else {
+            panic!("expected app-server notification");
+        };
+        assert!(
+            envelope
+                .emitted_at_ms
+                .is_some_and(|emitted_at_ms| emitted_at_ms > 0)
+        );
         write_complete_tx
             .expect("write completion sender should be attached")
             .send(())
@@ -1259,6 +1354,7 @@ mod tests {
                     turn_id: "turn-1".to_string(),
                     item_id: "call-1".to_string(),
                     questions: vec![],
+                    is_blocking: true,
                     auto_resolution_ms: None,
                 },
             ))
@@ -1322,6 +1418,7 @@ mod tests {
                     turn_id: "turn-1".to_string(),
                     item_id: "call-1".to_string(),
                     questions: vec![],
+                    is_blocking: true,
                     auto_resolution_ms: None,
                 },
             ))

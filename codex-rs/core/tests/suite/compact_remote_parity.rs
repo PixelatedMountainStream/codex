@@ -1,21 +1,20 @@
-#![allow(clippy::expect_used)]
-
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 
 use anyhow::Result;
 use codex_features::Feature;
+use codex_history::RolloutItem;
+use codex_history::RolloutLine;
 use codex_login::CodexAuth;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
-use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutLine;
 use codex_protocol::user_input::UserInput;
 use core_test_support::hooks::trust_discovered_hooks;
 use core_test_support::responses;
 use core_test_support::responses::ResponseMock;
+use core_test_support::responses::strip_response_item_ids_from_json;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodexHarness;
 use core_test_support::test_codex::test_codex;
@@ -764,17 +763,17 @@ fn compact_request_view(body: &Value, mode: Mode) -> Value {
     }
 
     let mut selected = selected_request_fields(body, SelectedFieldsMode::Compact);
-    selected["input"] = normalize_value(Value::Array(input));
+    selected["input"] = normalize_value(strip_response_item_ids_from_json(Value::Array(input)));
     canonical_json(&normalize_value(selected))
 }
 
 fn follow_up_request_view(body: &Value) -> Value {
     let mut selected = selected_request_fields(body, SelectedFieldsMode::FollowUp);
-    selected["input"] = normalize_value(
+    selected["input"] = normalize_value(strip_response_item_ids_from_json(
         body.get("input")
             .cloned()
             .expect("follow-up request should include input"),
-    );
+    ));
     canonical_json(&normalize_value(selected))
 }
 
@@ -795,14 +794,16 @@ fn replacement_history_from_rollout(path: &Path) -> Result<Value> {
         {
             let values = items
                 .into_iter()
-                .map(|item| serde_json::to_value(item).expect("serialize replacement item"))
+                .map(|item| serde_json::to_value(item.item).expect("serialize replacement item"))
                 .collect::<Vec<_>>();
             replacement_history = Some(Value::Array(values));
         }
     }
     let replacement_history =
         replacement_history.expect("expected compacted rollout replacement history");
-    Ok(canonical_json(&normalize_value(replacement_history)))
+    Ok(canonical_json(&normalize_value(
+        strip_response_item_ids_from_json(replacement_history),
+    )))
 }
 
 fn write_manual_compact_hooks(home: &Path) {
@@ -926,6 +927,7 @@ fn normalize_value(value: Value) -> Value {
         Value::Array(values) => Value::Array(values.into_iter().map(normalize_value).collect()),
         Value::Object(map) => Value::Object(
             map.into_iter()
+                .filter(|(key, _value)| key != "internal_chat_message_metadata_passthrough")
                 .map(|(key, value)| (key, normalize_value(value)))
                 .collect(),
         ),
@@ -941,6 +943,19 @@ fn normalize_string(value: &str) -> String {
     let mut text = value.to_string();
     normalize_tmp_prefix_before_marker(&mut text, "/skills/");
     normalize_tmp_prefix_before_marker(&mut text, "\\skills\\");
+
+    let skills_open_tag = "<skills_instructions>";
+    let skills_close_tag = "</skills_instructions>";
+    let mut search_start = 0;
+    while let Some(relative_start) = text[search_start..].find(skills_open_tag) {
+        let body_start = search_start + relative_start + skills_open_tag.len();
+        let Some(relative_end) = text[body_start..].find(skills_close_tag) else {
+            break;
+        };
+        let body_end = body_start + relative_end;
+        text.replace_range(body_start..body_end, "\n...\n");
+        search_start = body_start + "\n...\n".len() + skills_close_tag.len();
+    }
 
     let mut search_start = 0;
     let wall_time_prefix = "Wall time: ";
@@ -963,6 +978,19 @@ fn normalize_string(value: &str) -> String {
         }
     }
     text
+}
+
+#[test]
+fn normalize_string_rewrites_dynamic_skill_instructions() {
+    let text = normalize_string(
+        "before\n<skills_instructions>\n## Skills\n- demo: Dynamic description\n\
+         </skills_instructions>\nafter",
+    );
+
+    assert_eq!(
+        text,
+        "before\n<skills_instructions>\n...\n</skills_instructions>\nafter"
+    );
 }
 
 fn is_uuid_like(value: &str) -> bool {

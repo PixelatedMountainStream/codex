@@ -2,33 +2,36 @@ use std::sync::Arc;
 
 use codex_prompts::render_review_exit_interrupted;
 use codex_prompts::render_review_exit_success;
+use codex_protocol::ResponseItemId;
 use codex_protocol::config_types::WebSearchMode;
+use codex_protocol::items::ExitedReviewModeItem;
 use codex_protocol::items::TurnItem;
+use codex_protocol::models::BaseInstructionsProvenance;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AgentMessageContentDeltaEvent;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::ExitedReviewModeEvent;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::ReviewOutputEvent;
 use codex_protocol::protocol::SubAgentSource;
+use codex_protocol::review_format::format_review_findings_block;
+use codex_protocol::review_format::render_review_output_text;
 use tokio_util::sync::CancellationToken;
 
 use crate::codex_delegate::run_codex_thread_one_shot;
 use crate::config::Constrained;
-use crate::review_format::format_review_findings_block;
-use crate::review_format::render_review_output_text;
 use crate::session::TurnInput;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::state::TaskKind;
 use codex_features::Feature;
 use codex_protocol::user_input::UserInput;
+use codex_thread_store::PersistContext;
 
 use super::SessionTask;
-use super::SessionTaskContext;
+use super::SessionTaskResult;
 
 #[derive(Clone, Copy)]
 pub(crate) struct ReviewTask;
@@ -50,22 +53,21 @@ impl SessionTask for ReviewTask {
 
     async fn run(
         self: Arc<Self>,
-        session: Arc<SessionTaskContext>,
+        session: Arc<Session>,
         ctx: Arc<TurnContext>,
         input: Vec<TurnInput>,
         cancellation_token: CancellationToken,
-    ) -> Option<String> {
-        session.session.services.session_telemetry.counter(
-            "codex.task.review",
-            /*inc*/ 1,
-            &[],
-        );
+    ) -> SessionTaskResult {
+        session
+            .services
+            .session_telemetry
+            .counter("codex.task.review", /*inc*/ 1, &[]);
 
         let mut user_input = Vec::new();
         for item in input {
             match item {
                 TurnInput::UserInput { mut content, .. } => user_input.append(&mut content),
-                TurnInput::ResponseItem(_) => {}
+                TurnInput::ResponseItem(_) | TurnInput::InterAgentCommunication(_) => {}
             }
         }
 
@@ -82,18 +84,18 @@ impl SessionTask for ReviewTask {
             None => None,
         };
         if !cancellation_token.is_cancelled() {
-            exit_review_mode(session.clone_session(), output.clone(), ctx.clone()).await;
+            exit_review_mode(Arc::clone(&session), output.clone(), ctx.clone()).await;
         }
-        None
+        Ok(None)
     }
 
-    async fn abort(&self, session: Arc<SessionTaskContext>, ctx: Arc<TurnContext>) {
-        exit_review_mode(session.clone_session(), /*review_output*/ None, ctx).await;
+    async fn abort(&self, session: Arc<Session>, ctx: Arc<TurnContext>) {
+        exit_review_mode(session, /*review_output*/ None, ctx).await;
     }
 }
 
 async fn start_review_conversation(
-    session: Arc<SessionTaskContext>,
+    session: Arc<Session>,
     ctx: Arc<TurnContext>,
     input: Vec<UserInput>,
     cancellation_token: CancellationToken,
@@ -108,12 +110,12 @@ async fn start_review_conversation(
     {
         panic!("by construction Constrained<WebSearchMode> must always support Disabled: {err}");
     }
-    let _ = sub_agent_config.features.disable(Feature::SpawnCsv);
     let _ = sub_agent_config.features.disable(Feature::Collab);
     let _ = sub_agent_config.features.disable(Feature::MultiAgentV2);
 
     // Set explicit review rubric for the sub-agent
     sub_agent_config.base_instructions = Some(crate::REVIEW_PROMPT.to_string());
+    sub_agent_config.base_instructions_provenance = Some(BaseInstructionsProvenance::Custom);
     sub_agent_config.permissions.approval_policy = Constrained::allow_only(AskForApproval::Never);
 
     let model = config
@@ -123,10 +125,10 @@ async fn start_review_conversation(
     sub_agent_config.model = Some(model);
     (run_codex_thread_one_shot(
         sub_agent_config,
-        session.auth_manager(),
-        session.models_manager(),
+        Arc::clone(&session.services.auth_manager),
+        Arc::clone(&session.services.models_manager),
         input,
-        session.clone_session(),
+        Arc::clone(&session),
         ctx.clone(),
         cancellation_token,
         SubAgentSource::Review,
@@ -135,11 +137,11 @@ async fn start_review_conversation(
     )
     .await)
         .ok()
-        .map(|io| io.rx_event)
+        .map(|(_session, io)| io.rx_event)
 }
 
 async fn process_review_events(
-    session: Arc<SessionTaskContext>,
+    session: Arc<Session>,
     ctx: Arc<TurnContext>,
     receiver: async_channel::Receiver<Event>,
 ) -> Option<ReviewOutputEvent> {
@@ -148,10 +150,7 @@ async fn process_review_events(
         match event.clone().msg {
             EventMsg::AgentMessage(_) => {
                 if let Some(prev) = prev_agent_message.take() {
-                    session
-                        .clone_session()
-                        .send_event(ctx.as_ref(), prev.msg)
-                        .await;
+                    session.send_event(ctx.as_ref(), prev.msg).await;
                 }
                 prev_agent_message = Some(event);
             }
@@ -176,10 +175,7 @@ async fn process_review_events(
                 return None;
             }
             other => {
-                session
-                    .clone_session()
-                    .send_event(ctx.as_ref(), other)
-                    .await;
+                session.send_event(ctx.as_ref(), other).await;
             }
         }
     }
@@ -209,15 +205,13 @@ fn parse_review_output_event(text: &str) -> ReviewOutputEvent {
     }
 }
 
-/// Emits an ExitedReviewMode Event with optional ReviewOutput,
-/// and records a developer message with the review output.
+/// Emits ExitedReviewMode item lifecycle with optional ReviewOutput,
+/// and records the review output back into conversation history.
 pub(crate) async fn exit_review_mode(
     session: Arc<Session>,
     review_output: Option<ReviewOutputEvent>,
     ctx: Arc<TurnContext>,
 ) {
-    const REVIEW_USER_MESSAGE_ID: &str = "review_rollout_user";
-    const REVIEW_ASSISTANT_MESSAGE_ID: &str = "review_rollout_assistant";
     let (user_message, assistant_message) = if let Some(out) = review_output.clone() {
         let mut findings_str = String::new();
         let text = out.overall_explanation.trim();
@@ -243,30 +237,32 @@ pub(crate) async fn exit_review_mode(
         .record_conversation_items(
             &ctx,
             &[ResponseItem::Message {
-                id: Some(REVIEW_USER_MESSAGE_ID.to_string()),
+                id: Some(ResponseItemId::new("msg")),
                 role: "user".to_string(),
                 content: vec![ContentItem::InputText { text: user_message }],
                 phase: None,
+                internal_chat_message_metadata_passthrough: None,
             }],
         )
         .await;
 
-    session
-        .send_event(
-            ctx.as_ref(),
-            EventMsg::ExitedReviewMode(ExitedReviewModeEvent { review_output }),
-        )
-        .await;
+    let item = TurnItem::ExitedReviewMode(ExitedReviewModeItem {
+        id: uuid::Uuid::now_v7().to_string(),
+        review_output,
+    });
+    session.emit_turn_item_started(ctx.as_ref(), &item).await;
+    session.emit_turn_item_completed(ctx.as_ref(), item).await;
     session
         .record_response_item_and_emit_turn_item(
             ctx.as_ref(),
             ResponseItem::Message {
-                id: Some(REVIEW_ASSISTANT_MESSAGE_ID.to_string()),
+                id: Some(ResponseItemId::new("msg")),
                 role: "assistant".to_string(),
                 content: vec![ContentItem::OutputText {
                     text: assistant_message,
                 }],
                 phase: None,
+                internal_chat_message_metadata_passthrough: None,
             },
         )
         .await;
@@ -274,5 +270,7 @@ pub(crate) async fn exit_review_mode(
     // Review turns can run before any regular user turn, so explicitly
     // materialize rollout persistence. Do this after emitting review output so
     // file creation + git metadata collection cannot delay client-facing items.
-    session.ensure_rollout_materialized().await;
+    session
+        .ensure_rollout_materialized(PersistContext::Standard)
+        .await;
 }

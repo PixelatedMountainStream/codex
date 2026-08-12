@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::app_event::AppEvent;
+use crate::chatwidget::rate_limits::RATE_LIMIT_SWITCH_PROMPT_VIEW_ID;
 
 impl ChatWidget {
     /// Set the approval policy in the widget's config copy.
@@ -75,18 +76,6 @@ impl ChatWidget {
             );
         }
         let enabled = self.config.features.enabled(feature);
-        if feature == Feature::RealtimeConversation {
-            let realtime_conversation_enabled = self.realtime_conversation_enabled();
-            self.bottom_pane
-                .set_realtime_conversation_enabled(realtime_conversation_enabled);
-            self.bottom_pane
-                .set_audio_device_selection_enabled(self.realtime_audio_device_selection_enabled());
-            if !realtime_conversation_enabled && self.realtime_conversation.is_live() {
-                self.request_realtime_conversation_close(Some(
-                    "Realtime voice mode was closed because the feature was disabled.".to_string(),
-                ));
-            }
-        }
         if feature == Feature::FastMode {
             self.refresh_effective_service_tier();
             self.sync_service_tier_commands();
@@ -131,10 +120,6 @@ impl ChatWidget {
     pub(crate) fn set_approvals_reviewer(&mut self, policy: ApprovalsReviewer) {
         self.config.approvals_reviewer = policy;
         self.refresh_status_surfaces();
-    }
-
-    pub(crate) fn set_full_access_warning_acknowledged(&mut self, acknowledged: bool) {
-        self.config.notices.hide_full_access_warning = Some(acknowledged);
     }
 
     pub(crate) fn set_world_writable_warning_acknowledged(&mut self, acknowledged: bool) {
@@ -218,28 +203,48 @@ impl ChatWidget {
         self.has_chatgpt_account
     }
 
+    pub(crate) fn has_codex_backend_auth(&self) -> bool {
+        self.has_codex_backend_auth
+    }
+
     pub(crate) fn update_account_state(
         &mut self,
         status_account_display: Option<StatusAccountDisplay>,
         plan_type: Option<PlanType>,
         has_chatgpt_account: bool,
+        has_codex_backend_auth: bool,
     ) {
+        // Account-update notifications are the identity boundary. The visible account fields can
+        // be identical across two accounts, so always invalidate account-scoped requests and data.
+        self.clear_pending_token_activity_refreshes();
+        self.clear_pending_rate_limit_reset_requests();
+        self.codex_rate_limit_reached_type = None;
+        self.codex_spend_control_reached = None;
+        self.rate_limit_warnings = RateLimitWarningState::default();
+        self.rate_limit_switch_prompt = RateLimitSwitchPromptState::Idle;
+        self.bottom_pane
+            .dismiss_view_by_id(RATE_LIMIT_SWITCH_PROMPT_VIEW_ID);
+        let had_refreshing_status_outputs = !self.refreshing_status_outputs.is_empty();
+        let now = Local::now();
+        for (_, handle) in self.refreshing_status_outputs.drain(..) {
+            handle.finish_rate_limit_refresh(&[], now);
+        }
+        if had_refreshing_status_outputs {
+            self.request_redraw();
+        }
+        self.status_line_workspace_headline = None;
+        self.status_line_workspace_headline_pending_request_id = None;
+        self.status_line_workspace_headline_last_requested_at = None;
+        self.status_line_workspace_messages_disabled = false;
         self.status_account_display = status_account_display;
         self.plan_type = plan_type;
         self.has_chatgpt_account = has_chatgpt_account;
+        self.has_codex_backend_auth = has_codex_backend_auth;
         self.bottom_pane
             .set_connectors_enabled(self.connectors_enabled());
-    }
-
-    pub(crate) fn set_realtime_audio_device(
-        &mut self,
-        kind: RealtimeAudioDeviceKind,
-        name: Option<String>,
-    ) {
-        match kind {
-            RealtimeAudioDeviceKind::Microphone => self.config.realtime_audio.microphone = name,
-            RealtimeAudioDeviceKind::Speaker => self.config.realtime_audio.speaker = name,
-        }
+        self.bottom_pane
+            .set_token_activity_command_enabled(has_codex_backend_auth);
+        self.refresh_status_surfaces();
     }
 
     /// Set the syntax theme override in the widget's config copy.
@@ -271,28 +276,6 @@ impl ChatWidget {
             .as_ref()
             .and_then(|mask| mask.model.as_deref())
             .unwrap_or_else(|| self.current_collaboration_mode.model())
-    }
-
-    pub(crate) fn realtime_conversation_is_live(&self) -> bool {
-        self.realtime_conversation.is_live()
-    }
-
-    pub(super) fn current_realtime_audio_device_name(
-        &self,
-        kind: RealtimeAudioDeviceKind,
-    ) -> Option<String> {
-        match kind {
-            RealtimeAudioDeviceKind::Microphone => self.config.realtime_audio.microphone.clone(),
-            RealtimeAudioDeviceKind::Speaker => self.config.realtime_audio.speaker.clone(),
-        }
-    }
-
-    pub(super) fn current_realtime_audio_selection_label(
-        &self,
-        kind: RealtimeAudioDeviceKind,
-    ) -> String {
-        self.current_realtime_audio_device_name(kind)
-            .unwrap_or_else(|| "System default".to_string())
     }
 
     pub(super) fn sync_personality_command_enabled(&mut self) {
@@ -359,7 +342,6 @@ impl ChatWidget {
         )
     }
 
-    #[allow(dead_code)] // Used in tests
     pub(crate) fn current_collaboration_mode(&self) -> &CollaborationMode {
         &self.current_collaboration_mode
     }
@@ -488,6 +470,9 @@ impl ChatWidget {
         self.sync_image_paste_enabled();
         self.sync_service_tier_commands();
         self.refresh_terminal_title();
+        let effort = self.effective_reasoning_effort();
+        self.bottom_pane
+            .set_active_reasoning_effort(effort.as_ref());
     }
 
     /// Refresh every UI surface that depends on the effective model, reasoning
@@ -620,7 +605,7 @@ impl ChatWidget {
         }
         match self.active_mode_kind() {
             ModeKind::Plan => Some(CollaborationModeIndicator::Plan),
-            ModeKind::Default | ModeKind::PairProgramming | ModeKind::Execute => None,
+            ModeKind::Default => None,
         }
     }
 

@@ -24,6 +24,7 @@ use codex_protocol::protocol::PatchApplyStatus;
 use codex_protocol::protocol::SubAgentActivityEvent;
 use codex_protocol::protocol::TurnAbortReason;
 use serde::Serialize;
+use std::time::Duration;
 
 use crate::AgentThreadId;
 use crate::CodexTurnId;
@@ -120,8 +121,12 @@ impl Serialize for ToolRuntimePayload<'_> {
         S: serde::Serializer,
     {
         match self {
-            ToolRuntimePayload::ExecCommandBegin(event) => event.serialize(serializer),
-            ToolRuntimePayload::ExecCommandEnd(event) => event.serialize(serializer),
+            ToolRuntimePayload::ExecCommandBegin(event) => {
+                ExecCommandBeginTracePayload::from(*event).serialize(serializer)
+            }
+            ToolRuntimePayload::ExecCommandEnd(event) => {
+                ExecCommandEndTracePayload::from(*event).serialize(serializer)
+            }
             ToolRuntimePayload::PatchApplyBegin(event) => event.serialize(serializer),
             ToolRuntimePayload::PatchApplyEnd(event) => event.serialize(serializer),
             ToolRuntimePayload::McpToolCallBegin(event) => event.serialize(serializer),
@@ -135,6 +140,135 @@ impl Serialize for ToolRuntimePayload<'_> {
             ToolRuntimePayload::CollabCloseBegin(event) => event.serialize(serializer),
             ToolRuntimePayload::CollabCloseEnd(event) => event.serialize(serializer),
             ToolRuntimePayload::SubAgentActivity(event) => event.serialize(serializer),
+        }
+    }
+}
+
+/// Rollout-trace representation of an exec begin event.
+///
+/// Rollout traces share the rollout compatibility requirement that paths remain path-flavored
+/// strings on disk, even though live events carry `PathUri` internally.
+#[derive(Serialize)]
+struct ExecCommandBeginTracePayload<'a> {
+    call_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plugin_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    script_path: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    process_id: Option<&'a str>,
+    turn_id: &'a str,
+    started_at_ms: i64,
+    command: &'a [String],
+    cwd: String,
+    parsed_cmd: &'a [codex_protocol::parse_command::ParsedCommand],
+    source: ExecCommandSource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    interaction_input: Option<&'a str>,
+}
+
+impl<'a> From<&'a ExecCommandBeginEvent> for ExecCommandBeginTracePayload<'a> {
+    fn from(event: &'a ExecCommandBeginEvent) -> Self {
+        let ExecCommandBeginEvent {
+            call_id,
+            plugin_id,
+            script_path,
+            process_id,
+            turn_id,
+            started_at_ms,
+            command,
+            cwd,
+            parsed_cmd,
+            source,
+            interaction_input,
+        } = event;
+        Self {
+            call_id,
+            plugin_id: plugin_id.as_deref(),
+            script_path: script_path.as_deref(),
+            process_id: process_id.as_deref(),
+            turn_id,
+            started_at_ms: *started_at_ms,
+            command,
+            cwd: cwd.inferred_native_path_string(),
+            parsed_cmd,
+            source: *source,
+            interaction_input: interaction_input.as_deref(),
+        }
+    }
+}
+
+/// Rollout-trace representation of an exec end event.
+///
+/// Like [`ExecCommandBeginTracePayload`], this renders `cwd` as an inferred native path to preserve
+/// the on-disk format rather than serializing the internal `PathUri`.
+#[derive(Serialize)]
+struct ExecCommandEndTracePayload<'a> {
+    call_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plugin_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    script_path: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    process_id: Option<&'a str>,
+    turn_id: &'a str,
+    completed_at_ms: i64,
+    command: &'a [String],
+    cwd: String,
+    parsed_cmd: &'a [codex_protocol::parse_command::ParsedCommand],
+    source: ExecCommandSource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    interaction_input: Option<&'a str>,
+    stdout: &'a str,
+    stderr: &'a str,
+    aggregated_output: &'a str,
+    exit_code: i32,
+    duration: Duration,
+    formatted_output: &'a str,
+    status: &'a ExecCommandStatus,
+}
+
+impl<'a> From<&'a ExecCommandEndEvent> for ExecCommandEndTracePayload<'a> {
+    fn from(event: &'a ExecCommandEndEvent) -> Self {
+        let ExecCommandEndEvent {
+            call_id,
+            plugin_id,
+            script_path,
+            process_id,
+            turn_id,
+            completed_at_ms,
+            command,
+            cwd,
+            parsed_cmd,
+            source,
+            interaction_input,
+            stdout,
+            stderr,
+            aggregated_output,
+            exit_code,
+            duration,
+            formatted_output,
+            status,
+        } = event;
+        Self {
+            call_id,
+            plugin_id: plugin_id.as_deref(),
+            script_path: script_path.as_deref(),
+            process_id: process_id.as_deref(),
+            turn_id,
+            completed_at_ms: *completed_at_ms,
+            command,
+            cwd: cwd.inferred_native_path_string(),
+            parsed_cmd,
+            source: *source,
+            interaction_input: interaction_input.as_deref(),
+            stdout,
+            stderr,
+            aggregated_output,
+            exit_code: *exit_code,
+            duration: *duration,
+            formatted_output,
+            status,
         }
     }
 }
@@ -226,6 +360,7 @@ pub(crate) fn tool_runtime_trace_event(event: &EventMsg) -> Option<ToolRuntimeTr
         EventMsg::Error(_)
         | EventMsg::Warning(_)
         | EventMsg::GuardianWarning(_)
+        | EventMsg::SafetyBuffering(_)
         | EventMsg::RealtimeConversationStarted(_)
         | EventMsg::RealtimeConversationRealtime(_)
         | EventMsg::RealtimeConversationClosed(_)
@@ -236,6 +371,7 @@ pub(crate) fn tool_runtime_trace_event(event: &EventMsg) -> Option<ToolRuntimeTr
         | EventMsg::ContextCompacted(_)
         | EventMsg::ThreadRolledBack(_)
         | EventMsg::ThreadGoalUpdated(_)
+        | EventMsg::ThreadQueueChanged(_)
         | EventMsg::TurnStarted(_)
         | EventMsg::ThreadSettingsApplied(_)
         | EventMsg::TurnComplete(_)
@@ -246,6 +382,8 @@ pub(crate) fn tool_runtime_trace_event(event: &EventMsg) -> Option<ToolRuntimeTr
         | EventMsg::AgentReasoningRawContent(_)
         | EventMsg::AgentReasoningSectionBreak(_)
         | EventMsg::SessionConfigured(_)
+        | EventMsg::EnvironmentConnected(_)
+        | EventMsg::EnvironmentDisconnected(_)
         | EventMsg::McpStartupUpdate(_)
         | EventMsg::McpStartupComplete(_)
         | EventMsg::WebSearchBegin(_)
@@ -276,6 +414,7 @@ pub(crate) fn tool_runtime_trace_event(event: &EventMsg) -> Option<ToolRuntimeTr
         | EventMsg::EnteredReviewMode(_)
         | EventMsg::ExitedReviewMode(_)
         | EventMsg::RawResponseItem(_)
+        | EventMsg::RawResponseCompleted(_)
         | EventMsg::ItemStarted(_)
         | EventMsg::ItemCompleted(_)
         | EventMsg::HookStarted(_)
@@ -300,6 +439,7 @@ pub(crate) fn wrapped_protocol_event_type(event: &EventMsg) -> Option<&'static s
         EventMsg::Warning(_) => Some("warning"),
         EventMsg::ShutdownComplete => Some("shutdown_complete"),
         EventMsg::GuardianWarning(_)
+        | EventMsg::SafetyBuffering(_)
         | EventMsg::RealtimeConversationStarted(_)
         | EventMsg::RealtimeConversationRealtime(_)
         | EventMsg::RealtimeConversationClosed(_)
@@ -309,6 +449,8 @@ pub(crate) fn wrapped_protocol_event_type(event: &EventMsg) -> Option<&'static s
         | EventMsg::TurnModerationMetadata(_)
         | EventMsg::ContextCompacted(_)
         | EventMsg::ThreadSettingsApplied(_)
+        | EventMsg::EnvironmentConnected(_)
+        | EventMsg::EnvironmentDisconnected(_)
         | EventMsg::TokenCount(_)
         | EventMsg::AgentMessage(_)
         | EventMsg::UserMessage(_)
@@ -316,6 +458,7 @@ pub(crate) fn wrapped_protocol_event_type(event: &EventMsg) -> Option<&'static s
         | EventMsg::AgentReasoningRawContent(_)
         | EventMsg::AgentReasoningSectionBreak(_)
         | EventMsg::ThreadGoalUpdated(_)
+        | EventMsg::ThreadQueueChanged(_)
         | EventMsg::McpStartupUpdate(_)
         | EventMsg::McpStartupComplete(_)
         | EventMsg::McpToolCallBegin(_)
@@ -348,6 +491,7 @@ pub(crate) fn wrapped_protocol_event_type(event: &EventMsg) -> Option<&'static s
         | EventMsg::EnteredReviewMode(_)
         | EventMsg::ExitedReviewMode(_)
         | EventMsg::RawResponseItem(_)
+        | EventMsg::RawResponseCompleted(_)
         | EventMsg::ItemStarted(_)
         | EventMsg::ItemCompleted(_)
         | EventMsg::HookStarted(_)

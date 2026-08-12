@@ -33,8 +33,8 @@ use crate::key_hint;
 use crate::key_hint::KeyBinding;
 use crate::key_hint::KeyBindingListExt;
 use crate::keymap::ApprovalKeymap;
+use crate::keymap::ListAction;
 use crate::keymap::ListKeymap;
-use crate::keymap::primary_binding;
 use crate::render::highlight::highlight_bash_to_lines;
 use crate::render::renderable::ColumnRenderable;
 use crate::render::renderable::Renderable;
@@ -55,6 +55,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::request_permissions::PermissionGrantScope;
 use codex_protocol::request_permissions::RequestPermissionProfile;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::LegacyAppPathString;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
@@ -70,85 +71,97 @@ use ratatui::widgets::Wrap;
 /// Request coming from the agent that needs user approval.
 #[derive(Clone, Debug)]
 pub(crate) enum ApprovalRequest {
-    Exec {
-        thread_id: ThreadId,
-        thread_label: Option<String>,
-        id: String,
-        command: Vec<String>,
-        reason: Option<String>,
-        available_decisions: Vec<CommandExecutionApprovalDecision>,
-        network_approval_context: Option<NetworkApprovalContext>,
-        additional_permissions: Option<AdditionalPermissionProfile>,
-    },
-    Permissions {
-        thread_id: ThreadId,
-        thread_label: Option<String>,
-        call_id: String,
-        environment_id: Option<String>,
-        reason: Option<String>,
-        permissions: RequestPermissionProfile,
-    },
-    ApplyPatch {
-        thread_id: ThreadId,
-        thread_label: Option<String>,
-        id: String,
-        reason: Option<String>,
-        cwd: AbsolutePathBuf,
-        changes: HashMap<PathBuf, FileChange>,
-    },
-    McpElicitation {
-        thread_id: ThreadId,
-        thread_label: Option<String>,
-        server_name: String,
-        request_id: RequestId,
-        message: String,
-    },
+    Exec(ExecApprovalRequest),
+    Permissions(PermissionsApprovalRequest),
+    ApplyPatch(ApplyPatchApprovalRequest),
+    McpElicitation(McpElicitationApprovalRequest),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ExecApprovalRequest {
+    pub thread_id: ThreadId,
+    pub thread_label: Option<String>,
+    pub id: String,
+    pub environment_id: Option<String>,
+    pub command: Vec<String>,
+    pub reason: Option<String>,
+    pub available_decisions: Vec<CommandExecutionApprovalDecision>,
+    pub network_approval_context: Option<NetworkApprovalContext>,
+    pub additional_permissions: Option<AdditionalPermissionProfile>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PermissionsApprovalRequest {
+    pub thread_id: ThreadId,
+    pub thread_label: Option<String>,
+    pub call_id: String,
+    pub environment_id: Option<String>,
+    pub reason: Option<String>,
+    pub permissions: RequestPermissionProfile,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ApplyPatchApprovalRequest {
+    pub thread_id: ThreadId,
+    pub thread_label: Option<String>,
+    pub id: String,
+    pub reason: Option<String>,
+    pub cwd: AbsolutePathBuf,
+    pub changes: HashMap<PathBuf, FileChange>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct McpElicitationApprovalRequest {
+    pub thread_id: ThreadId,
+    pub thread_label: Option<String>,
+    pub server_name: String,
+    pub request_id: RequestId,
+    pub message: String,
 }
 
 impl ApprovalRequest {
     fn thread_id(&self) -> ThreadId {
         match self {
-            ApprovalRequest::Exec { thread_id, .. }
-            | ApprovalRequest::Permissions { thread_id, .. }
-            | ApprovalRequest::ApplyPatch { thread_id, .. }
-            | ApprovalRequest::McpElicitation { thread_id, .. } => *thread_id,
+            ApprovalRequest::Exec(request) => request.thread_id,
+            ApprovalRequest::Permissions(request) => request.thread_id,
+            ApprovalRequest::ApplyPatch(request) => request.thread_id,
+            ApprovalRequest::McpElicitation(request) => request.thread_id,
         }
     }
 
     fn thread_label(&self) -> Option<&str> {
         match self {
-            ApprovalRequest::Exec { thread_label, .. }
-            | ApprovalRequest::Permissions { thread_label, .. }
-            | ApprovalRequest::ApplyPatch { thread_label, .. }
-            | ApprovalRequest::McpElicitation { thread_label, .. } => thread_label.as_deref(),
+            ApprovalRequest::Exec(request) => request.thread_label.as_deref(),
+            ApprovalRequest::Permissions(request) => request.thread_label.as_deref(),
+            ApprovalRequest::ApplyPatch(request) => request.thread_label.as_deref(),
+            ApprovalRequest::McpElicitation(request) => request.thread_label.as_deref(),
         }
     }
 
     pub(super) fn matches_resolved_request(&self, request: &ResolvedAppServerRequest) -> bool {
         match (self, request) {
             (
-                ApprovalRequest::Exec { id, .. },
+                ApprovalRequest::Exec(request),
                 ResolvedAppServerRequest::ExecApproval { id: resolved_id },
-            ) => id == resolved_id,
+            ) => request.id == *resolved_id,
             (
-                ApprovalRequest::Permissions { call_id, .. },
+                ApprovalRequest::Permissions(request),
                 ResolvedAppServerRequest::PermissionsApproval { id },
-            ) => call_id == id,
+            ) => request.call_id == *id,
             (
-                ApprovalRequest::ApplyPatch { id, .. },
+                ApprovalRequest::ApplyPatch(request),
                 ResolvedAppServerRequest::FileChangeApproval { id: resolved_id },
-            ) => id == resolved_id,
+            ) => request.id == *resolved_id,
             (
-                ApprovalRequest::McpElicitation {
-                    server_name,
-                    request_id,
-                    ..
-                },
+                ApprovalRequest::McpElicitation(request),
                 ResolvedAppServerRequest::McpElicitation {
                     server_name: resolved_server_name,
                     request_id: resolved_request_id,
                 },
-            ) => server_name == resolved_server_name && request_id == resolved_request_id,
+            ) => {
+                request.server_name == *resolved_server_name
+                    && request.request_id == *resolved_request_id
+            }
             _ => false,
         }
     }
@@ -237,19 +250,14 @@ impl ApprovalOverlay {
         list_keymap: &ListKeymap,
     ) -> (Vec<ApprovalOption>, SelectionViewParams) {
         let (options, title) = match request {
-            ApprovalRequest::Exec {
-                available_decisions,
-                network_approval_context,
-                additional_permissions,
-                ..
-            } => (
+            ApprovalRequest::Exec(request) => (
                 exec_options(
-                    available_decisions,
-                    network_approval_context.as_ref(),
-                    additional_permissions.as_ref(),
+                    &request.available_decisions,
+                    request.network_approval_context.as_ref(),
+                    request.additional_permissions.as_ref(),
                     approval_keymap,
                 ),
-                network_approval_context.as_ref().map_or_else(
+                request.network_approval_context.as_ref().map_or_else(
                     || "Would you like to run the following command?".to_string(),
                     |network_approval_context| {
                         format!(
@@ -259,17 +267,17 @@ impl ApprovalOverlay {
                     },
                 ),
             ),
-            ApprovalRequest::Permissions { .. } => (
+            ApprovalRequest::Permissions(_) => (
                 permissions_options(approval_keymap),
                 "Would you like to grant these permissions?".to_string(),
             ),
-            ApprovalRequest::ApplyPatch { .. } => (
+            ApprovalRequest::ApplyPatch(_) => (
                 patch_options(approval_keymap),
                 "Would you like to make the following edits?".to_string(),
             ),
-            ApprovalRequest::McpElicitation { server_name, .. } => (
+            ApprovalRequest::McpElicitation(request) => (
                 elicitation_options(approval_keymap),
-                format!("{server_name} needs your approval."),
+                format!("{} needs your approval.", request.server_name),
             ),
         };
 
@@ -283,7 +291,7 @@ impl ApprovalOverlay {
             .iter()
             .map(|opt| SelectionItem {
                 name: opt.label.clone(),
-                display_shortcut: opt.shortcuts.first().copied(),
+                display_shortcut: approval_keymap.hint_for_bindings(&opt.shortcuts),
                 dismiss_on_select: false,
                 ..Default::default()
             })
@@ -308,35 +316,31 @@ impl ApprovalOverlay {
         };
         if let Some(request) = self.current_request.as_ref() {
             match (request, &option.decision) {
-                (
-                    ApprovalRequest::Exec { id, command, .. },
-                    ApprovalDecision::Command(decision),
-                ) => {
-                    self.handle_exec_decision(id, command, decision.clone());
+                (ApprovalRequest::Exec(request), ApprovalDecision::Command(decision)) => {
+                    self.handle_exec_decision(&request.id, &request.command, decision.clone());
                 }
                 (
-                    ApprovalRequest::Permissions {
-                        call_id,
-                        permissions,
-                        ..
-                    },
+                    ApprovalRequest::Permissions(request),
                     ApprovalDecision::Permissions(decision),
-                ) => self.handle_permissions_decision(call_id, permissions, *decision),
-                (
-                    ApprovalRequest::ApplyPatch { id, .. },
-                    ApprovalDecision::FileChange(decision),
                 ) => {
-                    self.handle_patch_decision(id, decision.clone());
+                    self.handle_permissions_decision(
+                        &request.call_id,
+                        &request.permissions,
+                        *decision,
+                    );
+                }
+                (ApprovalRequest::ApplyPatch(request), ApprovalDecision::FileChange(decision)) => {
+                    self.handle_patch_decision(&request.id, decision.clone());
                 }
                 (
-                    ApprovalRequest::McpElicitation {
-                        server_name,
-                        request_id,
-                        ..
-                    },
+                    ApprovalRequest::McpElicitation(request),
                     ApprovalDecision::McpElicitation(decision),
                 ) => {
-                    self.handle_elicitation_decision(server_name, request_id, *decision);
+                    self.handle_elicitation_decision(
+                        &request.server_name,
+                        &request.request_id,
+                        *decision,
+                    );
                 }
                 _ => {}
             }
@@ -356,22 +360,22 @@ impl ApprovalOverlay {
             return;
         };
         if request.thread_label().is_none() {
-            let subject = match request {
-                ApprovalRequest::Exec {
-                    network_approval_context: Some(network_approval_context),
-                    ..
-                } => history_cell::ApprovalDecisionSubject::NetworkAccess {
+            let network_approval_context = match request {
+                ApprovalRequest::Exec(request) => request.network_approval_context.as_ref(),
+                ApprovalRequest::Permissions(_)
+                | ApprovalRequest::ApplyPatch(_)
+                | ApprovalRequest::McpElicitation(_) => None,
+            };
+            let subject = if let Some(network_approval_context) = network_approval_context {
+                history_cell::ApprovalDecisionSubject::NetworkAccess {
                     target: network_approval_target(network_approval_context, command),
-                },
-                _ => {
-                    if let Some(target) = network_approval_command_target(command) {
-                        history_cell::ApprovalDecisionSubject::NetworkAccess {
-                            target: target.to_string(),
-                        }
-                    } else {
-                        history_cell::ApprovalDecisionSubject::Command(command.to_vec())
-                    }
                 }
+            } else if let Some(target) = network_approval_command_target(command) {
+                history_cell::ApprovalDecisionSubject::NetworkAccess {
+                    target: target.to_string(),
+                }
+            } else {
+                history_cell::ApprovalDecisionSubject::Command(command.to_vec())
             };
             let cell = history_cell::new_approval_decision_cell(
                 subject,
@@ -486,35 +490,27 @@ impl ApprovalOverlay {
             && let Some(request) = self.current_request.as_ref()
         {
             match request {
-                ApprovalRequest::Exec { id, command, .. } => {
+                ApprovalRequest::Exec(request) => {
                     self.handle_exec_decision(
-                        id,
-                        command,
+                        &request.id,
+                        &request.command,
                         CommandExecutionApprovalDecision::Cancel,
                     );
                 }
-                ApprovalRequest::Permissions {
-                    call_id,
-                    permissions,
-                    ..
-                } => {
+                ApprovalRequest::Permissions(request) => {
                     self.handle_permissions_decision(
-                        call_id,
-                        permissions,
+                        &request.call_id,
+                        &request.permissions,
                         PermissionsDecision::Deny,
                     );
                 }
-                ApprovalRequest::ApplyPatch { id, .. } => {
-                    self.handle_patch_decision(id, FileChangeApprovalDecision::Cancel);
+                ApprovalRequest::ApplyPatch(request) => {
+                    self.handle_patch_decision(&request.id, FileChangeApprovalDecision::Cancel);
                 }
-                ApprovalRequest::McpElicitation {
-                    server_name,
-                    request_id,
-                    ..
-                } => {
+                ApprovalRequest::McpElicitation(request) => {
                     self.handle_elicitation_decision(
-                        server_name,
-                        request_id,
+                        &request.server_name,
+                        &request.request_id,
                         McpServerElicitationAction::Cancel,
                     );
                 }
@@ -567,6 +563,11 @@ impl ApprovalOverlay {
 }
 
 impl BottomPaneView for ApprovalOverlay {
+    fn keymap_contexts(&self) -> crate::keymap::KeymapContextSet {
+        crate::keymap::KeymapContextSet::new(crate::keymap::KeymapContext::Approval)
+            .with(crate::keymap::KeymapContext::List)
+    }
+
     fn handle_key_event(&mut self, key_event: KeyEvent) {
         if self.try_handle_shortcut(&key_event) {
             return;
@@ -623,14 +624,15 @@ fn approval_footer_hint(
     list_keymap: &ListKeymap,
 ) -> Line<'static> {
     let mut spans = accept_cancel_hint_line(
-        primary_binding(&list_keymap.accept),
+        list_keymap.primary_hint(ListAction::Accept),
         "to confirm",
-        primary_binding(&list_keymap.cancel),
+        list_keymap.primary_hint(ListAction::Cancel),
         "to cancel",
     )
     .spans;
     if request.thread_label().is_some()
-        && let Some(open_thread) = primary_binding(&approval_keymap.open_thread)
+        && let Some(open_thread) =
+            approval_keymap.primary_hint("open_thread", &approval_keymap.open_thread)
     {
         if !spans.is_empty() {
             spans.push(" or ".into());
@@ -673,27 +675,27 @@ fn network_approval_command_target(command: &[String]) -> Option<&str> {
 
 fn build_header(request: &ApprovalRequest) -> Box<dyn Renderable> {
     match request {
-        ApprovalRequest::Exec {
-            thread_label,
-            reason,
-            command,
-            network_approval_context,
-            additional_permissions,
-            ..
-        } => {
+        ApprovalRequest::Exec(request) => {
             let mut header: Vec<Line<'static>> = Vec::new();
-            if let Some(thread_label) = thread_label {
+            if let Some(thread_label) = &request.thread_label {
                 header.push(Line::from(vec![
                     "Thread: ".into(),
                     thread_label.clone().bold(),
                 ]));
                 header.push(Line::from(""));
             }
-            if let Some(reason) = reason {
+            if let Some(environment_id) = &request.environment_id {
+                header.push(Line::from(vec![
+                    "Environment: ".into(),
+                    environment_id.clone().bold(),
+                ]));
+                header.push(Line::from(""));
+            }
+            if let Some(reason) = &request.reason {
                 header.push(Line::from(vec!["Reason: ".into(), reason.clone().italic()]));
                 header.push(Line::from(""));
             }
-            if let Some(additional_permissions) = additional_permissions
+            if let Some(additional_permissions) = &request.additional_permissions
                 && let Some(rule_line) = format_additional_permissions_rule(additional_permissions)
             {
                 header.push(Line::from(vec![
@@ -702,43 +704,37 @@ fn build_header(request: &ApprovalRequest) -> Box<dyn Renderable> {
                 ]));
                 header.push(Line::from(""));
             }
-            let full_cmd = strip_bash_lc_and_escape(command);
+            let full_cmd = strip_bash_lc_and_escape(&request.command);
             let mut full_cmd_lines = highlight_bash_to_lines(&full_cmd);
             if let Some(first) = full_cmd_lines.first_mut() {
                 first.spans.insert(0, Span::from("$ "));
             }
-            if network_approval_context.is_none() {
+            if request.network_approval_context.is_none() {
                 header.extend(full_cmd_lines);
             }
             Box::new(Paragraph::new(header).wrap(Wrap { trim: false }))
         }
-        ApprovalRequest::Permissions {
-            thread_label,
-            environment_id,
-            reason,
-            permissions,
-            ..
-        } => {
+        ApprovalRequest::Permissions(request) => {
             let mut header: Vec<Line<'static>> = Vec::new();
-            if let Some(thread_label) = thread_label {
+            if let Some(thread_label) = &request.thread_label {
                 header.push(Line::from(vec![
                     "Thread: ".into(),
                     thread_label.clone().bold(),
                 ]));
                 header.push(Line::from(""));
             }
-            if let Some(environment_id) = environment_id {
+            if let Some(environment_id) = &request.environment_id {
                 header.push(Line::from(vec![
                     "Environment: ".into(),
                     environment_id.clone().bold(),
                 ]));
                 header.push(Line::from(""));
             }
-            if let Some(reason) = reason {
+            if let Some(reason) = &request.reason {
                 header.push(Line::from(vec!["Reason: ".into(), reason.clone().italic()]));
                 header.push(Line::from(""));
             }
-            if let Some(rule_line) = format_requested_permissions_rule(permissions) {
+            if let Some(rule_line) = format_requested_permissions_rule(&request.permissions) {
                 header.push(Line::from(vec![
                     "Permission rule: ".into(),
                     rule_line.cyan(),
@@ -746,19 +742,15 @@ fn build_header(request: &ApprovalRequest) -> Box<dyn Renderable> {
             }
             Box::new(Paragraph::new(header).wrap(Wrap { trim: false }))
         }
-        ApprovalRequest::ApplyPatch {
-            thread_label,
-            reason,
-            ..
-        } => {
+        ApprovalRequest::ApplyPatch(request) => {
             let mut header: Vec<Box<dyn Renderable>> = Vec::new();
-            if let Some(thread_label) = thread_label {
+            if let Some(thread_label) = &request.thread_label {
                 header.push(Box::new(Line::from(vec![
                     "Thread: ".into(),
                     thread_label.clone().bold(),
                 ])));
             }
-            if let Some(reason) = reason
+            if let Some(reason) = &request.reason
                 && !reason.is_empty()
             {
                 if !header.is_empty() {
@@ -774,14 +766,9 @@ fn build_header(request: &ApprovalRequest) -> Box<dyn Renderable> {
             }
             Box::new(ColumnRenderable::with(header))
         }
-        ApprovalRequest::McpElicitation {
-            thread_label,
-            server_name,
-            message,
-            ..
-        } => {
+        ApprovalRequest::McpElicitation(request) => {
             let mut lines = Vec::new();
-            if let Some(thread_label) = thread_label {
+            if let Some(thread_label) = &request.thread_label {
                 lines.push(Line::from(vec![
                     "Thread: ".into(),
                     thread_label.clone().bold(),
@@ -789,9 +776,9 @@ fn build_header(request: &ApprovalRequest) -> Box<dyn Renderable> {
                 lines.push(Line::from(""));
             }
             lines.extend([
-                Line::from(vec!["Server: ".into(), server_name.clone().bold()]),
+                Line::from(vec!["Server: ".into(), request.server_name.clone().bold()]),
                 Line::from(""),
-                Line::from(message.clone()),
+                Line::from(request.message.clone()),
             ]);
             let header = Paragraph::new(lines).wrap(Wrap { trim: false });
             Box::new(header)
@@ -1000,7 +987,7 @@ fn format_file_system_entry_paths<'a>(
 ) -> String {
     entries
         .map(|entry| match &entry.path {
-            FileSystemPath::Path { path } => format!("`{}`", path.display()),
+            FileSystemPath::Path { path } => format!("`{path}`"),
             FileSystemPath::GlobPattern { pattern } => format!("glob `{pattern}`"),
             FileSystemPath::Special { value } => format!("`{}`", special_path_label(value)),
         })
@@ -1019,9 +1006,9 @@ fn special_path_label(value: &FileSystemSpecialPath) -> String {
     }
 }
 
-fn path_label(base: &str, subpath: &Option<PathBuf>) -> String {
+fn path_label(base: &str, subpath: &Option<LegacyAppPathString>) -> String {
     match subpath {
-        Some(subpath) => format!("{base}/{}", subpath.display()),
+        Some(subpath) => format!("{base}/{subpath}"),
         None => base.to_string(),
     }
 }
@@ -1125,11 +1112,15 @@ fn elicitation_options(keymap: &ApprovalKeymap) -> Vec<ApprovalOption> {
 mod tests {
     use super::*;
     use crate::app_event::AppEvent;
+    use crate::keymap::RuntimeKeymap;
     use codex_app_server_protocol::AdditionalFileSystemPermissions;
     use codex_app_server_protocol::AdditionalNetworkPermissions;
     use codex_app_server_protocol::ExecPolicyAmendment;
     use codex_app_server_protocol::NetworkApprovalProtocol;
     use codex_app_server_protocol::NetworkPolicyAmendment;
+    use codex_config::types::KeybindingSpec;
+    use codex_config::types::KeybindingsSpec;
+    use codex_config::types::TuiKeymap;
     use codex_protocol::models::FileSystemPermissions;
     use codex_protocol::models::NetworkPermissions;
     use codex_utils_absolute_path::AbsolutePathBuf;
@@ -1216,10 +1207,11 @@ mod tests {
     }
 
     fn make_exec_request() -> ApprovalRequest {
-        ApprovalRequest::Exec {
+        ApprovalRequest::Exec(ExecApprovalRequest {
             thread_id: ThreadId::new(),
             thread_label: None,
             id: "test".to_string(),
+            environment_id: None,
             command: vec!["echo".to_string(), "hi".to_string()],
             reason: Some("reason".to_string()),
             available_decisions: vec![
@@ -1228,11 +1220,11 @@ mod tests {
             ],
             network_approval_context: None,
             additional_permissions: None,
-        }
+        })
     }
 
     fn make_permissions_request() -> ApprovalRequest {
-        ApprovalRequest::Permissions {
+        ApprovalRequest::Permissions(PermissionsApprovalRequest {
             thread_id: ThreadId::new(),
             thread_label: None,
             call_id: "test".to_string(),
@@ -1247,16 +1239,68 @@ mod tests {
                     Some(vec![absolute_path("/tmp/out.txt")]),
                 )),
             },
-        }
+        })
     }
 
     fn make_elicitation_request() -> ApprovalRequest {
-        ApprovalRequest::McpElicitation {
+        ApprovalRequest::McpElicitation(McpElicitationApprovalRequest {
             thread_id: ThreadId::new(),
             thread_label: None,
             server_name: "test-server".to_string(),
             request_id: RequestId::String("request-1".to_string()),
             message: "Need more information".to_string(),
+        })
+    }
+
+    #[test]
+    fn approval_shortcuts_display_chords_in_configured_order() {
+        let chord = crate::key_hint::ShortcutHint::Chord {
+            prefix: key_hint::ctrl(KeyCode::Char('x')),
+            completion: key_hint::plain(KeyCode::Char('y')),
+        };
+        let single = crate::key_hint::ShortcutHint::Single(key_hint::plain(KeyCode::Char('y')));
+        let binding = |spec: &str| KeybindingSpec(spec.to_string());
+        for (specs, expected_shortcut) in [
+            (KeybindingsSpec::One(binding("ctrl-x y")), chord),
+            (
+                KeybindingsSpec::Many(vec![binding("y"), binding("ctrl-x y")]),
+                single,
+            ),
+            (
+                KeybindingsSpec::Many(vec![binding("ctrl-x y"), binding("y")]),
+                chord,
+            ),
+        ] {
+            let mut config = TuiKeymap::default();
+            config.approval.approve = Some(specs);
+            let keymap = RuntimeKeymap::from_config(&config).expect("valid approval keymap");
+            let request = make_exec_request();
+            let (_, params) = ApprovalOverlay::build_options(
+                &request,
+                build_header(&request),
+                &Features::with_defaults(),
+                &keymap.approval,
+                &keymap.list,
+            );
+            let approval = params
+                .items
+                .iter()
+                .find(|item| item.name == "Yes, proceed")
+                .expect("approval selection");
+
+            assert_eq!(approval.display_shortcut, Some(expected_shortcut));
+            if matches!(
+                expected_shortcut,
+                crate::key_hint::ShortcutHint::Chord { .. }
+            ) {
+                let dispatch_token = keymap.approval.approve.last().expect("chord token");
+                assert_eq!(
+                    keymap
+                        .approval
+                        .hint_for_bindings(std::slice::from_ref(dispatch_token)),
+                    Some(expected_shortcut)
+                );
+            }
         }
     }
 
@@ -1356,10 +1400,11 @@ mod tests {
         let (tx, mut rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx);
         let mut view = make_overlay(
-            ApprovalRequest::Exec {
+            ApprovalRequest::Exec(ExecApprovalRequest {
                 thread_id: ThreadId::new(),
                 thread_label: None,
                 id: "test".to_string(),
+                environment_id: None,
                 command: vec!["echo".to_string(), "hi".to_string()],
                 reason: None,
                 available_decisions: vec![
@@ -1368,7 +1413,7 @@ mod tests {
                 ],
                 network_approval_context: None,
                 additional_permissions: None,
-            },
+            }),
             tx,
             Features::with_defaults(),
         );
@@ -1399,10 +1444,11 @@ mod tests {
             action: NetworkPolicyRuleAction::Deny,
         };
         let mut view = make_overlay(
-            ApprovalRequest::Exec {
+            ApprovalRequest::Exec(ExecApprovalRequest {
                 thread_id: ThreadId::new(),
                 thread_label: None,
                 id: "test".to_string(),
+                environment_id: None,
                 command: vec!["curl".to_string(), "https://example.com".to_string()],
                 reason: None,
                 available_decisions: vec![
@@ -1416,7 +1462,7 @@ mod tests {
                     protocol: NetworkApprovalProtocol::Https,
                 }),
                 additional_permissions: None,
-            },
+            }),
             tx,
             Features::with_defaults(),
         );
@@ -1473,10 +1519,11 @@ mod tests {
         let tx = AppEventSender::new(tx);
         let thread_id = ThreadId::new();
         let mut view = make_overlay(
-            ApprovalRequest::Exec {
+            ApprovalRequest::Exec(ExecApprovalRequest {
                 thread_id,
                 thread_label: Some("Robie [explorer]".to_string()),
                 id: "test".to_string(),
+                environment_id: None,
                 command: vec!["echo".to_string(), "hi".to_string()],
                 reason: None,
                 available_decisions: vec![
@@ -1485,7 +1532,7 @@ mod tests {
                 ],
                 network_approval_context: None,
                 additional_permissions: None,
-            },
+            }),
             tx,
             Features::with_defaults(),
         );
@@ -1507,10 +1554,11 @@ mod tests {
         let mut keymap = crate::keymap::RuntimeKeymap::defaults();
         keymap.approval.open_thread = vec![key_hint::plain(KeyCode::Char('x'))];
         let mut view = make_overlay_with_keymap(
-            ApprovalRequest::Exec {
+            ApprovalRequest::Exec(ExecApprovalRequest {
                 thread_id,
                 thread_label: Some("Robie [explorer]".to_string()),
                 id: "test".to_string(),
+                environment_id: None,
                 command: vec!["echo".to_string(), "hi".to_string()],
                 reason: None,
                 available_decisions: vec![
@@ -1519,7 +1567,7 @@ mod tests {
                 ],
                 network_approval_context: None,
                 additional_permissions: None,
-            },
+            }),
             tx,
             Features::with_defaults(),
             keymap.approval,
@@ -1545,10 +1593,11 @@ mod tests {
         let (tx, _rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx);
         let view = make_overlay(
-            ApprovalRequest::Exec {
+            ApprovalRequest::Exec(ExecApprovalRequest {
                 thread_id: ThreadId::new(),
                 thread_label: Some("Robie [explorer]".to_string()),
                 id: "test".to_string(),
+                environment_id: None,
                 command: vec!["echo".to_string(), "hi".to_string()],
                 reason: None,
                 available_decisions: vec![
@@ -1557,7 +1606,7 @@ mod tests {
                 ],
                 network_approval_context: None,
                 additional_permissions: None,
-            },
+            }),
             tx,
             Features::with_defaults(),
         );
@@ -1573,10 +1622,11 @@ mod tests {
         let (tx, mut rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx);
         let mut view = make_overlay(
-            ApprovalRequest::Exec {
+            ApprovalRequest::Exec(ExecApprovalRequest {
                 thread_id: ThreadId::new(),
                 thread_label: None,
                 id: "test".to_string(),
+                environment_id: None,
                 command: vec!["echo".to_string()],
                 reason: None,
                 available_decisions: vec![
@@ -1590,7 +1640,7 @@ mod tests {
                 ],
                 network_approval_context: None,
                 additional_permissions: None,
-            },
+            }),
             tx,
             Features::with_defaults(),
         );
@@ -1625,10 +1675,11 @@ mod tests {
         let (tx, mut rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx);
         let mut view = make_overlay(
-            ApprovalRequest::Exec {
+            ApprovalRequest::Exec(ExecApprovalRequest {
                 thread_id: ThreadId::new(),
                 thread_label: None,
                 id: "test".to_string(),
+                environment_id: None,
                 command: vec!["curl".to_string(), "https://example.com".to_string()],
                 reason: None,
                 available_decisions: vec![
@@ -1647,7 +1698,7 @@ mod tests {
                     protocol: NetworkApprovalProtocol::Https,
                 }),
                 additional_permissions: None,
-            },
+            }),
             tx,
             Features::with_defaults(),
         );
@@ -1664,10 +1715,11 @@ mod tests {
         let (tx, _rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx);
         let command = vec!["echo".into(), "hello".into(), "world".into()];
-        let exec_request = ApprovalRequest::Exec {
+        let exec_request = ApprovalRequest::Exec(ExecApprovalRequest {
             thread_id: ThreadId::new(),
             thread_label: None,
             id: "test".into(),
+            environment_id: None,
             command,
             reason: None,
             available_decisions: vec![
@@ -1676,7 +1728,7 @@ mod tests {
             ],
             network_approval_context: None,
             additional_permissions: None,
-        };
+        });
 
         let view = make_overlay(exec_request, tx, Features::with_defaults());
         let mut buf = Buffer::empty(Rect::new(0, 0, 80, view.desired_height(/*width*/ 80)));
@@ -1853,7 +1905,9 @@ mod tests {
                 entries: Some(vec![FileSystemSandboxEntry {
                     path: FileSystemPath::Special {
                         value: FileSystemSpecialPath::ProjectRoots {
-                            subpath: Some(".git".into()),
+                            subpath: Some(LegacyAppPathString::from_path(std::path::Path::new(
+                                ".git",
+                            ))),
                         },
                     },
                     access: FileSystemAccessMode::Read,
@@ -1962,10 +2016,11 @@ mod tests {
     fn additional_permissions_prompt_shows_permission_rule_line() {
         let (tx, _rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx);
-        let exec_request = ApprovalRequest::Exec {
+        let exec_request = ApprovalRequest::Exec(ExecApprovalRequest {
             thread_id: ThreadId::new(),
             thread_label: None,
             id: "test".into(),
+            environment_id: None,
             command: vec!["cat".into(), "/tmp/readme.txt".into()],
             reason: None,
             available_decisions: vec![
@@ -1985,7 +2040,7 @@ mod tests {
                     .into(),
                 ),
             }),
-        };
+        });
 
         let view = make_overlay(exec_request, tx, Features::with_defaults());
         let mut buf = Buffer::empty(Rect::new(0, 0, 100, view.desired_height(/*width*/ 100)));
@@ -2018,10 +2073,11 @@ mod tests {
     fn additional_permissions_prompt_snapshot() {
         let (tx, _rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx);
-        let exec_request = ApprovalRequest::Exec {
+        let exec_request = ApprovalRequest::Exec(ExecApprovalRequest {
             thread_id: ThreadId::new(),
             thread_label: None,
             id: "test".into(),
+            environment_id: None,
             command: vec!["cat".into(), "/tmp/readme.txt".into()],
             reason: Some("need filesystem access".into()),
             available_decisions: vec![
@@ -2041,7 +2097,7 @@ mod tests {
                     .into(),
                 ),
             }),
-        };
+        });
 
         let view = make_overlay(exec_request, tx, Features::with_defaults());
         assert_snapshot!(
@@ -2072,14 +2128,14 @@ mod tests {
                 content: "one\ntwo\nthree\n".to_string(),
             },
         );
-        let request = ApprovalRequest::ApplyPatch {
+        let request = ApprovalRequest::ApplyPatch(ApplyPatchApprovalRequest {
             thread_id: ThreadId::new(),
             thread_label: Some("Banach [worker]".to_string()),
             id: "test".to_string(),
             reason: None,
             cwd: absolute_path("/tmp"),
             changes,
-        };
+        });
         let keymap = crate::keymap::RuntimeKeymap::defaults();
         let view = ApprovalOverlay::new(
             request,
@@ -2098,10 +2154,11 @@ mod tests {
     fn network_exec_prompt_title_includes_host() {
         let (tx, _rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx);
-        let exec_request = ApprovalRequest::Exec {
+        let exec_request = ApprovalRequest::Exec(ExecApprovalRequest {
             thread_id: ThreadId::new(),
             thread_label: None,
             id: "test".into(),
+            environment_id: None,
             command: vec!["curl".into(), "https://example.com".into()],
             reason: Some("network request blocked".into()),
             available_decisions: vec![
@@ -2120,7 +2177,7 @@ mod tests {
                 protocol: NetworkApprovalProtocol::Https,
             }),
             additional_permissions: None,
-        };
+        });
 
         let view = make_overlay(exec_request, tx, Features::with_defaults());
         let mut buf = Buffer::empty(Rect::new(0, 0, 100, view.desired_height(/*width*/ 100)));
@@ -2234,10 +2291,11 @@ mod tests {
         let (tx_raw, mut rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx_raw);
         let mut view = make_overlay(
-            ApprovalRequest::Exec {
+            ApprovalRequest::Exec(ExecApprovalRequest {
                 thread_id: ThreadId::new(),
                 thread_label: None,
                 id: "test".into(),
+                environment_id: None,
                 command: vec![
                     "network-access".to_string(),
                     "https://example.com:8443".to_string(),
@@ -2249,7 +2307,7 @@ mod tests {
                 ],
                 network_approval_context: None,
                 additional_permissions: None,
-            },
+            }),
             tx,
             Features::with_defaults(),
         );

@@ -46,7 +46,7 @@ fn function_payloads_remain_function_outputs() {
 }
 
 #[test]
-fn mcp_code_mode_result_serializes_full_call_tool_result() {
+fn mcp_code_mode_result_omits_private_metadata() {
     let output = CallToolResult {
         content: vec![serde_json::json!({
             "type": "text",
@@ -78,11 +78,9 @@ fn mcp_code_mode_result_serializes_full_call_tool_result() {
                 "content": "done",
             },
             "isError": false,
-            "_meta": {
-                "source": "mcp",
-            },
         })
     );
+    assert_eq!(output.meta, Some(serde_json::json!({ "source": "mcp" })));
 }
 
 #[test]
@@ -232,7 +230,7 @@ fn mcp_tool_output_response_item_preserves_content_items() {
 }
 
 #[test]
-fn mcp_tool_output_code_mode_result_stays_raw_call_tool_result() {
+fn mcp_tool_output_code_mode_result_preserves_content_without_private_metadata() {
     let large_content = "large structured value ".repeat(1_000);
     let output = McpToolOutput {
         result: CallToolResult {
@@ -244,7 +242,9 @@ fn mcp_tool_output_code_mode_result_stays_raw_call_tool_result() {
                 "content": large_content,
             })),
             is_error: Some(false),
-            meta: None,
+            meta: Some(serde_json::json!({
+                "hive_dispatch_id": "private-dispatch-id",
+            })),
         },
         tool_input: json!({}),
         wall_time: std::time::Duration::from_millis(1250),
@@ -268,6 +268,10 @@ fn mcp_tool_output_code_mode_result_stays_raw_call_tool_result() {
             },
             "isError": false,
         })
+    );
+    assert_eq!(
+        output.result.meta,
+        Some(serde_json::json!({ "hive_dispatch_id": "private-dispatch-id" }))
     );
 }
 
@@ -434,6 +438,7 @@ fn exec_command_tool_output_formats_truncated_response() {
         process_id: None,
         exit_code: Some(0),
         original_token_count: Some(10),
+        output_omitted_bytes: None,
         hook_command: None,
     }
     .to_response_item("call-42", &payload);
@@ -460,4 +465,43 @@ fn exec_command_tool_output_formats_truncated_response() {
         }
         other => panic!("expected FunctionCallOutput, got {other:?}"),
     }
+}
+
+#[test]
+fn exec_command_tool_output_preserves_omission_metadata_when_truncated() {
+    let payload = ToolPayload::Function {
+        arguments: "{}".to_string(),
+    };
+    let marker = format_output_omission_marker(/*omitted_bytes*/ 123_456);
+    let raw_output = format!(
+        "HEAD-{}\n{marker}\nTAIL-{}",
+        "a".repeat(/*n*/ 100),
+        "z".repeat(/*n*/ 100)
+    )
+    .into_bytes();
+    let response = ExecCommandToolOutput {
+        event_call_id: "call-omitted".to_string(),
+        chunk_id: "abc123".to_string(),
+        wall_time: std::time::Duration::from_millis(/*millis*/ 1250),
+        raw_output,
+        truncation_policy: TruncationPolicy::Tokens(10_000),
+        max_output_tokens: Some(4),
+        process_id: None,
+        exit_code: Some(0),
+        original_token_count: Some(42_000),
+        output_omitted_bytes: NonZeroUsize::new(/*n*/ 123_456),
+        hook_command: None,
+    }
+    .to_response_item("call-omitted", &payload);
+
+    let ResponseInputItem::FunctionCallOutput { output, .. } = response else {
+        panic!("expected FunctionCallOutput");
+    };
+    let text = output
+        .body
+        .to_text()
+        .expect("exec output should serialize as text");
+    assert!(text.contains("Original token count: 42000"));
+    assert!(text.contains("Warning: truncated output (original token count: 42000)"));
+    assert_eq!(text.matches(&marker).count(), 1);
 }
