@@ -949,6 +949,14 @@ fn any_environment_allows_login_shell(environments: &TurnEnvironmentSnapshot) ->
         .any(|environment| environment.config.allow_login_shell)
 }
 
+/// Tool names local models commonly emit for shell execution.
+///
+/// Upstream exposes the shell tool as `shell_command`, but models served over the
+/// Chat Completions/Ollama path (e.g. qwen3-coder) routinely call it `exec` or the
+/// older `shell`. These are registered as hidden aliases so such calls dispatch to
+/// the shell handler instead of failing with "unsupported call".
+const LOCAL_MODEL_SHELL_ALIASES: [&str; 2] = ["exec", "shell"];
+
 #[instrument(level = "trace", skip_all)]
 fn add_shell_tools(context: &CoreToolPlanContext<'_>, registry: &mut ToolRegistry) {
     let turn_context = context.turn_context;
@@ -988,15 +996,19 @@ fn add_shell_tools(context: &CoreToolPlanContext<'_>, registry: &mut ToolRegistr
                     ShellCommandHandler::new(shell_command_options),
                     ToolExposure::Hidden,
                 );
-                // Register a hidden alias so local models that emit `exec` as
-                // the tool name (e.g. qwen3-coder via the Chat
+                // Register hidden aliases so local models that emit a
+                // different tool name (e.g. qwen3-coder via the Chat
                 // Completions/Ollama path) are routed to the shell execution
-                // path instead of producing an "unsupported call: exec"
-                // error.
-                registry.add_with_exposure(
-                    ShellCommandHandler::new_alias(shell_command_options, ToolName::plain("exec")),
-                    ToolExposure::Hidden,
-                );
+                // path instead of producing an "unsupported call" error.
+                for alias in LOCAL_MODEL_SHELL_ALIASES {
+                    registry.add_with_exposure(
+                        ShellCommandHandler::new_alias(
+                            shell_command_options,
+                            ToolName::plain(alias),
+                        ),
+                        ToolExposure::Hidden,
+                    );
+                }
             }
         }
         ConfigShellToolType::Disabled => {}
@@ -1005,12 +1017,17 @@ fn add_shell_tools(context: &CoreToolPlanContext<'_>, registry: &mut ToolRegistr
         | ConfigShellToolType::ShellCommand => {
             if supports_shell_command {
                 registry.add(ShellCommandHandler::new(shell_command_options));
-                // Same hidden alias for local models on the default shell
+                // Same hidden aliases for local models on the default shell
                 // path.
-                registry.add_with_exposure(
-                    ShellCommandHandler::new_alias(shell_command_options, ToolName::plain("exec")),
-                    ToolExposure::Hidden,
-                );
+                for alias in LOCAL_MODEL_SHELL_ALIASES {
+                    registry.add_with_exposure(
+                        ShellCommandHandler::new_alias(
+                            shell_command_options,
+                            ToolName::plain(alias),
+                        ),
+                        ToolExposure::Hidden,
+                    );
+                }
             }
         }
     }

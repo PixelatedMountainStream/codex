@@ -396,3 +396,16 @@ fn exec_alias_matches_function_payload() {
         "exec alias must accept Function payloads"
     );
 }
+
+#[test]
+fn shell_alias_tool_name_is_shell() {
+    // Upstream renamed the shell tool to `shell_command`; local models served over
+    // the Chat Completions path still emit the older `shell`, so it must alias too.
+    let options = ShellCommandHandlerOptions {
+        backend_config: ShellCommandBackendConfig::Classic,
+        allow_login_shell: false,
+        exec_permission_approvals_enabled: false,
+    };
+    let alias = ShellCommandHandler::new_alias(options, ToolName::plain("shell"));
+    assert_eq!(alias.tool_name(), ToolName::plain("shell"));
+}
