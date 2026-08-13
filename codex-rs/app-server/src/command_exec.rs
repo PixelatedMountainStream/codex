@@ -237,6 +237,10 @@ impl CommandExecManager {
             arg0,
             ..
         } = exec_request;
+        // TODO(anp): Keep PathUri through the local command launch boundary.
+        let cwd = cwd
+            .to_abs_path()
+            .map_err(|err| invalid_request(format!("invalid command cwd: {err}")))?;
 
         let stream_stdin = tty || stream_stdin;
         let stream_stdout_stderr = tty || stream_stdout_stderr;
@@ -271,13 +275,22 @@ impl CommandExecManager {
                 &env,
                 &arg0,
                 size.unwrap_or_default(),
+                &[],
             )
             .await
         } else if stream_stdin {
-            codex_utils_pty::spawn_pipe_process(program, args, cwd.as_path(), &env, &arg0).await
-        } else {
-            codex_utils_pty::spawn_pipe_process_no_stdin(program, args, cwd.as_path(), &env, &arg0)
+            codex_utils_pty::spawn_pipe_process(program, args, cwd.as_path(), &env, &arg0, &[])
                 .await
+        } else {
+            codex_utils_pty::spawn_pipe_process_no_stdin(
+                program,
+                args,
+                cwd.as_path(),
+                &env,
+                &arg0,
+                &[],
+            )
+            .await
         };
         let spawned = match spawned {
             Ok(spawned) => spawned,
@@ -700,6 +713,7 @@ mod tests {
             cwd.clone(),
             HashMap::new(),
             /*network*/ None,
+            /*network_environment_id*/ None,
             ExecExpiration::DefaultTimeout,
             codex_core::exec::ExecCapturePolicy::ShellTool,
             SandboxType::WindowsRestrictedToken,
@@ -817,6 +831,7 @@ mod tests {
                     cwd.clone(),
                     HashMap::new(),
                     /*network*/ None,
+                    /*network_environment_id*/ None,
                     ExecExpiration::Cancellation(CancellationToken::new()),
                     codex_core::exec::ExecCapturePolicy::ShellTool,
                     SandboxType::None,
@@ -870,8 +885,11 @@ mod tests {
             panic!("expected execution response after termination");
         };
         assert_eq!(response.id, request_id.request_id);
-        let response: CommandExecResponse =
-            serde_json::from_value(response.result).expect("deserialize command/exec response");
+        let codex_app_server_protocol::ClientResponsePayload::OneOffCommandExec(response) =
+            *response.result
+        else {
+            panic!("expected command/exec response");
+        };
         assert_ne!(response.exit_code, 0);
         assert_eq!(response.stdout, "");
         // The deferred response now drains any already-emitted stderr before
@@ -904,6 +922,7 @@ mod tests {
                     cwd.clone(),
                     HashMap::new(),
                     /*network*/ None,
+                    /*network_environment_id*/ None,
                     ExecExpiration::TimeoutOrCancellation {
                         timeout: Duration::from_secs(30),
                         cancellation,
@@ -945,8 +964,11 @@ mod tests {
             panic!("expected execution response after cancellation");
         };
         assert_eq!(response.id, request_id.request_id);
-        let response: CommandExecResponse =
-            serde_json::from_value(response.result).expect("deserialize command/exec response");
+        let codex_app_server_protocol::ClientResponsePayload::OneOffCommandExec(response) =
+            *response.result
+        else {
+            panic!("expected command/exec response");
+        };
         assert_ne!(response.exit_code, EXEC_TIMEOUT_EXIT_CODE);
     }
 

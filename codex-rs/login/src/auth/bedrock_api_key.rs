@@ -6,7 +6,8 @@ use serde::Serialize;
 
 use super::manager::save_auth;
 use super::storage::AuthDotJson;
-use codex_app_server_protocol::AuthMode;
+use super::storage::AuthKeyringBackendKind;
+use codex_protocol::auth::AuthMode;
 
 /// Managed Amazon Bedrock API key persisted in `auth.json`.
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
@@ -21,6 +22,7 @@ pub fn login_with_bedrock_api_key(
     api_key: &str,
     region: &str,
     auth_credentials_store_mode: AuthCredentialsStoreMode,
+    keyring_backend_kind: AuthKeyringBackendKind,
 ) -> std::io::Result<()> {
     let auth_dot_json = AuthDotJson {
         auth_mode: Some(AuthMode::BedrockApiKey),
@@ -34,7 +36,12 @@ pub fn login_with_bedrock_api_key(
             region: region.to_string(),
         }),
     };
-    save_auth(codex_home, &auth_dot_json, auth_credentials_store_mode)
+    save_auth(
+        codex_home,
+        &auth_dot_json,
+        auth_credentials_store_mode,
+        keyring_backend_kind,
+    )
 }
 
 #[cfg(test)]

@@ -1,3 +1,6 @@
+use std::collections::BTreeMap;
+use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -6,9 +9,18 @@ use app_test_support::ChatGptAuthFixture;
 use app_test_support::TestAppServer;
 use app_test_support::to_response;
 use app_test_support::write_chatgpt_auth;
+use chrono::Duration as ChronoDuration;
+use chrono::Utc;
+use codex_app_server_protocol::HookMetadata;
+use codex_app_server_protocol::HookTrustStatus;
+use codex_app_server_protocol::HooksListParams;
+use codex_app_server_protocol::HooksListResponse;
 use codex_app_server_protocol::JSONRPCResponse;
+use codex_app_server_protocol::LoginAccountResponse;
 use codex_app_server_protocol::PluginAuthPolicy;
+use codex_app_server_protocol::PluginDisabledReason;
 use codex_app_server_protocol::PluginInstallPolicy;
+use codex_app_server_protocol::PluginInstallPolicySource;
 use codex_app_server_protocol::PluginInstalledParams;
 use codex_app_server_protocol::PluginInstalledResponse;
 use codex_app_server_protocol::PluginListMarketplaceKind;
@@ -21,12 +33,15 @@ use codex_app_server_protocol::PluginSummary;
 use codex_app_server_protocol::RequestId;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_core::config::set_project_trust_level;
+use codex_login::AuthKeyringBackendKind;
+use codex_login::login_with_api_key;
 use codex_protocol::config_types::TrustLevel;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
+use tokio::time::sleep;
 use tokio::time::timeout;
 use wiremock::Mock;
 use wiremock::MockServer;
@@ -35,6 +50,7 @@ use wiremock::matchers::header;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
 use wiremock::matchers::query_param;
+use wiremock::matchers::query_param_is_missing;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const TEST_CURATED_PLUGIN_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -42,6 +58,9 @@ const TEST_ALLOW_HTTP_REMOTE_PLUGIN_BUNDLE_DOWNLOADS: &str =
     "CODEX_TEST_ALLOW_HTTP_REMOTE_PLUGIN_BUNDLE_DOWNLOADS";
 const ALTERNATE_MARKETPLACE_RELATIVE_PATH: &str = ".claude-plugin/marketplace.json";
 const ALTERNATE_PLUGIN_MANIFEST_RELATIVE_PATH: &str = ".claude-plugin/plugin.json";
+type RemoteInstalledPluginFixtures = BTreeMap<String, BTreeMap<String, Vec<serde_json::Value>>>;
+static REMOTE_INSTALLED_PLUGIN_FIXTURES: OnceLock<Mutex<RemoteInstalledPluginFixtures>> =
+    OnceLock::new();
 
 fn write_plugins_enabled_config(codex_home: &std::path::Path) -> std::io::Result<()> {
     std::fs::write(
@@ -68,6 +87,23 @@ plugins = true
     )
 }
 
+fn write_remote_plugins_disabled_config_with_base_url(
+    codex_home: &std::path::Path,
+    base_url: &str,
+) -> std::io::Result<()> {
+    std::fs::write(
+        codex_home.join("config.toml"),
+        format!(
+            r#"chatgpt_base_url = "{base_url}"
+
+[features]
+plugins = true
+remote_plugin = false
+"#,
+        ),
+    )
+}
+
 #[tokio::test]
 async fn plugin_list_skips_invalid_marketplace_file_and_reports_error() -> Result<()> {
     let codex_home = TempDir::new()?;
@@ -80,29 +116,25 @@ async fn plugin_list_skips_invalid_marketplace_file_and_reports_error() -> Resul
     std::fs::write(marketplace_path.as_path(), "{not json")?;
 
     let home = codex_home.path().to_string_lossy().into_owned();
-    let mut mcp = TestAppServer::new_with_env(
-        codex_home.path(),
-        &[
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .with_env_overrides(&[
             ("HOME", Some(home.as_str())),
             ("USERPROFILE", Some(home.as_str())),
-        ],
-    )
-    .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+        ])
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
 
     let request_id = mcp
         .send_plugin_list_request(PluginListParams {
             cwds: Some(vec![AbsolutePathBuf::try_from(repo_root.path())?]),
             marketplace_kinds: None,
+            force_refetch: false,
         })
         .await?;
 
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let response: PluginListResponse = to_response(response)?;
+    let response: PluginListResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
 
     assert!(
         response
@@ -145,8 +177,10 @@ enabled = true
 "#,
     )?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
 
     let request_id = mcp
         .send_plugin_installed_request(PluginInstalledParams {
@@ -155,12 +189,8 @@ enabled = true
         })
         .await?;
 
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let response: PluginInstalledResponse = to_response(response)?;
+    let response: PluginInstalledResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
 
     assert_eq!(response.marketplaces.len(), 1);
     assert_eq!(response.marketplaces[0].name, "openai-curated");
@@ -176,6 +206,12 @@ enabled = true
         ]
     );
     assert_eq!(response.marketplace_load_errors, Vec::new());
+    assert!(
+        response.marketplaces[0]
+            .plugins
+            .iter()
+            .all(|plugin| plugin.install_policy_source.is_none())
+    );
     Ok(())
 }
 
@@ -194,7 +230,6 @@ async fn plugin_installed_prefers_remote_curated_conflicts_when_remote_plugin_en
 
 [features]
 plugins = true
-remote_plugin = true
 plugin_sharing = false
 
 [plugins."linear@openai-curated"]
@@ -217,6 +252,8 @@ enabled = true
     let mut global_installed_body: serde_json::Value = serde_json::from_str(
         &remote_installed_plugin_body("", "1.2.3", /*enabled*/ true),
     )?;
+    global_installed_body["plugins"][0]["must_show_installation_interstitial"] =
+        serde_json::json!(false);
     let mut remote_only = global_installed_body["plugins"][0].clone();
     remote_only["id"] = serde_json::json!("plugins~Plugin_11111111111111111111111111111111");
     remote_only["name"] = serde_json::json!("remote-only");
@@ -229,9 +266,12 @@ enabled = true
     mount_remote_installed_plugins(&server, "GLOBAL", &global_installed_body).await;
     mount_remote_installed_plugins(&server, "WORKSPACE", empty_remote_installed_plugins_body())
         .await;
+    mount_empty_user_installed_plugins(&server).await;
 
-    let mut app_server = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_TIMEOUT, app_server.initialize()).await??;
+    let mut app_server = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
 
     let request_id = app_server
         .send_plugin_installed_request(PluginInstalledParams {
@@ -240,12 +280,8 @@ enabled = true
         })
         .await?;
 
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        app_server.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let response: PluginInstalledResponse = to_response(response)?;
+    let response: PluginInstalledResponse =
+        timeout(DEFAULT_TIMEOUT, app_server.read_response(request_id)).await??;
 
     let local_marketplace = response
         .marketplaces
@@ -269,12 +305,125 @@ enabled = true
         remote_marketplace
             .plugins
             .iter()
-            .map(|plugin| plugin.id.clone())
+            .map(|plugin| {
+                (
+                    plugin.id.clone(),
+                    plugin.install_policy_source,
+                    plugin.must_show_installation_interstitial,
+                )
+            })
             .collect::<Vec<_>>(),
         vec![
-            "linear@openai-curated-remote".to_string(),
-            "remote-only@openai-curated-remote".to_string(),
+            (
+                "linear@openai-curated-remote".to_string(),
+                Some(PluginInstallPolicySource::WorkspaceSetting),
+                Some(false),
+            ),
+            (
+                "remote-only@openai-curated-remote".to_string(),
+                Some(PluginInstallPolicySource::WorkspaceSetting),
+                Some(false),
+            ),
         ]
+    );
+    assert_eq!(response.marketplace_load_errors, Vec::new());
+    Ok(())
+}
+
+#[tokio::test]
+async fn plugin_installed_prefers_api_curated_conflicts_after_switching_to_api_auth() -> Result<()>
+{
+    let codex_home = TempDir::new()?;
+    let server = MockServer::start().await;
+    write_openai_api_curated_marketplace(codex_home.path(), &["linear"])?;
+    write_installed_plugin(&codex_home, "openai-api-curated", "linear")?;
+    let config = format!(
+        r#"chatgpt_base_url = "{}/backend-api/"
+
+[features]
+plugins = true
+plugin_sharing = false
+
+[plugins."linear@openai-api-curated"]
+enabled = true
+"#,
+        server.uri()
+    );
+    std::fs::write(codex_home.path().join("config.toml"), &config)?;
+    write_chatgpt_auth(
+        codex_home.path(),
+        ChatGptAuthFixture::new("chatgpt-token")
+            .account_id("account-123")
+            .chatgpt_user_id("user-123")
+            .chatgpt_account_id("account-123"),
+        AuthCredentialsStoreMode::File,
+    )?;
+    mount_remote_installed_plugins(
+        &server,
+        "GLOBAL",
+        &remote_installed_plugin_body("", "1.2.3", /*enabled*/ true),
+    )
+    .await;
+    mount_remote_installed_plugins(&server, "WORKSPACE", empty_remote_installed_plugins_body())
+        .await;
+    mount_empty_user_installed_plugins(&server).await;
+
+    let mut app_server = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
+
+    let request_id = app_server
+        .send_plugin_installed_request(PluginInstalledParams {
+            cwds: None,
+            install_suggestion_plugin_names: None,
+        })
+        .await?;
+    let response: PluginInstalledResponse =
+        timeout(DEFAULT_TIMEOUT, app_server.read_response(request_id)).await??;
+    assert_eq!(
+        response
+            .marketplaces
+            .iter()
+            .flat_map(|marketplace| &marketplace.plugins)
+            .map(|plugin| plugin.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["linear@openai-curated-remote"]
+    );
+
+    // Keep the ChatGPT remote snapshot cached while changing auth to exercise endpoint-level
+    // filtering even when the account-change cache refresh cannot run.
+    std::fs::write(codex_home.path().join("config.toml"), "invalid config")?;
+    let request_id = app_server
+        .send_login_account_api_key_request("sk-test-key")
+        .await?;
+    let response: LoginAccountResponse =
+        timeout(DEFAULT_TIMEOUT, app_server.read_response(request_id)).await??;
+    assert_eq!(response, LoginAccountResponse::ApiKey {});
+    timeout(
+        DEFAULT_TIMEOUT,
+        app_server.read_stream_until_notification_message("account/updated"),
+    )
+    .await??;
+    std::fs::write(codex_home.path().join("config.toml"), config)?;
+
+    let request_id = app_server
+        .send_plugin_installed_request(PluginInstalledParams {
+            cwds: None,
+            install_suggestion_plugin_names: None,
+        })
+        .await?;
+    let response: PluginInstalledResponse =
+        timeout(DEFAULT_TIMEOUT, app_server.read_response(request_id)).await??;
+
+    assert_eq!(
+        response
+            .marketplaces
+            .iter()
+            .flat_map(|marketplace| &marketplace.plugins)
+            .map(|plugin| plugin.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["linear@openai-api-curated"]
     );
     assert_eq!(response.marketplace_load_errors, Vec::new());
     Ok(())
@@ -294,8 +443,10 @@ enabled = true
 "#,
     )?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
 
     let request_id = mcp
         .send_plugin_installed_request(PluginInstalledParams {
@@ -304,12 +455,8 @@ enabled = true
         })
         .await?;
 
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let response: PluginInstalledResponse = to_response(response)?;
+    let response: PluginInstalledResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
 
     assert_eq!(response.marketplaces, Vec::new());
     assert_eq!(response.marketplace_load_errors, Vec::new());
@@ -319,8 +466,10 @@ enabled = true
 #[tokio::test]
 async fn plugin_list_rejects_relative_cwds() -> Result<()> {
     let codex_home = TempDir::new()?;
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
 
     let request_id = mcp
         .send_raw_request(
@@ -396,15 +545,14 @@ async fn plugin_list_keeps_valid_marketplaces_when_another_marketplace_fails_to_
     std::fs::write(invalid_marketplace_path.as_path(), "{not json")?;
 
     let home = codex_home.path().to_string_lossy().into_owned();
-    let mut mcp = TestAppServer::new_with_env(
-        codex_home.path(),
-        &[
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .with_env_overrides(&[
             ("HOME", Some(home.as_str())),
             ("USERPROFILE", Some(home.as_str())),
-        ],
-    )
-    .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+        ])
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
 
     let request_id = mcp
         .send_plugin_list_request(PluginListParams {
@@ -413,15 +561,12 @@ async fn plugin_list_keeps_valid_marketplaces_when_another_marketplace_fails_to_
                 AbsolutePathBuf::try_from(invalid_repo_root.path())?,
             ]),
             marketplace_kinds: None,
+            force_refetch: false,
         })
         .await?;
 
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let response: PluginListResponse = to_response(response)?;
+    let response: PluginListResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
 
     assert_eq!(
         response.marketplaces,
@@ -432,6 +577,7 @@ async fn plugin_list_keeps_valid_marketplaces_when_another_marketplace_fails_to_
             plugins: vec![PluginSummary {
                 id: "valid-plugin@valid-marketplace".to_string(),
                 remote_plugin_id: None,
+                version: None,
                 local_version: None,
                 name: "valid-plugin".to_string(),
                 share_context: None,
@@ -439,10 +585,15 @@ async fn plugin_list_keeps_valid_marketplaces_when_another_marketplace_fails_to_
                     path: valid_plugin_path,
                 },
                 installed: false,
+                installed_at: None,
                 enabled: false,
                 install_policy: PluginInstallPolicy::Available,
+                install_policy_source: None,
+                must_show_installation_interstitial: None,
                 auth_policy: PluginAuthPolicy::OnInstall,
                 availability: codex_app_server_protocol::PluginAvailability::Available,
+                disabled_reason: None,
+                eligible_plan_types: None,
                 interface: None,
                 keywords: vec!["api-key".to_string(), "developer tools".to_string()],
             }],
@@ -513,29 +664,26 @@ async fn plugin_list_returns_empty_when_workspace_codex_plugins_disabled() -> Re
         .await;
 
     let home = codex_home.path().to_string_lossy().into_owned();
-    let mut mcp = TestAppServer::new_without_managed_config_with_env(
-        codex_home.path(),
-        &[
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_managed_config()
+        .with_env_overrides(&[
             ("HOME", Some(home.as_str())),
             ("USERPROFILE", Some(home.as_str())),
-        ],
-    )
-    .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+        ])
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
 
     let request_id = mcp
         .send_plugin_list_request(PluginListParams {
             cwds: Some(vec![AbsolutePathBuf::try_from(repo_root.path())?]),
             marketplace_kinds: None,
+            force_refetch: false,
         })
         .await?;
 
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let response: PluginListResponse = to_response(response)?;
+    let response: PluginListResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
 
     assert_eq!(
         response,
@@ -604,30 +752,27 @@ async fn plugin_list_reuses_cached_workspace_codex_plugins_setting() -> Result<(
         .await;
 
     let home = codex_home.path().to_string_lossy().into_owned();
-    let mut mcp = TestAppServer::new_without_managed_config_with_env(
-        codex_home.path(),
-        &[
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_managed_config()
+        .with_env_overrides(&[
             ("HOME", Some(home.as_str())),
             ("USERPROFILE", Some(home.as_str())),
-        ],
-    )
-    .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+        ])
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
 
     for _ in 0..2 {
         let request_id = mcp
             .send_plugin_list_request(PluginListParams {
                 cwds: Some(vec![AbsolutePathBuf::try_from(repo_root.path())?]),
                 marketplace_kinds: None,
+                force_refetch: false,
             })
             .await?;
 
-        let response: JSONRPCResponse = timeout(
-            DEFAULT_TIMEOUT,
-            mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-        )
-        .await??;
-        let response: PluginListResponse = to_response(response)?;
+        let response: PluginListResponse =
+            timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
         assert_eq!(response.marketplaces.len(), 1);
         assert_eq!(response.marketplaces[0].name, "local-marketplace");
     }
@@ -689,29 +834,25 @@ async fn plugin_list_uses_alternate_discoverable_manifest_and_keeps_undiscoverab
     )?;
 
     let home = codex_home.path().to_string_lossy().into_owned();
-    let mut mcp = TestAppServer::new_with_env(
-        codex_home.path(),
-        &[
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .with_env_overrides(&[
             ("HOME", Some(home.as_str())),
             ("USERPROFILE", Some(home.as_str())),
-        ],
-    )
-    .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+        ])
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
 
     let request_id = mcp
         .send_plugin_list_request(PluginListParams {
             cwds: Some(vec![AbsolutePathBuf::try_from(repo_root.path())?]),
             marketplace_kinds: None,
+            force_refetch: false,
         })
         .await?;
 
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let response: PluginListResponse = to_response(response)?;
+    let response: PluginListResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
 
     assert_eq!(
         response.marketplaces,
@@ -723,6 +864,7 @@ async fn plugin_list_uses_alternate_discoverable_manifest_and_keeps_undiscoverab
                 PluginSummary {
                     id: "valid-plugin@alternate-marketplace".to_string(),
                     remote_plugin_id: None,
+                    version: None,
                     local_version: None,
                     name: "valid-plugin".to_string(),
                     share_context: None,
@@ -730,10 +872,15 @@ async fn plugin_list_uses_alternate_discoverable_manifest_and_keeps_undiscoverab
                         path: valid_plugin_path,
                     },
                     installed: false,
+                    installed_at: None,
                     enabled: false,
                     install_policy: PluginInstallPolicy::Available,
+                    install_policy_source: None,
+                    must_show_installation_interstitial: None,
                     auth_policy: PluginAuthPolicy::OnInstall,
                     availability: codex_app_server_protocol::PluginAvailability::Available,
+                    disabled_reason: None,
+                    eligible_plan_types: None,
                     interface: Some(codex_app_server_protocol::PluginInterface {
                         display_name: Some("Valid Plugin".to_string()),
                         short_description: None,
@@ -749,7 +896,9 @@ async fn plugin_list_uses_alternate_discoverable_manifest_and_keeps_undiscoverab
                         composer_icon: None,
                         composer_icon_url: None,
                         logo: None,
+                        logo_dark: None,
                         logo_url: None,
+                        logo_url_dark: None,
                         screenshots: Vec::new(),
                         screenshot_urls: Vec::new(),
                     }),
@@ -758,6 +907,7 @@ async fn plugin_list_uses_alternate_discoverable_manifest_and_keeps_undiscoverab
                 PluginSummary {
                     id: "missing-plugin@alternate-marketplace".to_string(),
                     remote_plugin_id: None,
+                    version: None,
                     local_version: None,
                     name: "missing-plugin".to_string(),
                     share_context: None,
@@ -767,10 +917,15 @@ async fn plugin_list_uses_alternate_discoverable_manifest_and_keeps_undiscoverab
                         )?,
                     },
                     installed: false,
+                    installed_at: None,
                     enabled: false,
                     install_policy: PluginInstallPolicy::Available,
+                    install_policy_source: None,
+                    must_show_installation_interstitial: None,
                     auth_policy: PluginAuthPolicy::OnInstall,
                     availability: codex_app_server_protocol::PluginAvailability::Available,
+                    disabled_reason: None,
+                    eligible_plan_types: None,
                     interface: None,
                     keywords: Vec::new(),
                 },
@@ -802,29 +957,24 @@ async fn plugin_list_accepts_omitted_cwds() -> Result<()> {
 }"#,
     )?;
     let home = codex_home.path().to_string_lossy().into_owned();
-    let mut mcp = TestAppServer::new_with_env(
-        codex_home.path(),
-        &[
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .with_env_overrides(&[
             ("HOME", Some(home.as_str())),
             ("USERPROFILE", Some(home.as_str())),
-        ],
-    )
-    .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+        ])
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
 
     let request_id = mcp
         .send_plugin_list_request(PluginListParams {
             cwds: None,
             marketplace_kinds: None,
+            force_refetch: false,
         })
         .await?;
 
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let _: PluginListResponse = to_response(response)?;
+    let _: PluginListResponse = timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
     Ok(())
 }
 
@@ -862,22 +1012,21 @@ async fn plugin_list_returns_share_context_for_shared_local_plugin() -> Result<(
         &AbsolutePathBuf::try_from(plugin_root)?,
     )?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
 
     let request_id = mcp
         .send_plugin_list_request(PluginListParams {
             cwds: Some(vec![AbsolutePathBuf::try_from(repo_root.path())?]),
             marketplace_kinds: None,
+            force_refetch: false,
         })
         .await?;
 
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let response: PluginListResponse = to_response(response)?;
+    let response: PluginListResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
 
     let plugin = response
         .marketplaces
@@ -898,6 +1047,126 @@ async fn plugin_list_returns_share_context_for_shared_local_plugin() -> Result<(
     assert_eq!(share_context.creator_account_user_id, None);
     assert_eq!(share_context.creator_name, None);
     assert_eq!(share_context.share_principals, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn plugin_list_force_refetch_waits_for_same_path_local_plugin_upgrade() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let marketplace_root = TempDir::new()?;
+    std::fs::create_dir_all(marketplace_root.path().join(".git"))?;
+    std::fs::create_dir_all(marketplace_root.path().join(".agents/plugins"))?;
+    let source_manifest = marketplace_root
+        .path()
+        .join("sample-plugin/.codex-plugin/plugin.json");
+    std::fs::create_dir_all(source_manifest.parent().expect("source manifest parent"))?;
+    std::fs::write(
+        &source_manifest,
+        r#"{"name":"sample-plugin","version":"1.0.0"}"#,
+    )?;
+    std::fs::write(
+        marketplace_root
+            .path()
+            .join(".agents/plugins/marketplace.json"),
+        r#"{
+  "name": "sample-marketplace",
+  "plugins": [
+    {
+      "name": "sample-plugin",
+      "source": {
+        "source": "local",
+        "path": "./sample-plugin"
+      }
+    }
+  ]
+}"#,
+    )?;
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        r#"[features]
+plugins = true
+remote_plugin = false
+
+[plugins."sample-plugin@sample-marketplace"]
+enabled = true
+"#,
+    )?;
+    write_installed_plugin_with_version(
+        &codex_home,
+        "sample-marketplace",
+        "sample-plugin",
+        "1.0.0",
+    )?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+
+    let request_id = mcp
+        .send_plugin_list_request(PluginListParams {
+            cwds: Some(vec![AbsolutePathBuf::try_from(marketplace_root.path())?]),
+            marketplace_kinds: Some(vec![PluginListMarketplaceKind::Local]),
+            force_refetch: true,
+        })
+        .await?;
+    let initial_response: JSONRPCResponse = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    let _: PluginListResponse = to_response(initial_response)?;
+
+    std::fs::write(
+        &source_manifest,
+        r#"{"name":"sample-plugin","version":"1.1.0"}"#,
+    )?;
+
+    let request_id = mcp
+        .send_plugin_list_request(PluginListParams {
+            cwds: Some(vec![AbsolutePathBuf::try_from(marketplace_root.path())?]),
+            marketplace_kinds: Some(vec![PluginListMarketplaceKind::Local]),
+            force_refetch: true,
+        })
+        .await?;
+    let response: JSONRPCResponse = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    let response: PluginListResponse = to_response(response)?;
+    let plugin = response
+        .marketplaces
+        .iter()
+        .find(|marketplace| marketplace.name == "sample-marketplace")
+        .and_then(|marketplace| {
+            marketplace
+                .plugins
+                .iter()
+                .find(|plugin| plugin.name == "sample-plugin")
+        })
+        .expect("upgraded local plugin should appear in its marketplace response");
+    assert!(plugin.installed);
+    assert!(plugin.enabled);
+    assert_eq!(plugin.local_version.as_deref(), Some("1.1.0"));
+
+    let plugin_cache = codex_home
+        .path()
+        .join("plugins/cache/sample-marketplace/sample-plugin");
+    let installed_manifest = plugin_cache.join("1.1.0/.codex-plugin/plugin.json");
+    assert!(
+        installed_manifest.is_file(),
+        "force-refetched plugin/list must finish installing the newer local plugin before responding"
+    );
+    assert!(
+        !plugin_cache.join("1.0.0").exists(),
+        "force-refetched plugin/list must remove the superseded local plugin before responding"
+    );
+    let installed_manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(installed_manifest)?)?;
+    assert_eq!(installed_manifest["version"], serde_json::json!("1.1.0"));
+
     Ok(())
 }
 
@@ -954,22 +1223,21 @@ enabled = false
 "#,
     )?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
 
     let request_id = mcp
         .send_plugin_list_request(PluginListParams {
             cwds: Some(vec![AbsolutePathBuf::try_from(repo_root.path())?]),
             marketplace_kinds: None,
+            force_refetch: false,
         })
         .await?;
 
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let response: PluginListResponse = to_response(response)?;
+    let response: PluginListResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
 
     let marketplace = response
         .marketplaces
@@ -1101,15 +1369,14 @@ enabled = false
 
     let workspace_default = TempDir::new()?;
     let home = codex_home.path().to_string_lossy().into_owned();
-    let mut mcp = TestAppServer::new_with_env(
-        codex_home.path(),
-        &[
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .with_env_overrides(&[
             ("HOME", Some(home.as_str())),
             ("USERPROFILE", Some(home.as_str())),
-        ],
-    )
-    .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+        ])
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
 
     let request_id = mcp
         .send_plugin_list_request(PluginListParams {
@@ -1118,15 +1385,12 @@ enabled = false
                 AbsolutePathBuf::try_from(workspace_default.path())?,
             ]),
             marketplace_kinds: None,
+            force_refetch: false,
         })
         .await?;
 
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let response: PluginListResponse = to_response(response)?;
+    let response: PluginListResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
 
     let shared_plugin = response
         .marketplaces
@@ -1195,22 +1459,21 @@ async fn plugin_list_returns_plugin_interface_with_absolute_asset_paths() -> Res
 }"##,
     )?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
 
     let request_id = mcp
         .send_plugin_list_request(PluginListParams {
             cwds: Some(vec![AbsolutePathBuf::try_from(repo_root.path())?]),
             marketplace_kinds: None,
+            force_refetch: false,
         })
         .await?;
 
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let response: PluginListResponse = to_response(response)?;
+    let response: PluginListResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
 
     let plugin = response
         .marketplaces
@@ -1308,22 +1571,21 @@ async fn plugin_list_accepts_legacy_string_default_prompt() -> Result<()> {
 }"##,
     )?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
 
     let request_id = mcp
         .send_plugin_list_request(PluginListParams {
             cwds: Some(vec![AbsolutePathBuf::try_from(repo_root.path())?]),
             marketplace_kinds: None,
+            force_refetch: false,
         })
         .await?;
 
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let response: PluginListResponse = to_response(response)?;
+    let response: PluginListResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
 
     let plugin = response
         .marketplaces
@@ -1396,22 +1658,21 @@ enabled = true
 "#,
     )?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
 
     let request_id = mcp
         .send_plugin_list_request(PluginListParams {
             cwds: Some(vec![AbsolutePathBuf::try_from(repo_root.path())?]),
             marketplace_kinds: None,
+            force_refetch: false,
         })
         .await?;
 
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let response: PluginListResponse = to_response(response)?;
+    let response: PluginListResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
 
     let plugin = response
         .marketplaces
@@ -1479,7 +1740,7 @@ async fn app_server_startup_sync_downloads_remote_installed_plugin_bundles() -> 
     let bundle_url = mount_remote_plugin_bundle(
         &server,
         "linear",
-        remote_plugin_bundle_tar_gz_bytes("linear")?,
+        remote_plugin_bundle_tar_gz_bytes("linear", /*hooks_json*/ None)?,
     )
     .await;
     let remote_app_manifest = serde_json::json!({
@@ -1498,16 +1759,17 @@ async fn app_server_startup_sync_downloads_remote_installed_plugin_bundles() -> 
     mount_remote_installed_plugins(&server, "GLOBAL", &global_installed_body).await;
     mount_remote_installed_plugins(&server, "WORKSPACE", empty_remote_installed_plugins_body())
         .await;
+    mount_empty_user_installed_plugins(&server).await;
 
     let installed_path = codex_home
         .path()
         .join("plugins/cache/openai-curated-remote/linear/1.2.3");
-    let mut mcp = TestAppServer::new_with_env_and_plugin_startup_tasks(
-        codex_home.path(),
-        &[(TEST_ALLOW_HTTP_REMOTE_PLUGIN_BUNDLE_DOWNLOADS, Some("1"))],
-    )
-    .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+    let _mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .with_plugin_startup_tasks()
+        .with_env_overrides(&[(TEST_ALLOW_HTTP_REMOTE_PLUGIN_BUNDLE_DOWNLOADS, Some("1"))])
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
 
     wait_for_path_exists(&installed_path.join(".codex-plugin/plugin.json")).await?;
     let installed_plugin_manifest: serde_json::Value = serde_json::from_str(
@@ -1548,7 +1810,7 @@ async fn plugin_list_sync_upgrades_and_removes_remote_installed_plugin_bundles()
     let bundle_url = mount_remote_plugin_bundle(
         &server,
         "linear",
-        remote_plugin_bundle_tar_gz_bytes("linear")?,
+        remote_plugin_bundle_tar_gz_bytes("linear", /*hooks_json*/ None)?,
     )
     .await;
     let remote_app_manifest = serde_json::json!({
@@ -1569,6 +1831,7 @@ async fn plugin_list_sync_upgrades_and_removes_remote_installed_plugin_bundles()
     mount_remote_installed_plugins(&server, "GLOBAL", &global_installed_body).await;
     mount_remote_installed_plugins(&server, "WORKSPACE", empty_remote_installed_plugins_body())
         .await;
+    mount_empty_user_installed_plugins(&server).await;
 
     let old_path = codex_home
         .path()
@@ -1580,25 +1843,21 @@ async fn plugin_list_sync_upgrades_and_removes_remote_installed_plugin_bundles()
         .path()
         .join("plugins/cache/openai-curated-remote/stale");
 
-    let mut mcp = TestAppServer::new_with_env(
-        codex_home.path(),
-        &[(TEST_ALLOW_HTTP_REMOTE_PLUGIN_BUNDLE_DOWNLOADS, Some("1"))],
-    )
-    .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .with_env_overrides(&[(TEST_ALLOW_HTTP_REMOTE_PLUGIN_BUNDLE_DOWNLOADS, Some("1"))])
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
 
     let request_id = mcp
         .send_plugin_list_request(PluginListParams {
             cwds: None,
             marketplace_kinds: None,
+            force_refetch: false,
         })
         .await?;
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let response: PluginListResponse = to_response(response)?;
+    let response: PluginListResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
     let remote_marketplace = response
         .marketplaces
         .into_iter()
@@ -1647,6 +1906,7 @@ async fn plugin_list_includes_remote_marketplaces_when_remote_plugin_enabled() -
             .chatgpt_account_id("account-123"),
         AuthCredentialsStoreMode::File,
     )?;
+    write_installed_plugin_with_version(&codex_home, "openai-curated-remote", "linear", "1.2.3")?;
 
     let global_directory_body = r#"{
   "plugins": [
@@ -1655,9 +1915,12 @@ async fn plugin_list_includes_remote_marketplaces_when_remote_plugin_enabled() -
       "name": "linear",
       "scope": "GLOBAL",
       "installation_policy": "AVAILABLE",
+      "installation_policy_source": "IMPLICIT_CANONICAL_APP",
+      "must_show_installation_interstitial": true,
       "authentication_policy": "ON_USE",
       "status": "ENABLED",
       "release": {
+        "version": "1.2.3",
         "display_name": "Linear",
         "description": "Track work in Linear",
         "app_ids": [],
@@ -1693,9 +1956,13 @@ async fn plugin_list_includes_remote_marketplaces_when_remote_plugin_enabled() -
       "name": "linear",
       "scope": "GLOBAL",
       "installation_policy": "AVAILABLE",
+      "installation_policy_source": "WORKSPACE_SETTING",
+      "installed_at": "2026-01-02T00:00:00Z",
+      "must_show_installation_interstitial": false,
       "authentication_policy": "ON_USE",
       "status": "ENABLED",
       "release": {
+        "version": "1.2.3",
         "display_name": "Linear",
         "description": "Track work in Linear",
         "app_ids": [],
@@ -1755,23 +2022,30 @@ async fn plugin_list_includes_remote_marketplaces_when_remote_plugin_enabled() -
         .respond_with(ResponseTemplate::new(200).set_body_string(empty_page_body))
         .mount(&server)
         .await;
+    Mock::given(method("GET"))
+        .and(path("/backend-api/plugins/featured"))
+        .and(query_param("platform", "codex"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(r#"["linear@openai-curated-remote"]"#),
+        )
+        .mount(&server)
+        .await;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
 
     let request_id = mcp
         .send_plugin_list_request(PluginListParams {
             cwds: None,
             marketplace_kinds: None,
+            force_refetch: false,
         })
         .await?;
 
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let response: PluginListResponse = to_response(response)?;
+    let response: PluginListResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
 
     let remote_marketplace = response
         .marketplaces
@@ -1797,8 +2071,28 @@ async fn plugin_list_includes_remote_marketplaces_when_remote_plugin_enabled() -
     );
     assert_eq!(remote_marketplace.plugins[0].name, "linear");
     assert_eq!(remote_marketplace.plugins[0].source, PluginSource::Remote);
+    assert_eq!(
+        remote_marketplace.plugins[0].version.as_deref(),
+        Some("1.2.3")
+    );
+    assert_eq!(
+        remote_marketplace.plugins[0].local_version.as_deref(),
+        Some("1.2.3")
+    );
     assert_eq!(remote_marketplace.plugins[0].installed, true);
+    assert_eq!(
+        remote_marketplace.plugins[0].installed_at,
+        Some(1_767_312_000)
+    );
     assert_eq!(remote_marketplace.plugins[0].enabled, true);
+    assert_eq!(
+        remote_marketplace.plugins[0].install_policy_source,
+        Some(PluginInstallPolicySource::ImplicitCanonicalApp)
+    );
+    assert_eq!(
+        remote_marketplace.plugins[0].must_show_installation_interstitial,
+        Some(true)
+    );
     assert_eq!(
         remote_marketplace.plugins[0].availability,
         codex_app_server_protocol::PluginAvailability::Available
@@ -1834,6 +2128,15 @@ async fn plugin_list_includes_remote_marketplaces_when_remote_plugin_enabled() -
     let cached_catalog: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&cache_files[0])?)?;
     assert_eq!(cached_catalog["schema_version"], serde_json::json!(1));
+    assert!(cached_catalog["fetched_at"].as_str().is_some());
+    assert_eq!(
+        cached_catalog["plugins"][0]["installation_policy_source"],
+        serde_json::json!("IMPLICIT_CANONICAL_APP")
+    );
+    assert_eq!(
+        cached_catalog["plugins"][0]["must_show_installation_interstitial"],
+        serde_json::json!(true)
+    );
     assert_eq!(
         cached_catalog["plugins"][0]["release"]["interface"]["default_prompts"],
         serde_json::json!(["Create a Linear issue", "Review my Linear projects"])
@@ -1848,7 +2151,10 @@ async fn plugin_list_includes_remote_marketplaces_when_remote_plugin_enabled() -
         cached_plugin_ids,
         vec!["plugins~Plugin_00000000000000000000000000000000".to_string()]
     );
-    assert_eq!(response.featured_plugin_ids, Vec::<String>::new());
+    assert_eq!(
+        response.featured_plugin_ids,
+        vec!["linear@openai-curated-remote".to_string()]
+    );
     assert!(
         !server
             .received_requests()
@@ -1864,7 +2170,7 @@ async fn plugin_list_includes_remote_marketplaces_when_remote_plugin_enabled() -
 }
 
 #[tokio::test]
-async fn plugin_list_uses_cached_global_remote_catalog_and_refreshes_it() -> Result<()> {
+async fn plugin_list_honors_global_remote_catalog_cache_ttl() -> Result<()> {
     let codex_home = TempDir::new()?;
     let server = MockServer::start().await;
     write_remote_plugin_catalog_config(
@@ -1894,14 +2200,85 @@ async fn plugin_list_uses_cached_global_remote_catalog_and_refreshes_it() -> Res
     mount_remote_installed_plugins(&server, "GLOBAL", empty_remote_installed_plugins_body()).await;
     mount_remote_installed_plugins(&server, "WORKSPACE", empty_remote_installed_plugins_body())
         .await;
+    mount_empty_user_installed_plugins(&server).await;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
 
     let request_id = mcp
         .send_plugin_list_request(PluginListParams {
             cwds: None,
             marketplace_kinds: None,
+            force_refetch: false,
+        })
+        .await?;
+    let response: PluginListResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
+    let remote_marketplace = response
+        .marketplaces
+        .iter()
+        .find(|marketplace| marketplace.name == "openai-curated-remote")
+        .expect("expected warmed remote marketplace");
+    assert_eq!(
+        remote_marketplace.plugins[0].id,
+        "linear@openai-curated-remote"
+    );
+    assert_eq!(
+        remote_marketplace.plugins[0].must_show_installation_interstitial,
+        None
+    );
+    wait_for_remote_plugin_request_count(&server, "/ps/plugins/list", /*expected_count*/ 1).await?;
+    wait_for_cached_remote_catalog_plugin_ids(codex_home.path(), &[cached_remote_plugin_id])
+        .await?;
+
+    server.reset().await;
+    mount_remote_plugin_list(&server, "GLOBAL", &refreshed_body).await;
+    mount_remote_installed_plugins(&server, "GLOBAL", empty_remote_installed_plugins_body()).await;
+    mount_remote_installed_plugins(&server, "WORKSPACE", empty_remote_installed_plugins_body())
+        .await;
+    mount_empty_user_installed_plugins(&server).await;
+
+    let request_id = mcp
+        .send_plugin_list_request(PluginListParams {
+            cwds: None,
+            marketplace_kinds: None,
+            force_refetch: false,
+        })
+        .await?;
+    let response: PluginListResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
+    let remote_marketplace = response
+        .marketplaces
+        .iter()
+        .find(|marketplace| marketplace.name == "openai-curated-remote")
+        .expect("expected cached remote marketplace");
+    assert_eq!(
+        remote_marketplace.plugins[0].id,
+        "linear@openai-curated-remote"
+    );
+    sleep(Duration::from_millis(100)).await;
+    wait_for_remote_plugin_request_count(&server, "/ps/plugins/list", /*expected_count*/ 0).await?;
+    wait_for_cached_remote_catalog_plugin_ids(codex_home.path(), &[cached_remote_plugin_id])
+        .await?;
+
+    rewrite_cached_remote_catalog_fetched_at(
+        codex_home.path(),
+        Utc::now() - ChronoDuration::hours(4),
+    )?;
+    server.reset().await;
+    mount_delayed_remote_plugin_list(&server, "GLOBAL", &refreshed_body).await;
+    mount_remote_installed_plugins(&server, "GLOBAL", empty_remote_installed_plugins_body()).await;
+    mount_remote_installed_plugins(&server, "WORKSPACE", empty_remote_installed_plugins_body())
+        .await;
+    mount_empty_user_installed_plugins(&server).await;
+
+    let request_id = mcp
+        .send_plugin_list_request(PluginListParams {
+            cwds: None,
+            marketplace_kinds: None,
+            force_refetch: false,
         })
         .await?;
     let response: PluginListResponse = to_response(
@@ -1915,31 +2292,143 @@ async fn plugin_list_uses_cached_global_remote_catalog_and_refreshes_it() -> Res
         .marketplaces
         .iter()
         .find(|marketplace| marketplace.name == "openai-curated-remote")
-        .expect("expected warmed remote marketplace");
+        .expect("expected stale cached remote marketplace");
     assert_eq!(
         remote_marketplace.plugins[0].id,
         "linear@openai-curated-remote"
     );
-    wait_for_remote_plugin_request_count(&server, "/ps/plugins/list", /*expected_count*/ 1).await?;
-    wait_for_cached_remote_catalog_plugin_ids(codex_home.path(), &[cached_remote_plugin_id])
-        .await?;
-
-    server.reset().await;
-    mount_remote_plugin_list(&server, "GLOBAL", &refreshed_body).await;
-    mount_remote_installed_plugins(&server, "GLOBAL", empty_remote_installed_plugins_body()).await;
-    mount_remote_installed_plugins(&server, "WORKSPACE", empty_remote_installed_plugins_body())
-        .await;
 
     let request_id = mcp
         .send_plugin_list_request(PluginListParams {
             cwds: None,
             marketplace_kinds: None,
+            force_refetch: false,
         })
         .await?;
     let response: PluginListResponse = to_response(
         timeout(
             DEFAULT_TIMEOUT,
             mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+        )
+        .await??,
+    )?;
+    let remote_marketplace = response
+        .marketplaces
+        .iter()
+        .find(|marketplace| marketplace.name == "openai-curated-remote")
+        .expect("expected stale cached remote marketplace");
+    assert_eq!(
+        remote_marketplace.plugins[0].id,
+        "linear@openai-curated-remote"
+    );
+
+    wait_for_remote_plugin_request_count(&server, "/ps/plugins/list", /*expected_count*/ 1).await?;
+    wait_for_cached_remote_catalog_plugin_ids(codex_home.path(), &[refreshed_remote_plugin_id])
+        .await?;
+    sleep(Duration::from_millis(100)).await;
+    wait_for_remote_plugin_request_count(&server, "/ps/plugins/list", /*expected_count*/ 1).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn app_server_startup_refreshes_cached_remote_catalog_without_blocking_plugin_list()
+-> Result<()> {
+    let codex_home = TempDir::new()?;
+    let server = MockServer::start().await;
+    write_remote_plugin_catalog_config(
+        codex_home.path(),
+        &format!("{}/backend-api/", server.uri()),
+    )?;
+    write_chatgpt_auth(
+        codex_home.path(),
+        ChatGptAuthFixture::new("chatgpt-token")
+            .account_id("account-123")
+            .chatgpt_user_id("user-123")
+            .chatgpt_account_id("account-123"),
+        AuthCredentialsStoreMode::File,
+    )?;
+
+    let cached_remote_plugin_id = "plugins~Plugin_00000000000000000000000000000000";
+    let refreshed_remote_plugin_id = "plugins~Plugin_11111111111111111111111111111111";
+    mount_remote_plugin_list(
+        &server,
+        "GLOBAL",
+        &remote_plugin_list_body(cached_remote_plugin_id, "linear", "Linear", "Plan work"),
+    )
+    .await;
+    mount_remote_installed_plugins(&server, "GLOBAL", empty_remote_installed_plugins_body()).await;
+    mount_remote_installed_plugins(&server, "WORKSPACE", empty_remote_installed_plugins_body())
+        .await;
+    mount_empty_user_installed_plugins(&server).await;
+
+    let mut app_server = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    timeout(DEFAULT_TIMEOUT, app_server.initialize()).await??;
+    let request_id = app_server
+        .send_plugin_list_request(PluginListParams {
+            cwds: None,
+            marketplace_kinds: None,
+            force_refetch: false,
+        })
+        .await?;
+    let _: PluginListResponse = to_response(
+        timeout(
+            DEFAULT_TIMEOUT,
+            app_server.read_stream_until_response_message(RequestId::Integer(request_id)),
+        )
+        .await??,
+    )?;
+    wait_for_cached_remote_catalog_plugin_ids(codex_home.path(), &[cached_remote_plugin_id])
+        .await?;
+    timeout(DEFAULT_TIMEOUT, app_server.shutdown_gracefully()).await??;
+
+    server.reset().await;
+    let refreshed_body = remote_plugin_list_body(
+        refreshed_remote_plugin_id,
+        "notion",
+        "Notion",
+        "Capture notes",
+    );
+    Mock::given(method("GET"))
+        .and(path("/backend-api/ps/plugins/list"))
+        .and(query_param("scope", "GLOBAL"))
+        .and(query_param("limit", "200"))
+        .and(header("authorization", "Bearer chatgpt-token"))
+        .and(header("chatgpt-account-id", "account-123"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(refreshed_body)
+                .set_delay(Duration::from_secs(/*secs*/ 2)),
+        )
+        .mount(&server)
+        .await;
+    mount_remote_installed_plugins(&server, "GLOBAL", empty_remote_installed_plugins_body()).await;
+    mount_remote_installed_plugins(&server, "WORKSPACE", empty_remote_installed_plugins_body())
+        .await;
+    mount_empty_user_installed_plugins(&server).await;
+
+    let mut app_server = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .with_plugin_startup_tasks()
+        .build()
+        .await?;
+    timeout(DEFAULT_TIMEOUT, app_server.initialize()).await??;
+    wait_for_remote_plugin_request_count(&server, "/ps/plugins/list", /*expected_count*/ 1).await?;
+
+    let request_id = app_server
+        .send_plugin_list_request(PluginListParams {
+            cwds: None,
+            marketplace_kinds: None,
+            force_refetch: false,
+        })
+        .await?;
+    let response: PluginListResponse = to_response(
+        timeout(
+            DEFAULT_TIMEOUT,
+            app_server.read_stream_until_response_message(RequestId::Integer(request_id)),
         )
         .await??,
     )?;
@@ -1952,18 +2441,292 @@ async fn plugin_list_uses_cached_global_remote_catalog_and_refreshes_it() -> Res
         remote_marketplace.plugins[0].id,
         "linear@openai-curated-remote"
     );
-    wait_for_remote_plugin_request_count(&server, "/ps/plugins/list", /*expected_count*/ 1).await?;
+
     wait_for_cached_remote_catalog_plugin_ids(codex_home.path(), &[refreshed_remote_plugin_id])
         .await?;
+    let request_id = app_server
+        .send_plugin_list_request(PluginListParams {
+            cwds: None,
+            marketplace_kinds: None,
+            force_refetch: false,
+        })
+        .await?;
+    let response: PluginListResponse = to_response(
+        timeout(
+            DEFAULT_TIMEOUT,
+            app_server.read_stream_until_response_message(RequestId::Integer(request_id)),
+        )
+        .await??,
+    )?;
+    let remote_marketplace = response
+        .marketplaces
+        .iter()
+        .find(|marketplace| marketplace.name == "openai-curated-remote")
+        .expect("expected refreshed remote marketplace");
+    assert_eq!(
+        remote_marketplace.plugins[0].id,
+        "notion@openai-curated-remote"
+    );
+    sleep(Duration::from_millis(100)).await;
+    wait_for_remote_plugin_request_count(&server, "/ps/plugins/list", /*expected_count*/ 1).await?;
 
     Ok(())
 }
 
 #[tokio::test]
-async fn plugin_list_includes_openai_curated_remote_collection_when_requested() -> Result<()> {
+async fn app_server_startup_skips_disabled_remote_plugin_catalog_scopes() -> Result<()> {
     let codex_home = TempDir::new()?;
     let server = MockServer::start().await;
-    write_plugins_enabled_config_with_base_url(
+    let base_url = format!("{}/backend-api/", server.uri());
+    write_remote_plugin_catalog_config(codex_home.path(), &base_url)?;
+    write_chatgpt_auth(
+        codex_home.path(),
+        ChatGptAuthFixture::new("chatgpt-token")
+            .account_id("account-123")
+            .chatgpt_user_id("user-123")
+            .chatgpt_account_id("account-123"),
+        AuthCredentialsStoreMode::File,
+    )?;
+
+    let global_plugin_id = "plugins~Plugin_00000000000000000000000000000000";
+    let user_plugin_id = "plugins~Plugin_11111111111111111111111111111111";
+    let workspace_plugin_id = "plugins~Plugin_22222222222222222222222222222222";
+    let global_body = remote_plugin_list_body(global_plugin_id, "global-linear", "Linear", "Plan");
+    let user_body = user_remote_plugin_page_body(
+        user_plugin_id,
+        "private-linear",
+        "Private Linear",
+        "PRIVATE",
+        /*enabled*/ None,
+    );
+    let workspace_body = workspace_remote_plugin_page_body(
+        workspace_plugin_id,
+        "workspace-linear",
+        "Workspace Linear",
+        "LISTED",
+        /*enabled*/ None,
+    );
+    mount_remote_plugin_list(&server, "GLOBAL", &global_body).await;
+    mount_remote_plugin_list(&server, "USER", &user_body).await;
+    mount_remote_plugin_list(&server, "WORKSPACE", &workspace_body).await;
+    for scope in ["GLOBAL", "USER", "WORKSPACE"] {
+        mount_remote_installed_plugins(&server, scope, empty_remote_installed_plugins_body()).await;
+    }
+
+    let mut app_server = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    timeout(DEFAULT_TIMEOUT, app_server.initialize()).await??;
+    for marketplace_kinds in [
+        None,
+        Some(vec![
+            PluginListMarketplaceKind::CreatedByMeRemote,
+            PluginListMarketplaceKind::WorkspaceDirectory,
+        ]),
+    ] {
+        let request_id = app_server
+            .send_plugin_list_request(PluginListParams {
+                cwds: None,
+                marketplace_kinds,
+                force_refetch: false,
+            })
+            .await?;
+        let _: PluginListResponse = to_response(
+            timeout(
+                DEFAULT_TIMEOUT,
+                app_server.read_stream_until_response_message(RequestId::Integer(request_id)),
+            )
+            .await??,
+        )?;
+    }
+    wait_for_cached_remote_catalog_plugin_ids(
+        codex_home.path(),
+        &[global_plugin_id, user_plugin_id, workspace_plugin_id],
+    )
+    .await?;
+    timeout(DEFAULT_TIMEOUT, app_server.shutdown_gracefully()).await??;
+
+    write_remote_plugins_disabled_config_with_base_url(codex_home.path(), &base_url)?;
+    server.reset().await;
+    mount_remote_plugin_list(&server, "GLOBAL", &global_body).await;
+    mount_remote_plugin_list(&server, "USER", &user_body).await;
+    mount_remote_plugin_list(&server, "WORKSPACE", &workspace_body).await;
+    for scope in ["GLOBAL", "USER", "WORKSPACE"] {
+        mount_remote_installed_plugins(&server, scope, empty_remote_installed_plugins_body()).await;
+    }
+
+    let mut app_server = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .with_plugin_startup_tasks()
+        .build()
+        .await?;
+    timeout(DEFAULT_TIMEOUT, app_server.initialize()).await??;
+    wait_for_remote_plugin_list_scope_request_count(
+        &server,
+        "WORKSPACE",
+        /*expected_count*/ 1,
+    )
+    .await?;
+
+    let requested_scopes = server
+        .received_requests()
+        .await
+        .expect("wiremock should record requests")
+        .into_iter()
+        .filter(|request| {
+            request.method == "GET" && request.url.path().ends_with("/ps/plugins/list")
+        })
+        .filter_map(|request| {
+            request
+                .url
+                .query_pairs()
+                .find(|(name, _)| name == "scope")
+                .map(|(_, scope)| scope.into_owned())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(requested_scopes, vec!["WORKSPACE".to_string()]);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn plugin_list_force_refetch_bypasses_fresh_global_remote_catalog_cache() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let server = MockServer::start().await;
+    write_remote_plugin_catalog_config(
+        codex_home.path(),
+        &format!("{}/backend-api/", server.uri()),
+    )?;
+    write_chatgpt_auth(
+        codex_home.path(),
+        ChatGptAuthFixture::new("chatgpt-token")
+            .account_id("account-123")
+            .chatgpt_user_id("user-123")
+            .chatgpt_account_id("account-123"),
+        AuthCredentialsStoreMode::File,
+    )?;
+
+    let cached_remote_plugin_id = "plugins~Plugin_00000000000000000000000000000000";
+    let refreshed_remote_plugin_id = "plugins~Plugin_11111111111111111111111111111111";
+    mount_remote_plugin_list(
+        &server,
+        "GLOBAL",
+        &remote_plugin_list_body(cached_remote_plugin_id, "linear", "Linear", "Plan work"),
+    )
+    .await;
+    mount_remote_installed_plugins(&server, "GLOBAL", empty_remote_installed_plugins_body()).await;
+    mount_remote_installed_plugins(&server, "WORKSPACE", empty_remote_installed_plugins_body())
+        .await;
+    mount_empty_user_installed_plugins(&server).await;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+
+    let request_id = mcp
+        .send_plugin_list_request(PluginListParams {
+            cwds: None,
+            marketplace_kinds: None,
+            force_refetch: false,
+        })
+        .await?;
+    let _: PluginListResponse = to_response(
+        timeout(
+            DEFAULT_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+        )
+        .await??,
+    )?;
+    wait_for_cached_remote_catalog_plugin_ids(codex_home.path(), &[cached_remote_plugin_id])
+        .await?;
+
+    server.reset().await;
+    mount_delayed_remote_plugin_list(
+        &server,
+        "GLOBAL",
+        &remote_plugin_list_body(
+            refreshed_remote_plugin_id,
+            "notion",
+            "Notion",
+            "Capture notes",
+        ),
+    )
+    .await;
+    mount_remote_installed_plugins(&server, "GLOBAL", empty_remote_installed_plugins_body()).await;
+    mount_remote_installed_plugins(&server, "WORKSPACE", empty_remote_installed_plugins_body())
+        .await;
+    mount_empty_user_installed_plugins(&server).await;
+
+    let request_id = mcp
+        .send_plugin_list_request(PluginListParams {
+            cwds: None,
+            marketplace_kinds: None,
+            force_refetch: true,
+        })
+        .await?;
+    let response: PluginListResponse = to_response(
+        timeout(
+            DEFAULT_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+        )
+        .await??,
+    )?;
+    let remote_marketplace = response
+        .marketplaces
+        .iter()
+        .find(|marketplace| marketplace.name == "openai-curated-remote")
+        .expect("expected refreshed remote marketplace");
+    assert_eq!(
+        remote_marketplace.plugins[0].id,
+        "notion@openai-curated-remote"
+    );
+    wait_for_remote_plugin_request_count(&server, "/ps/plugins/list", /*expected_count*/ 1).await?;
+    wait_for_cached_remote_catalog_plugin_ids(codex_home.path(), &[refreshed_remote_plugin_id])
+        .await?;
+
+    server.reset().await;
+    mount_remote_installed_plugins(&server, "GLOBAL", empty_remote_installed_plugins_body()).await;
+    mount_remote_installed_plugins(&server, "WORKSPACE", empty_remote_installed_plugins_body())
+        .await;
+    mount_empty_user_installed_plugins(&server).await;
+
+    let request_id = mcp
+        .send_plugin_list_request(PluginListParams {
+            cwds: None,
+            marketplace_kinds: None,
+            force_refetch: false,
+        })
+        .await?;
+    let response: PluginListResponse = to_response(
+        timeout(
+            DEFAULT_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+        )
+        .await??,
+    )?;
+    let remote_marketplace = response
+        .marketplaces
+        .iter()
+        .find(|marketplace| marketplace.name == "openai-curated-remote")
+        .expect("expected cached refreshed remote marketplace");
+    assert_eq!(
+        remote_marketplace.plugins[0].id,
+        "notion@openai-curated-remote"
+    );
+    wait_for_remote_plugin_request_count(&server, "/ps/plugins/list", /*expected_count*/ 0).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn plugin_list_includes_openai_curated_remote_collection_when_remote_plugin_disabled_and_requested()
+-> Result<()> {
+    let codex_home = TempDir::new()?;
+    let server = MockServer::start().await;
+    write_remote_plugins_disabled_config_with_base_url(
         codex_home.path(),
         &format!("{}/backend-api/", server.uri()),
     )?;
@@ -1986,6 +2749,7 @@ async fn plugin_list_includes_openai_curated_remote_collection_when_requested() 
       "authentication_policy": "ON_USE",
       "status": "ENABLED",
       "release": {
+        "version": "1.2.3",
         "display_name": "Linear",
         "description": "Track work in Linear",
         "app_ids": [],
@@ -2006,22 +2770,22 @@ async fn plugin_list_includes_openai_curated_remote_collection_when_requested() 
     mount_remote_installed_plugins(&server, "GLOBAL", empty_remote_installed_plugins_body()).await;
     mount_remote_installed_plugins(&server, "WORKSPACE", empty_remote_installed_plugins_body())
         .await;
+    mount_empty_user_installed_plugins(&server).await;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
 
     let request_id = mcp
         .send_plugin_list_request(PluginListParams {
             cwds: None,
             marketplace_kinds: Some(vec![PluginListMarketplaceKind::Vertical]),
+            force_refetch: false,
         })
         .await?;
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let response: PluginListResponse = to_response(response)?;
+    let response: PluginListResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
 
     let remote_marketplace = response
         .marketplaces
@@ -2045,6 +2809,7 @@ async fn plugin_list_includes_openai_curated_remote_collection_when_requested() 
     );
     assert_eq!(plugin.name, "linear");
     assert_eq!(plugin.source, PluginSource::Remote);
+    assert_eq!(plugin.version.as_deref(), Some("1.2.3"));
     assert_eq!(plugin.installed, false);
     assert_eq!(plugin.enabled, false);
 
@@ -2064,10 +2829,11 @@ async fn plugin_list_includes_openai_curated_remote_collection_when_requested() 
 }
 
 #[tokio::test]
-async fn plugin_list_fail_opens_openai_curated_remote_collection_errors() -> Result<()> {
+async fn plugin_list_propagates_openai_curated_remote_collection_errors_when_remote_plugin_disabled()
+-> Result<()> {
     let codex_home = TempDir::new()?;
     let server = MockServer::start().await;
-    write_plugins_enabled_config_with_base_url(
+    write_remote_plugins_disabled_config_with_base_url(
         codex_home.path(),
         &format!("{}/backend-api/", server.uri()),
     )?;
@@ -2093,29 +2859,241 @@ async fn plugin_list_fail_opens_openai_curated_remote_collection_errors() -> Res
     mount_remote_installed_plugins(&server, "GLOBAL", empty_remote_installed_plugins_body()).await;
     mount_remote_installed_plugins(&server, "WORKSPACE", empty_remote_installed_plugins_body())
         .await;
+    mount_empty_user_installed_plugins(&server).await;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
 
     let request_id = mcp
         .send_plugin_list_request(PluginListParams {
             cwds: None,
             marketplace_kinds: Some(vec![PluginListMarketplaceKind::Vertical]),
+            force_refetch: false,
         })
         .await?;
-    let response: JSONRPCResponse = timeout(
+    let err = timeout(
         DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
     )
     .await??;
-    let response: PluginListResponse = to_response(response)?;
 
+    assert_eq!(err.error.code, -32603);
+    assert!(
+        err.error
+            .message
+            .contains("list OpenAI Curated remote plugin catalog")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn plugin_list_skips_openai_curated_remote_collection_for_api_auth_when_remote_plugin_disabled()
+-> Result<()> {
+    let codex_home = TempDir::new()?;
+    let server = MockServer::start().await;
+    write_remote_plugins_disabled_config_with_base_url(
+        codex_home.path(),
+        &format!("{}/backend-api/", server.uri()),
+    )?;
+    login_with_api_key(
+        codex_home.path(),
+        "sk-test-key",
+        AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::default(),
+    )?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
+
+    let request_id = mcp
+        .send_plugin_list_request(PluginListParams {
+            cwds: None,
+            marketplace_kinds: Some(vec![PluginListMarketplaceKind::Vertical]),
+            force_refetch: false,
+        })
+        .await?;
+    let response: PluginListResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
+
+    assert!(response.marketplaces.is_empty());
+    assert!(response.marketplace_load_errors.is_empty());
+    wait_for_remote_plugin_request_count(&server, "/ps/plugins/list", /*expected_count*/ 0).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn plugin_list_includes_api_curated_marketplace_for_api_auth_when_remote_plugin_enabled()
+-> Result<()> {
+    let codex_home = TempDir::new()?;
+    let server = MockServer::start().await;
+    write_remote_plugin_catalog_config(
+        codex_home.path(),
+        &format!("{}/backend-api/", server.uri()),
+    )?;
+    write_openai_api_curated_marketplace(codex_home.path(), &["api-plugin"])?;
+    login_with_api_key(
+        codex_home.path(),
+        "sk-test-key",
+        AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::default(),
+    )?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
+
+    let request_id = mcp
+        .send_plugin_list_request(PluginListParams {
+            cwds: None,
+            marketplace_kinds: None,
+            force_refetch: false,
+        })
+        .await?;
+    let response: PluginListResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
+
+    let api_curated_marketplace = response
+        .marketplaces
+        .iter()
+        .find(|marketplace| marketplace.name == "openai-api-curated")
+        .expect("expected API curated marketplace");
+    assert_eq!(
+        api_curated_marketplace
+            .interface
+            .as_ref()
+            .and_then(|interface| interface.display_name.as_deref()),
+        Some("OpenAI Curated")
+    );
+    assert_eq!(api_curated_marketplace.plugins.len(), 1);
+    assert_eq!(
+        api_curated_marketplace.plugins[0].id,
+        "api-plugin@openai-api-curated"
+    );
+    assert!(response.marketplace_load_errors.is_empty());
+    wait_for_remote_plugin_request_count(&server, "/ps/plugins/list", /*expected_count*/ 0).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn plugin_list_includes_api_curated_marketplace_for_bedrock_without_codex_auth() -> Result<()>
+{
+    let codex_home = TempDir::new()?;
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        r#"model_provider = "amazon-bedrock"
+
+[model_providers.amazon-bedrock.aws]
+region = "us-east-2"
+profile = "default"
+
+[features]
+plugins = true
+"#,
+    )?;
+    write_openai_curated_marketplace(codex_home.path(), &["chatgpt-plugin"])?;
+    write_openai_api_curated_marketplace(codex_home.path(), &["api-plugin"])?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
+
+    let request_id = mcp
+        .send_plugin_list_request(PluginListParams {
+            cwds: None,
+            marketplace_kinds: None,
+            force_refetch: false,
+        })
+        .await?;
+    let response: PluginListResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
+
+    assert!(!codex_home.path().join("auth.json").exists());
+    let api_curated_marketplace = response
+        .marketplaces
+        .iter()
+        .find(|marketplace| marketplace.name == "openai-api-curated")
+        .expect("expected API curated marketplace");
+    assert_eq!(api_curated_marketplace.plugins.len(), 1);
+    assert_eq!(
+        api_curated_marketplace.plugins[0].id,
+        "api-plugin@openai-api-curated"
+    );
     assert!(
         response
             .marketplaces
             .iter()
-            .all(|marketplace| marketplace.name != "openai-curated-remote")
+            .all(|marketplace| marketplace.name != "openai-curated")
     );
+    assert!(response.marketplace_load_errors.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn plugin_list_includes_chatgpt_curated_marketplace_for_bedrock_with_chatgpt_auth()
+-> Result<()> {
+    let codex_home = TempDir::new()?;
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        r#"model_provider = "amazon-bedrock"
+
+[model_providers.amazon-bedrock.aws]
+region = "us-east-2"
+profile = "default"
+
+[features]
+plugins = true
+remote_plugin = false
+"#,
+    )?;
+    write_openai_curated_marketplace(codex_home.path(), &["chatgpt-plugin"])?;
+    write_openai_api_curated_marketplace(codex_home.path(), &["api-plugin"])?;
+    write_chatgpt_auth(
+        codex_home.path(),
+        ChatGptAuthFixture::new("chatgpt-token")
+            .account_id("account-123")
+            .chatgpt_user_id("user-123")
+            .chatgpt_account_id("account-123"),
+        AuthCredentialsStoreMode::File,
+    )?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
+
+    let request_id = mcp
+        .send_plugin_list_request(PluginListParams {
+            cwds: None,
+            marketplace_kinds: None,
+            force_refetch: false,
+        })
+        .await?;
+    let response: PluginListResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
+
+    let chatgpt_curated_marketplace = response
+        .marketplaces
+        .iter()
+        .find(|marketplace| marketplace.name == "openai-curated")
+        .expect("expected ChatGPT curated marketplace");
+    assert_eq!(chatgpt_curated_marketplace.plugins.len(), 1);
+    assert_eq!(
+        chatgpt_curated_marketplace.plugins[0].id,
+        "chatgpt-plugin@openai-curated"
+    );
+    assert!(
+        response
+            .marketplaces
+            .iter()
+            .all(|marketplace| marketplace.name != "openai-api-curated")
+    );
+    assert!(response.marketplace_load_errors.is_empty());
     Ok(())
 }
 
@@ -2136,21 +3114,20 @@ async fn plugin_list_does_not_query_openai_curated_remote_collection_by_default(
         AuthCredentialsStoreMode::File,
     )?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
 
     let request_id = mcp
         .send_plugin_list_request(PluginListParams {
             cwds: None,
             marketplace_kinds: None,
+            force_refetch: false,
         })
         .await?;
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let response: PluginListResponse = to_response(response)?;
+    let response: PluginListResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
 
     assert!(
         response
@@ -2189,21 +3166,20 @@ async fn plugin_list_vertical_kind_noops_when_remote_plugin_enabled() -> Result<
         AuthCredentialsStoreMode::File,
     )?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
 
     let request_id = mcp
         .send_plugin_list_request(PluginListParams {
             cwds: None,
             marketplace_kinds: Some(vec![PluginListMarketplaceKind::Vertical]),
+            force_refetch: false,
         })
         .await?;
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let response: PluginListResponse = to_response(response)?;
+    let response: PluginListResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
 
     assert!(
         response
@@ -2243,22 +3219,21 @@ async fn plugin_list_does_not_append_global_remote_when_marketplace_kinds_are_ex
         AuthCredentialsStoreMode::File,
     )?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
 
     let request_id = mcp
         .send_plugin_list_request(PluginListParams {
             cwds: None,
             marketplace_kinds: Some(vec![PluginListMarketplaceKind::Local]),
+            force_refetch: false,
         })
         .await?;
 
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let response: PluginListResponse = to_response(response)?;
+    let response: PluginListResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
 
     assert!(
         response
@@ -2271,7 +3246,8 @@ async fn plugin_list_does_not_append_global_remote_when_marketplace_kinds_are_ex
 }
 
 #[tokio::test]
-async fn plugin_installed_includes_remote_shared_with_me_plugins() -> Result<()> {
+async fn plugin_installed_includes_remote_shared_with_me_plugins_when_remote_plugin_disabled()
+-> Result<()> {
     let codex_home = TempDir::new()?;
     let server = MockServer::start().await;
     std::fs::write(
@@ -2319,9 +3295,12 @@ plugin_sharing = true
     let global_installed_body = remote_installed_plugin_body("", "1.2.3", /*enabled*/ true);
     mount_remote_installed_plugins(&server, "GLOBAL", &global_installed_body).await;
     mount_remote_installed_plugins(&server, "WORKSPACE", &workspace_installed_body).await;
+    mount_empty_user_installed_plugins(&server).await;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
 
     let request_id = mcp
         .send_plugin_installed_request(PluginInstalledParams {
@@ -2330,12 +3309,8 @@ plugin_sharing = true
         })
         .await?;
 
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let response: PluginInstalledResponse = to_response(response)?;
+    let response: PluginInstalledResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
 
     assert_eq!(response.marketplaces.len(), 1);
     let marketplace = &response.marketplaces[0];
@@ -2351,28 +3326,37 @@ plugin_sharing = true
         marketplace
             .plugins
             .iter()
-            .map(|plugin| (plugin.id.clone(), plugin.installed, plugin.enabled))
+            .map(|plugin| {
+                (
+                    plugin.id.clone(),
+                    plugin.version.clone(),
+                    plugin.installed,
+                    plugin.enabled,
+                )
+            })
             .collect::<Vec<_>>(),
         vec![
             (
                 "shared-linear@workspace-shared-with-me".to_string(),
+                Some("1.2.3".to_string()),
                 true,
                 true
             ),
             (
                 "unlisted-linear@workspace-shared-with-me".to_string(),
+                Some("1.2.3".to_string()),
                 true,
                 false
             )
         ]
     );
-    wait_for_remote_installed_scope_request(&server, "WORKSPACE").await?;
-    wait_for_remote_installed_scope_request(&server, "GLOBAL").await?;
+    wait_for_remote_installed_snapshot_request(&server).await?;
     Ok(())
 }
 
 #[tokio::test]
-async fn plugin_installed_includes_workspace_directory_without_plugin_sharing() -> Result<()> {
+async fn plugin_installed_includes_workspace_directory_without_plugin_sharing_when_remote_plugin_disabled()
+-> Result<()> {
     let codex_home = TempDir::new()?;
     let server = MockServer::start().await;
     std::fs::write(
@@ -2419,9 +3403,12 @@ plugin_sharing = false
     let workspace_installed_body = serde_json::to_string(&workspace_installed_body)?;
     mount_remote_installed_plugins(&server, "GLOBAL", empty_remote_installed_plugins_body()).await;
     mount_remote_installed_plugins(&server, "WORKSPACE", &workspace_installed_body).await;
+    mount_empty_user_installed_plugins(&server).await;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
 
     let request_id = mcp
         .send_plugin_installed_request(PluginInstalledParams {
@@ -2430,12 +3417,8 @@ plugin_sharing = false
         })
         .await?;
 
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let response: PluginInstalledResponse = to_response(response)?;
+    let response: PluginInstalledResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
 
     assert_eq!(response.marketplaces.len(), 1);
     let marketplace = &response.marketplaces[0];
@@ -2452,13 +3435,12 @@ plugin_sharing = false
             true
         )]
     );
-    wait_for_remote_installed_scope_request(&server, "WORKSPACE").await?;
-    wait_for_remote_installed_scope_request(&server, "GLOBAL").await?;
+    wait_for_remote_installed_snapshot_request(&server).await?;
     Ok(())
 }
 
 #[tokio::test]
-async fn plugin_installed_starts_remote_installed_bundle_sync() -> Result<()> {
+async fn plugin_installed_includes_created_by_me_when_remote_plugins_enabled() -> Result<()> {
     let codex_home = TempDir::new()?;
     let server = MockServer::start().await;
     std::fs::write(
@@ -2468,7 +3450,6 @@ async fn plugin_installed_starts_remote_installed_bundle_sync() -> Result<()> {
 
 [features]
 plugins = true
-remote_plugin = true
 plugin_sharing = false
 "#,
             server.uri()
@@ -2482,64 +3463,251 @@ plugin_sharing = false
             .chatgpt_account_id("account-123"),
         AuthCredentialsStoreMode::File,
     )?;
-
-    let bundle_url = mount_remote_plugin_bundle(
-        &server,
-        "linear",
-        remote_plugin_bundle_tar_gz_bytes("linear")?,
-    )
-    .await;
-    let global_installed_body =
-        remote_installed_plugin_body(&bundle_url, "1.2.3", /*enabled*/ true);
-    mount_remote_installed_plugins(&server, "GLOBAL", &global_installed_body).await;
+    mount_remote_installed_plugins(&server, "GLOBAL", empty_remote_installed_plugins_body()).await;
     mount_remote_installed_plugins(&server, "WORKSPACE", empty_remote_installed_plugins_body())
         .await;
-
-    let mut mcp = TestAppServer::new_with_env(
-        codex_home.path(),
-        &[(TEST_ALLOW_HTTP_REMOTE_PLUGIN_BUNDLE_DOWNLOADS, Some("1"))],
+    let bundle_url = mount_remote_plugin_bundle(
+        &server,
+        "private-linear",
+        remote_plugin_bundle_tar_gz_bytes("private-linear", /*hooks_json*/ None)?,
     )
-    .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+    .await;
+    let mut user_installed_body: serde_json::Value =
+        serde_json::from_str(&user_remote_plugin_page_body(
+            "plugins~Plugin_55555555555555555555555555555555",
+            "private-linear",
+            "Private Linear",
+            "PRIVATE",
+            /*enabled*/ Some(true),
+        ))?;
+    user_installed_body["plugins"][0]["release"]["bundle_download_url"] =
+        serde_json::json!(bundle_url);
+    mount_remote_installed_plugins(
+        &server,
+        "USER",
+        &serde_json::to_string(&user_installed_body)?,
+    )
+    .await;
 
-    let plugin_installed_request_id = mcp
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .with_env_overrides(&[(TEST_ALLOW_HTTP_REMOTE_PLUGIN_BUNDLE_DOWNLOADS, Some("1"))])
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
+
+    let request_id = mcp
         .send_plugin_installed_request(PluginInstalledParams {
             cwds: None,
             install_suggestion_plugin_names: None,
         })
         .await?;
-    let response: PluginInstalledResponse = to_response(
-        timeout(
-            DEFAULT_TIMEOUT,
-            mcp.read_stream_until_response_message(RequestId::Integer(plugin_installed_request_id)),
-        )
-        .await??,
-    )?;
+    let response: PluginInstalledResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
 
     assert_eq!(response.marketplaces.len(), 1);
-    assert_eq!(response.marketplaces[0].name, "openai-curated-remote");
+    assert_eq!(response.marketplaces[0].name, "created-by-me-remote");
     assert_eq!(
         response.marketplaces[0]
             .plugins
             .iter()
-            .map(|plugin| (plugin.id.clone(), plugin.installed, plugin.enabled))
+            .map(|plugin| (plugin.id.as_str(), plugin.installed, plugin.enabled))
             .collect::<Vec<_>>(),
-        vec![("linear@openai-curated-remote".to_string(), true, true)]
+        vec![("private-linear@created-by-me-remote", true, true)]
     );
-    let installed_path = codex_home
-        .path()
-        .join("plugins/cache/openai-curated-remote/linear/1.2.3/.codex-plugin/plugin.json");
-    wait_for_path_exists(&installed_path).await?;
-    wait_for_remote_installed_scope_request(&server, "GLOBAL").await?;
-    wait_for_remote_installed_scope_request(&server, "WORKSPACE").await?;
+    wait_for_path_exists(
+        &codex_home.path().join(
+            "plugins/cache/created-by-me-remote/private-linear/1.2.3/.codex-plugin/plugin.json",
+        ),
+    )
+    .await?;
+    wait_for_remote_installed_snapshot_request(&server).await?;
     Ok(())
 }
 
 #[tokio::test]
-async fn plugin_list_fetches_workspace_directory_kind_without_remote_plugin_flag() -> Result<()> {
+async fn plugin_installed_trusts_new_workspace_listed_plugin_hooks() -> Result<()> {
     let codex_home = TempDir::new()?;
     let server = MockServer::start().await;
-    write_plugins_enabled_config_with_base_url(
+    let disabled_hook_key = "available-hooks@workspace-directory:hooks/hooks.json:pre_tool_use:0:0";
+    let unrelated_hook_key = "unrelated@test:hooks/hooks.json:session_start:0:0";
+    write_remote_plugin_hook_config(
+        codex_home.path(),
+        &format!("{}/backend-api/", server.uri()),
+        &format!(
+            r#"
+[hooks.state."{disabled_hook_key}"]
+enabled = false
+
+[hooks.state."{unrelated_hook_key}"]
+enabled = false
+trusted_hash = "sha256:unrelated"
+"#,
+        ),
+    )?;
+    write_remote_plugin_test_auth(codex_home.path())?;
+
+    let available_bundle_url = mount_remote_plugin_bundle_with_hooks(
+        &server,
+        "available-hooks",
+        Some(
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"echo available"}]}]}}"#,
+        ),
+    )
+    .await?;
+    let default_bundle_url = mount_remote_plugin_bundle_with_hooks(
+        &server,
+        "default-hooks",
+        Some(
+            r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"echo default"}]}]}}"#,
+        ),
+    )
+    .await?;
+    let no_hooks_bundle_url =
+        mount_remote_plugin_bundle_with_hooks(&server, "no-hooks", /*hooks_json*/ None).await?;
+    mount_workspace_bundle_sync(
+        &server,
+        &[
+            ("available-hooks", "AVAILABLE", &available_bundle_url),
+            ("default-hooks", "INSTALLED_BY_DEFAULT", &default_bundle_url),
+            ("no-hooks", "AVAILABLE", &no_hooks_bundle_url),
+        ],
+    )
+    .await;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .with_env_overrides(&[(TEST_ALLOW_HTTP_REMOTE_PLUGIN_BUNDLE_DOWNLOADS, Some("1"))])
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
+
+    trigger_plugin_installed_sync(&mut mcp).await?;
+    let plugin_ids = [
+        "available-hooks@workspace-directory",
+        "default-hooks@workspace-directory",
+    ];
+    let hooks = wait_for_plugin_hooks(
+        &mut mcp,
+        codex_home.path(),
+        &plugin_ids,
+        HookTrustStatus::Trusted,
+    )
+    .await?;
+    for plugin_id in plugin_ids {
+        assert!(
+            hooks
+                .iter()
+                .any(|hook| hook.plugin_id.as_deref() == Some(plugin_id))
+        );
+    }
+    wait_for_path_exists(
+        &codex_home
+            .path()
+            .join("plugins/cache/workspace-directory/no-hooks/1.2.3/.codex-plugin/plugin.json"),
+    )
+    .await?;
+    let config: toml::Value = toml::from_str(&std::fs::read_to_string(
+        codex_home.path().join("config.toml"),
+    )?)?;
+    let hook_states = config["hooks"]["state"].as_table().expect("hook states");
+    for hook in &hooks {
+        assert_eq!(
+            hook_states[hook.key.as_str()]["trusted_hash"].as_str(),
+            Some(hook.current_hash.as_str())
+        );
+    }
+    assert!(
+        !hooks
+            .iter()
+            .find(|hook| hook.key == disabled_hook_key)
+            .expect("disabled hook")
+            .enabled
+    );
+    assert_eq!(
+        hook_states[disabled_hook_key]["enabled"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        hook_states[unrelated_hook_key]["trusted_hash"].as_str(),
+        Some("sha256:unrelated")
+    );
+    assert_eq!(
+        hook_states[unrelated_hook_key]["enabled"].as_bool(),
+        Some(false)
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn plugin_installed_hook_trust_write_failure_stays_untrusted() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::symlink;
+
+    let codex_home = TempDir::new()?;
+    let config_target_dir = TempDir::new()?;
+    let config_target = config_target_dir.path().join("config.toml");
+    let server = MockServer::start().await;
+    write_remote_plugin_hook_config(
+        config_target_dir.path(),
+        &format!("{}/backend-api/", server.uri()),
+        "",
+    )?;
+    symlink(&config_target, codex_home.path().join("config.toml"))?;
+    write_remote_plugin_test_auth(codex_home.path())?;
+
+    let bundle_url = mount_remote_plugin_bundle_with_hooks(
+        &server,
+        "failed-trust",
+        Some(
+            r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"echo fail closed"}]}]}}"#,
+        ),
+    )
+    .await?;
+    mount_workspace_bundle_sync(&server, &[("failed-trust", "AVAILABLE", &bundle_url)]).await;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .with_env_overrides(&[(TEST_ALLOW_HTTP_REMOTE_PLUGIN_BUNDLE_DOWNLOADS, Some("1"))])
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
+
+    let original_permissions = std::fs::metadata(config_target_dir.path())?.permissions();
+    let _permission_guard = RestorePermissions(
+        config_target_dir.path().to_path_buf(),
+        original_permissions.clone(),
+    );
+    let mut read_only_permissions = original_permissions;
+    read_only_permissions.set_mode(read_only_permissions.mode() & !0o222);
+    std::fs::set_permissions(config_target_dir.path(), read_only_permissions)?;
+
+    trigger_plugin_installed_sync(&mut mcp).await?;
+    let plugin_ids = ["failed-trust@workspace-directory"];
+    let before = wait_for_plugin_hooks(
+        &mut mcp,
+        codex_home.path(),
+        &plugin_ids,
+        HookTrustStatus::Untrusted,
+    )
+    .await?;
+    sleep(Duration::from_millis(300)).await;
+    let after = wait_for_plugin_hooks(
+        &mut mcp,
+        codex_home.path(),
+        &plugin_ids,
+        HookTrustStatus::Untrusted,
+    )
+    .await?;
+
+    assert_eq!(after[0].current_hash, before[0].current_hash);
+    assert!(!std::fs::read_to_string(config_target)?.contains("trusted_hash"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn plugin_list_fetches_workspace_directory_kind_when_remote_plugin_disabled() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let server = MockServer::start().await;
+    write_remote_plugins_disabled_config_with_base_url(
         codex_home.path(),
         &format!("{}/backend-api/", server.uri()),
     )?;
@@ -2566,25 +3734,32 @@ async fn plugin_list_fetches_workspace_directory_kind_without_remote_plugin_flag
         "LISTED",
         /*enabled*/ Some(false),
     );
+    let refreshed_workspace_plugin_body = workspace_remote_plugin_page_body(
+        "plugins~Plugin_22222222222222222222222222222222",
+        "workspace-notion",
+        "Workspace Notion",
+        "LISTED",
+        /*enabled*/ None,
+    );
     mount_remote_plugin_list(&server, "WORKSPACE", &workspace_plugin_body).await;
     mount_remote_installed_plugins(&server, "WORKSPACE", &workspace_installed_body).await;
+    mount_empty_user_installed_plugins(&server).await;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
 
     let request_id = mcp
         .send_plugin_list_request(PluginListParams {
             cwds: None,
             marketplace_kinds: Some(vec![PluginListMarketplaceKind::WorkspaceDirectory]),
+            force_refetch: false,
         })
         .await?;
 
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let response: PluginListResponse = to_response(response)?;
+    let response: PluginListResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
 
     assert_eq!(response.marketplaces.len(), 1);
     let marketplace = &response.marketplaces[0];
@@ -2619,6 +3794,252 @@ async fn plugin_list_fetches_workspace_directory_kind_without_remote_plugin_flag
                 .query()
                 .is_some_and(|query| query.contains("scope=GLOBAL")))
     );
+
+    let request_id = mcp
+        .send_plugin_list_request(PluginListParams {
+            cwds: None,
+            marketplace_kinds: Some(vec![PluginListMarketplaceKind::WorkspaceDirectory]),
+            force_refetch: false,
+        })
+        .await?;
+    let response: PluginListResponse = to_response(
+        timeout(
+            DEFAULT_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+        )
+        .await??,
+    )?;
+    assert_eq!(
+        response.marketplaces[0].plugins[0].id,
+        "workspace-linear@workspace-directory"
+    );
+    sleep(Duration::from_millis(100)).await;
+    wait_for_remote_plugin_list_scope_request_count(
+        &server,
+        "WORKSPACE",
+        /*expected_count*/ 1,
+    )
+    .await?;
+
+    rewrite_cached_remote_catalog_fetched_at(
+        codex_home.path(),
+        Utc::now() - ChronoDuration::hours(4),
+    )?;
+    server.reset().await;
+    mount_delayed_remote_plugin_list(&server, "WORKSPACE", &refreshed_workspace_plugin_body).await;
+    mount_remote_installed_plugins(&server, "GLOBAL", empty_remote_installed_plugins_body()).await;
+    mount_remote_installed_plugins(&server, "WORKSPACE", empty_remote_installed_plugins_body())
+        .await;
+    mount_empty_user_installed_plugins(&server).await;
+
+    let request_id = mcp
+        .send_plugin_list_request(PluginListParams {
+            cwds: None,
+            marketplace_kinds: Some(vec![PluginListMarketplaceKind::WorkspaceDirectory]),
+            force_refetch: false,
+        })
+        .await?;
+    let response: PluginListResponse = to_response(
+        timeout(
+            DEFAULT_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+        )
+        .await??,
+    )?;
+    assert_eq!(
+        response.marketplaces[0].plugins[0].id,
+        "workspace-linear@workspace-directory"
+    );
+
+    wait_for_remote_plugin_list_scope_request_count(
+        &server,
+        "WORKSPACE",
+        /*expected_count*/ 1,
+    )
+    .await?;
+    wait_for_cached_remote_catalog_plugin_ids(
+        codex_home.path(),
+        &["plugins~Plugin_22222222222222222222222222222222"],
+    )
+    .await?;
+
+    let request_id = mcp
+        .send_plugin_list_request(PluginListParams {
+            cwds: None,
+            marketplace_kinds: Some(vec![PluginListMarketplaceKind::WorkspaceDirectory]),
+            force_refetch: false,
+        })
+        .await?;
+    let response: PluginListResponse = to_response(
+        timeout(
+            DEFAULT_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+        )
+        .await??,
+    )?;
+    assert_eq!(
+        response.marketplaces[0].plugins[0].id,
+        "workspace-notion@workspace-directory"
+    );
+    sleep(Duration::from_millis(100)).await;
+    wait_for_remote_plugin_list_scope_request_count(
+        &server,
+        "WORKSPACE",
+        /*expected_count*/ 1,
+    )
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn plugin_list_fetches_user_plugins_in_created_by_me_remote_marketplace() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let server = MockServer::start().await;
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        format!(
+            r#"chatgpt_base_url = "{}/backend-api/"
+
+[features]
+plugins = true
+plugin_sharing = false
+"#,
+            server.uri()
+        ),
+    )?;
+    write_chatgpt_auth(
+        codex_home.path(),
+        ChatGptAuthFixture::new("chatgpt-token")
+            .account_id("account-123")
+            .chatgpt_user_id("user-123")
+            .chatgpt_account_id("account-123"),
+        AuthCredentialsStoreMode::File,
+    )?;
+
+    let mut private_page: serde_json::Value = serde_json::from_str(&user_remote_plugin_page_body(
+        "plugins~Plugin_55555555555555555555555555555555",
+        "private-linear",
+        "Private Linear",
+        "PRIVATE",
+        /*enabled*/ None,
+    ))?;
+    private_page["pagination"]["next_page_token"] = serde_json::json!("page-2");
+    Mock::given(method("GET"))
+        .and(path("/backend-api/ps/plugins/list"))
+        .and(query_param("scope", "USER"))
+        .and(query_param("limit", "200"))
+        .and(query_param_is_missing("pageToken"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(private_page))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/backend-api/ps/plugins/list"))
+        .and(query_param("scope", "USER"))
+        .and(query_param("limit", "200"))
+        .and(query_param("pageToken", "page-2"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(user_remote_plugin_page_body(
+                "plugins~Plugin_66666666666666666666666666666666",
+                "second-private-linear",
+                "Second Private Linear",
+                "PRIVATE",
+                /*enabled*/ None,
+            )),
+        )
+        .mount(&server)
+        .await;
+    mount_remote_installed_plugins(
+        &server,
+        "USER",
+        &user_remote_plugin_page_body(
+            "plugins~Plugin_55555555555555555555555555555555",
+            "private-linear",
+            "Private Linear",
+            "PRIVATE",
+            /*enabled*/ Some(true),
+        ),
+    )
+    .await;
+    mount_remote_installed_plugins(&server, "GLOBAL", empty_remote_installed_plugins_body()).await;
+    mount_remote_installed_plugins(&server, "WORKSPACE", empty_remote_installed_plugins_body())
+        .await;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
+
+    let request_id = mcp
+        .send_plugin_list_request(PluginListParams {
+            cwds: None,
+            marketplace_kinds: Some(vec![PluginListMarketplaceKind::CreatedByMeRemote]),
+            force_refetch: false,
+        })
+        .await?;
+
+    let response: PluginListResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
+
+    assert_eq!(response.marketplaces.len(), 1);
+    let marketplace = &response.marketplaces[0];
+    assert_eq!(marketplace.name, "created-by-me-remote");
+    assert_eq!(
+        marketplace
+            .interface
+            .as_ref()
+            .and_then(|interface| interface.display_name.as_deref()),
+        Some("Created by me")
+    );
+    assert_eq!(marketplace.plugins.len(), 2);
+    assert_eq!(
+        marketplace.plugins[0].id,
+        "private-linear@created-by-me-remote"
+    );
+    assert_eq!(
+        marketplace.plugins[0].remote_plugin_id.as_deref(),
+        Some("plugins~Plugin_55555555555555555555555555555555")
+    );
+    assert_eq!(marketplace.plugins[0].installed, true);
+    assert_eq!(marketplace.plugins[0].enabled, true);
+    assert_eq!(marketplace.plugins[0].share_context, None);
+    assert_eq!(
+        marketplace.plugins[1].id,
+        "second-private-linear@created-by-me-remote"
+    );
+    assert_eq!(marketplace.plugins[1].installed, false);
+    assert_eq!(marketplace.plugins[1].enabled, false);
+    assert!(
+        !server
+            .received_requests()
+            .await
+            .expect("wiremock should record requests")
+            .iter()
+            .any(|request| {
+                request.url.path().ends_with("/ps/plugins/list")
+                    && request
+                        .url
+                        .query_pairs()
+                        .any(|(key, value)| key == "scope" && value != "USER")
+            })
+    );
+
+    let request_id = mcp
+        .send_plugin_list_request(PluginListParams {
+            cwds: None,
+            marketplace_kinds: Some(vec![PluginListMarketplaceKind::CreatedByMeRemote]),
+            force_refetch: false,
+        })
+        .await?;
+    let response: PluginListResponse = to_response(
+        timeout(
+            DEFAULT_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+        )
+        .await??,
+    )?;
+    assert_eq!(response.marketplaces[0].plugins.len(), 2);
+    sleep(Duration::from_millis(100)).await;
+    wait_for_remote_plugin_list_scope_request_count(&server, "USER", /*expected_count*/ 2).await?;
     Ok(())
 }
 
@@ -2685,23 +4106,23 @@ async fn plugin_list_fetches_shared_with_me_kind() -> Result<()> {
     mount_shared_workspace_plugins(&server, &shared_plugin_body).await;
     mount_remote_installed_plugins(&server, "GLOBAL", empty_remote_installed_plugins_body()).await;
     mount_remote_installed_plugins(&server, "WORKSPACE", &workspace_installed_body).await;
+    mount_empty_user_installed_plugins(&server).await;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
 
     let request_id = mcp
         .send_plugin_list_request(PluginListParams {
             cwds: None,
             marketplace_kinds: Some(vec![PluginListMarketplaceKind::SharedWithMe]),
+            force_refetch: false,
         })
         .await?;
 
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let response: PluginListResponse = to_response(response)?;
+    let response: PluginListResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
 
     assert_eq!(response.marketplaces.len(), 2);
     let marketplace = response
@@ -2812,8 +4233,7 @@ async fn plugin_list_fetches_shared_with_me_kind() -> Result<()> {
         share_context.discoverability,
         Some(PluginShareDiscoverability::Unlisted)
     );
-    wait_for_remote_installed_scope_request(&server, "WORKSPACE").await?;
-    wait_for_remote_installed_scope_request(&server, "GLOBAL").await?;
+    wait_for_remote_installed_snapshot_request(&server).await?;
     wait_for_remote_plugin_request_count(&server, "/ps/plugins/list", /*expected_count*/ 0).await?;
     Ok(())
 }
@@ -2843,22 +4263,21 @@ plugin_sharing = false
         AuthCredentialsStoreMode::File,
     )?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
 
     let request_id = mcp
         .send_plugin_list_request(PluginListParams {
             cwds: None,
             marketplace_kinds: Some(vec![PluginListMarketplaceKind::SharedWithMe]),
+            force_refetch: false,
         })
         .await?;
 
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let response: PluginListResponse = to_response(response)?;
+    let response: PluginListResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
 
     assert_eq!(
         response,
@@ -2878,7 +4297,88 @@ plugin_sharing = false
 }
 
 #[tokio::test]
+async fn plugin_list_omits_created_by_me_when_remote_plugins_disabled() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let server = MockServer::start().await;
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        format!(
+            r#"chatgpt_base_url = "{}/backend-api/"
+
+[features]
+plugins = true
+remote_plugin = false
+plugin_sharing = true
+"#,
+            server.uri()
+        ),
+    )?;
+    write_chatgpt_auth(
+        codex_home.path(),
+        ChatGptAuthFixture::new("chatgpt-token")
+            .account_id("account-123")
+            .chatgpt_user_id("user-123")
+            .chatgpt_account_id("account-123"),
+        AuthCredentialsStoreMode::File,
+    )?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
+
+    let request_id = mcp
+        .send_plugin_list_request(PluginListParams {
+            cwds: None,
+            marketplace_kinds: Some(vec![PluginListMarketplaceKind::CreatedByMeRemote]),
+            force_refetch: false,
+        })
+        .await?;
+
+    let response: PluginListResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
+
+    assert_eq!(
+        response,
+        PluginListResponse {
+            marketplaces: Vec::new(),
+            marketplace_load_errors: Vec::new(),
+            featured_plugin_ids: Vec::new(),
+        }
+    );
+    wait_for_remote_plugin_request_count(&server, "/ps/plugins/list", /*expected_count*/ 0).await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn plugin_list_marks_remote_plugin_disabled_by_admin() -> Result<()> {
+    assert_disabled_remote_plugin_metadata(
+        PluginDisabledReason::DisabledByAdmin,
+        /*eligible_plan_types*/ None,
+        PluginInstallPolicy::Available,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn plugin_list_preserves_plan_ineligible_remote_plugin_metadata() -> Result<()> {
+    assert_disabled_remote_plugin_metadata(
+        PluginDisabledReason::PlanNotEligible,
+        Some(vec![
+            "plus".to_string(),
+            "pro".to_string(),
+            "enterprise_cbp_automation".to_string(),
+        ]),
+        PluginInstallPolicy::NotAvailable,
+    )
+    .await
+}
+
+async fn assert_disabled_remote_plugin_metadata(
+    disabled_reason: PluginDisabledReason,
+    eligible_plan_types: Option<Vec<String>>,
+    installation_policy: PluginInstallPolicy,
+) -> Result<()> {
     let codex_home = TempDir::new()?;
     let server = MockServer::start().await;
     write_remote_plugin_catalog_config(
@@ -2894,65 +4394,51 @@ async fn plugin_list_marks_remote_plugin_disabled_by_admin() -> Result<()> {
         AuthCredentialsStoreMode::File,
     )?;
 
-    let global_directory_body = r#"{
-  "plugins": [
-    {
-      "id": "plugins~Plugin_00000000000000000000000000000000",
-      "name": "linear",
-      "scope": "GLOBAL",
-      "installation_policy": "AVAILABLE",
-      "authentication_policy": "ON_USE",
-      "status": "DISABLED_BY_ADMIN",
-      "release": {
-        "display_name": "Linear",
-        "description": "Track work in Linear",
-        "app_ids": [],
-        "interface": {},
-        "skills": []
-      }
-    }
-  ],
-  "pagination": {
-    "limit": 50,
-    "next_page_token": null
-  }
-}"#;
-    let global_installed_body = r#"{
-  "plugins": [
-    {
-      "id": "plugins~Plugin_00000000000000000000000000000000",
-      "name": "linear",
-      "scope": "GLOBAL",
-      "installation_policy": "AVAILABLE",
-      "authentication_policy": "ON_USE",
-      "status": "DISABLED_BY_ADMIN",
-      "release": {
-        "display_name": "Linear",
-        "description": "Track work in Linear",
-        "app_ids": [],
-        "interface": {},
-        "skills": []
-      },
-      "enabled": true,
-      "disabled_skill_names": []
-    }
-  ],
-  "pagination": {
-    "limit": 50,
-    "next_page_token": null
-  }
-}"#;
-    let empty_page_body = r#"{
-  "plugins": [],
-  "pagination": {
-    "limit": 50,
-    "next_page_token": null
-  }
-}"#;
+    let plugin = serde_json::json!({
+        "id": "plugins~Plugin_00000000000000000000000000000000",
+        "name": "gmail",
+        "scope": "GLOBAL",
+        "installation_policy": installation_policy,
+        "authentication_policy": "ON_USE",
+        "status": "DISABLED_BY_ADMIN",
+        "disabled_reason": disabled_reason,
+        "eligible_plan_types": eligible_plan_types,
+        "release": {
+            "display_name": "Gmail",
+            "description": "Search and manage email",
+            "app_ids": [],
+            "interface": {},
+            "skills": [],
+        },
+    });
+    let global_directory_body = serde_json::json!({
+        "plugins": [plugin.clone()],
+        "pagination": {
+            "limit": 50,
+            "next_page_token": null,
+        },
+    });
+    let mut installed_plugin = plugin;
+    installed_plugin["enabled"] = serde_json::json!(true);
+    installed_plugin["disabled_skill_names"] = serde_json::json!([]);
+    let global_installed_body = serde_json::json!({
+        "plugins": [installed_plugin],
+        "pagination": {
+            "limit": 50,
+            "next_page_token": null,
+        },
+    });
+    let empty_page_body = serde_json::json!({
+        "plugins": [],
+        "pagination": {
+            "limit": 50,
+            "next_page_token": null,
+        },
+    });
 
     for (scope, body) in [
-        ("GLOBAL", global_directory_body),
-        ("WORKSPACE", empty_page_body),
+        ("GLOBAL", &global_directory_body),
+        ("WORKSPACE", &empty_page_body),
     ] {
         Mock::given(method("GET"))
             .and(path("/backend-api/ps/plugins/list"))
@@ -2960,40 +4446,39 @@ async fn plugin_list_marks_remote_plugin_disabled_by_admin() -> Result<()> {
             .and(query_param("limit", "200"))
             .and(header("authorization", "Bearer chatgpt-token"))
             .and(header("chatgpt-account-id", "account-123"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
             .mount(&server)
             .await;
     }
     for (scope, body) in [
-        ("GLOBAL", global_installed_body),
-        ("WORKSPACE", empty_page_body),
+        ("GLOBAL", &global_installed_body),
+        ("WORKSPACE", &empty_page_body),
     ] {
         Mock::given(method("GET"))
             .and(path("/backend-api/ps/plugins/installed"))
             .and(query_param("scope", scope))
             .and(header("authorization", "Bearer chatgpt-token"))
             .and(header("chatgpt-account-id", "account-123"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
             .mount(&server)
             .await;
     }
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
 
     let request_id = mcp
         .send_plugin_list_request(PluginListParams {
             cwds: None,
             marketplace_kinds: None,
+            force_refetch: false,
         })
         .await?;
 
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let response: PluginListResponse = to_response(response)?;
+    let response: PluginListResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
     let remote_marketplace = response
         .marketplaces
         .into_iter()
@@ -3009,6 +4494,9 @@ async fn plugin_list_marks_remote_plugin_disabled_by_admin() -> Result<()> {
         plugin.availability,
         codex_app_server_protocol::PluginAvailability::DisabledByAdmin
     );
+    assert_eq!(plugin.disabled_reason, Some(disabled_reason));
+    assert_eq!(plugin.eligible_plan_types, eligible_plan_types);
+    assert_eq!(plugin.install_policy, installation_policy);
     Ok(())
 }
 
@@ -3038,22 +4526,21 @@ remote_plugin = true
         AuthCredentialsStoreMode::File,
     )?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
 
     let request_id = mcp
         .send_plugin_list_request(PluginListParams {
             cwds: None,
             marketplace_kinds: None,
+            force_refetch: false,
         })
         .await?;
 
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let response: PluginListResponse = to_response(response)?;
+    let response: PluginListResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
 
     assert!(response.marketplaces.is_empty());
     wait_for_remote_plugin_request_count(&server, "/ps/plugins/list", /*expected_count*/ 0).await?;
@@ -3074,22 +4561,21 @@ async fn plugin_list_fetches_featured_plugin_ids_without_chatgpt_auth() -> Resul
         .mount(&server)
         .await;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
 
     let request_id = mcp
         .send_plugin_list_request(PluginListParams {
             cwds: None,
             marketplace_kinds: None,
+            force_refetch: false,
         })
         .await?;
 
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let response: PluginListResponse = to_response(response)?;
+    let response: PluginListResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
 
     assert_eq!(
         response.featured_plugin_ids,
@@ -3113,23 +4599,23 @@ async fn plugin_list_uses_warmed_featured_plugin_ids_cache_on_first_request() ->
         .mount(&server)
         .await;
 
-    let mut mcp = TestAppServer::new_with_plugin_startup_tasks(codex_home.path()).await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .with_plugin_startup_tasks()
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
     wait_for_featured_plugin_request_count(&server, /*expected_count*/ 1).await?;
 
     let request_id = mcp
         .send_plugin_list_request(PluginListParams {
             cwds: None,
             marketplace_kinds: None,
+            force_refetch: false,
         })
         .await?;
 
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let response: PluginListResponse = to_response(response)?;
+    let response: PluginListResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
 
     assert_eq!(
         response.featured_plugin_ids,
@@ -3184,7 +4670,43 @@ async fn wait_for_remote_plugin_request_count(
     Ok(())
 }
 
-async fn wait_for_remote_installed_scope_request(server: &MockServer, scope: &str) -> Result<()> {
+async fn wait_for_remote_plugin_list_scope_request_count(
+    server: &MockServer,
+    scope: &str,
+    expected_count: usize,
+) -> Result<()> {
+    timeout(DEFAULT_TIMEOUT, async {
+        loop {
+            let Some(requests) = server.received_requests().await else {
+                bail!("wiremock did not record requests");
+            };
+            let request_count = requests
+                .iter()
+                .filter(|request| {
+                    request.method == "GET"
+                        && request.url.path().ends_with("/ps/plugins/list")
+                        && request
+                            .url
+                            .query_pairs()
+                            .any(|(name, value)| name == "scope" && value == scope)
+                })
+                .count();
+            if request_count == expected_count {
+                return Ok::<(), anyhow::Error>(());
+            }
+            if request_count > expected_count {
+                bail!(
+                    "expected exactly {expected_count} /ps/plugins/list requests for scope {scope}, got {request_count}"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
+    Ok(())
+}
+
+async fn wait_for_remote_installed_snapshot_request(server: &MockServer) -> Result<()> {
     timeout(DEFAULT_TIMEOUT, async {
         loop {
             let Some(requests) = server.received_requests().await else {
@@ -3193,10 +4715,7 @@ async fn wait_for_remote_installed_scope_request(server: &MockServer, scope: &st
             if requests.iter().any(|request| {
                 request.method == "GET"
                     && request.url.path().ends_with("/ps/plugins/installed")
-                    && request
-                        .url
-                        .query_pairs()
-                        .any(|(name, value)| name == "scope" && value == scope)
+                    && request.url.query_pairs().all(|(name, _)| name != "scope")
             }) {
                 return Ok::<(), anyhow::Error>(());
             }
@@ -3253,6 +4772,20 @@ fn cached_remote_catalog_plugin_ids(codex_home: &std::path::Path) -> Result<Vec<
     Ok(plugin_ids)
 }
 
+fn rewrite_cached_remote_catalog_fetched_at(
+    codex_home: &std::path::Path,
+    fetched_at: chrono::DateTime<Utc>,
+) -> Result<()> {
+    let cache_dir = codex_home.join("cache/remote_plugin_catalog");
+    for entry in std::fs::read_dir(cache_dir)? {
+        let path = entry?.path();
+        let mut cached_catalog: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+        cached_catalog["fetched_at"] = serde_json::json!(fetched_at);
+        std::fs::write(path, serde_json::to_vec_pretty(&cached_catalog)?)?;
+    }
+    Ok(())
+}
+
 async fn wait_for_path_exists(path: &std::path::Path) -> Result<()> {
     timeout(DEFAULT_TIMEOUT, async {
         loop {
@@ -3264,6 +4797,54 @@ async fn wait_for_path_exists(path: &std::path::Path) -> Result<()> {
     })
     .await??;
     Ok(())
+}
+
+async fn trigger_plugin_installed_sync(mcp: &mut TestAppServer) -> Result<()> {
+    let request_id = mcp
+        .send_plugin_installed_request(PluginInstalledParams {
+            cwds: None,
+            install_suggestion_plugin_names: None,
+        })
+        .await?;
+    let _: PluginInstalledResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
+    Ok(())
+}
+
+async fn wait_for_plugin_hooks(
+    mcp: &mut TestAppServer,
+    cwd: &std::path::Path,
+    plugin_ids: &[&str],
+    expected_status: HookTrustStatus,
+) -> Result<Vec<HookMetadata>> {
+    timeout(DEFAULT_TIMEOUT, async {
+        loop {
+            let request_id = mcp
+                .send_hooks_list_request(HooksListParams {
+                    cwds: vec![cwd.to_path_buf()],
+                })
+                .await?;
+            let HooksListResponse { data } = mcp.read_response(request_id).await?;
+            let hooks = data
+                .into_iter()
+                .flat_map(|entry| entry.hooks)
+                .filter(|hook| {
+                    hook.plugin_id
+                        .as_deref()
+                        .is_some_and(|plugin_id| plugin_ids.contains(&plugin_id))
+                })
+                .collect::<Vec<_>>();
+            if hooks.len() == plugin_ids.len()
+                && hooks
+                    .iter()
+                    .all(|hook| hook.trust_status == expected_status)
+            {
+                return Ok::<_, anyhow::Error>(hooks);
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?
 }
 
 async fn wait_for_path_missing(path: &std::path::Path) -> Result<()> {
@@ -3287,6 +4868,22 @@ async fn mount_remote_plugin_list(server: &MockServer, scope: &str, body: &str) 
         .and(header("authorization", "Bearer chatgpt-token"))
         .and(header("chatgpt-account-id", "account-123"))
         .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(server)
+        .await;
+}
+
+async fn mount_delayed_remote_plugin_list(server: &MockServer, scope: &str, body: &str) {
+    Mock::given(method("GET"))
+        .and(path("/backend-api/ps/plugins/list"))
+        .and(query_param("scope", scope))
+        .and(query_param("limit", "200"))
+        .and(header("authorization", "Bearer chatgpt-token"))
+        .and(header("chatgpt-account-id", "account-123"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(body)
+                .set_delay(Duration::from_millis(/*millis*/ 200)),
+        )
         .mount(server)
         .await;
 }
@@ -3353,6 +4950,19 @@ async fn mount_shared_workspace_plugins(server: &MockServer, body: &str) {
 }
 
 async fn mount_remote_installed_plugins(server: &MockServer, scope: &str, body: &str) {
+    let plugins = serde_json::from_str::<serde_json::Value>(body)
+        .expect("installed plugin fixture should be valid JSON")["plugins"]
+        .as_array()
+        .expect("installed plugin fixture should contain plugins")
+        .clone();
+    REMOTE_INSTALLED_PLUGIN_FIXTURES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(server.uri())
+        .or_default()
+        .insert(scope.to_string(), plugins);
+
     Mock::given(method("GET"))
         .and(path("/backend-api/ps/plugins/installed"))
         .and(query_param("scope", scope))
@@ -3361,6 +4971,38 @@ async fn mount_remote_installed_plugins(server: &MockServer, scope: &str, body: 
         .respond_with(ResponseTemplate::new(200).set_body_string(body))
         .mount(server)
         .await;
+
+    let server_uri = server.uri();
+    Mock::given(method("GET"))
+        .and(path("/backend-api/ps/plugins/installed"))
+        .and(query_param_is_missing("scope"))
+        .and(header("authorization", "Bearer chatgpt-token"))
+        .and(header("chatgpt-account-id", "account-123"))
+        .respond_with(move |_request: &wiremock::Request| {
+            let fixtures = REMOTE_INSTALLED_PLUGIN_FIXTURES
+                .get()
+                .expect("installed plugin fixtures should exist")
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let scoped_plugins = fixtures
+                .get(&server_uri)
+                .expect("installed plugin fixtures should exist for this server");
+            let plugins = ["GLOBAL", "WORKSPACE", "USER"]
+                .into_iter()
+                .flat_map(|scope| scoped_plugins.get(scope).into_iter().flatten())
+                .cloned()
+                .collect::<Vec<_>>();
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "plugins": plugins,
+                "pagination": {"limit": 50, "next_page_token": null},
+            }))
+        })
+        .mount(server)
+        .await;
+}
+
+async fn mount_empty_user_installed_plugins(server: &MockServer) {
+    mount_remote_installed_plugins(server, "USER", empty_remote_installed_plugins_body()).await;
 }
 
 fn empty_remote_installed_plugins_body() -> &'static str {
@@ -3429,6 +5071,51 @@ fn workspace_remote_plugin_page_body(
     )
 }
 
+async fn mount_workspace_bundle_sync(server: &MockServer, plugins: &[(&str, &str, &str)]) {
+    let plugins = plugins
+        .iter()
+        .map(|(name, install_policy, bundle_url)| {
+            let body: serde_json::Value = serde_json::from_str(&workspace_remote_plugin_page_body(
+                &format!("plugins~Plugin_{name}"),
+                name,
+                name,
+                "LISTED",
+                /*enabled*/ Some(true),
+            ))
+            .expect("workspace plugin body");
+            let mut plugin = body["plugins"][0].clone();
+            plugin["installation_policy"] = serde_json::json!(install_policy);
+            plugin["release"]["bundle_download_url"] = serde_json::json!(bundle_url);
+            plugin
+        })
+        .collect::<Vec<_>>();
+    let body = serde_json::json!({
+        "plugins": plugins,
+        "pagination": {"next_page_token": null},
+    })
+    .to_string();
+    mount_remote_installed_plugins(server, "GLOBAL", empty_remote_installed_plugins_body()).await;
+    mount_remote_installed_plugins(server, "WORKSPACE", &body).await;
+    mount_empty_user_installed_plugins(server).await;
+}
+
+fn user_remote_plugin_page_body(
+    remote_plugin_id: &str,
+    plugin_name: &str,
+    display_name: &str,
+    discoverability: &str,
+    enabled: Option<bool>,
+) -> String {
+    workspace_remote_plugin_page_body(
+        remote_plugin_id,
+        plugin_name,
+        display_name,
+        discoverability,
+        enabled,
+    )
+    .replacen(r#""scope": "WORKSPACE""#, r#""scope": "USER""#, 1)
+}
+
 fn remote_installed_plugin_body(
     bundle_download_url: &str,
     release_version: &str,
@@ -3473,6 +5160,7 @@ fn remote_installed_plugin_body_with_optional_app_manifest(
       "name": "linear",
       "scope": "GLOBAL",
       "installation_policy": "AVAILABLE",
+      "installation_policy_source": "WORKSPACE_SETTING",
       "authentication_policy": "ON_USE",
       "release": {{
         "version": "{release_version}",
@@ -3514,12 +5202,28 @@ async fn mount_remote_plugin_bundle(
     format!("{}{bundle_path}", server.uri())
 }
 
-fn remote_plugin_bundle_tar_gz_bytes(plugin_name: &str) -> Result<Vec<u8>> {
+async fn mount_remote_plugin_bundle_with_hooks(
+    server: &MockServer,
+    plugin_name: &str,
+    hooks_json: Option<&str>,
+) -> Result<String> {
+    Ok(mount_remote_plugin_bundle(
+        server,
+        plugin_name,
+        remote_plugin_bundle_tar_gz_bytes(plugin_name, hooks_json)?,
+    )
+    .await)
+}
+
+fn remote_plugin_bundle_tar_gz_bytes(
+    plugin_name: &str,
+    hooks_json: Option<&str>,
+) -> Result<Vec<u8>> {
     let manifest = format!(r#"{{"name":"{plugin_name}"}}"#);
     let skill = "---\nname: plan-work\ndescription: Track work in Linear.\n---\n\n# Plan Work\n";
     let encoder = GzEncoder::new(Vec::new(), Compression::default());
     let mut tar = tar::Builder::new(encoder);
-    for (path, contents, mode) in [
+    let mut entries = vec![
         (
             ".codex-plugin/plugin.json",
             manifest.as_bytes(),
@@ -3530,7 +5234,15 @@ fn remote_plugin_bundle_tar_gz_bytes(plugin_name: &str) -> Result<Vec<u8>> {
             skill.as_bytes(),
             /*mode*/ 0o644,
         ),
-    ] {
+    ];
+    if let Some(hooks_json) = hooks_json {
+        entries.push((
+            "hooks/hooks.json",
+            hooks_json.as_bytes(),
+            /*mode*/ 0o644,
+        ));
+    }
+    for (path, contents, mode) in entries {
         let mut header = tar::Header::new_gnu();
         header.set_size(contents.len() as u64);
         header.set_mode(mode);
@@ -3604,14 +5316,71 @@ chatgpt_base_url = "{base_url}"
 
 [features]
 plugins = true
-remote_plugin = true
 "#
         ),
     )
 }
 
+fn write_remote_plugin_hook_config(
+    codex_home: &std::path::Path,
+    base_url: &str,
+    hook_state: &str,
+) -> std::io::Result<()> {
+    std::fs::write(
+        codex_home.join("config.toml"),
+        format!(
+            r#"chatgpt_base_url = "{base_url}"
+
+[features]
+plugins = true
+hooks = true
+{hook_state}"#,
+        ),
+    )
+}
+
+fn write_remote_plugin_test_auth(codex_home: &std::path::Path) -> Result<()> {
+    write_chatgpt_auth(
+        codex_home,
+        ChatGptAuthFixture::new("chatgpt-token")
+            .account_id("account-123")
+            .chatgpt_user_id("user-123")
+            .chatgpt_account_id("account-123"),
+        AuthCredentialsStoreMode::File,
+    )
+}
+
 fn write_openai_curated_marketplace(
     codex_home: &std::path::Path,
+    plugin_names: &[&str],
+) -> std::io::Result<()> {
+    write_curated_marketplace(
+        codex_home,
+        "marketplace.json",
+        "openai-curated",
+        /*display_name*/ None,
+        plugin_names,
+    )
+}
+
+fn write_openai_api_curated_marketplace(
+    codex_home: &std::path::Path,
+    plugin_names: &[&str],
+) -> std::io::Result<()> {
+    write_curated_marketplace(
+        codex_home,
+        "api_marketplace.json",
+        "openai-api-curated",
+        Some("OpenAI Curated"),
+        plugin_names,
+    )
+}
+
+fn write_curated_marketplace(
+    codex_home: &std::path::Path,
+    manifest_name: &str,
+    marketplace_name: &str,
+    display_name: Option<&str>,
     plugin_names: &[&str],
 ) -> std::io::Result<()> {
     let curated_root = codex_home.join(".tmp/plugins");
@@ -3632,11 +5401,21 @@ fn write_openai_curated_marketplace(
         })
         .collect::<Vec<_>>()
         .join(",\n");
+    let interface = display_name
+        .map(|display_name| {
+            format!(
+                r#"
+  "interface": {{
+    "displayName": "{display_name}"
+  }},"#
+            )
+        })
+        .unwrap_or_default();
     std::fs::write(
-        curated_root.join(".agents/plugins/marketplace.json"),
+        curated_root.join(".agents/plugins").join(manifest_name),
         format!(
             r#"{{
-  "name": "openai-curated",
+  "name": "{marketplace_name}",{interface}
   "plugins": [
 {plugins}
   ]
@@ -3679,4 +5458,14 @@ fn write_plugin_share_local_path_mapping(
         codex_home.join(".tmp/plugin-share-local-paths-v1.json"),
         format!("{contents}\n"),
     )
+}
+
+#[cfg(unix)]
+struct RestorePermissions(std::path::PathBuf, std::fs::Permissions);
+
+#[cfg(unix)]
+impl Drop for RestorePermissions {
+    fn drop(&mut self) {
+        let _ = std::fs::set_permissions(&self.0, self.1.clone());
+    }
 }

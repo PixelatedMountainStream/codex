@@ -25,15 +25,20 @@ use codex_protocol::items::TurnItem;
 use codex_protocol::items::UserMessageItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::HookCompletedEvent;
 use codex_protocol::protocol::HookEventName;
+use codex_protocol::protocol::HookExecutionMode;
+use codex_protocol::protocol::HookOutputEntryKind;
 use codex_protocol::protocol::HookRunStatus;
 use codex_protocol::protocol::HookRunSummary;
 use codex_protocol::protocol::HookSource;
 use codex_protocol::protocol::HookStartedEvent;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
+use codex_protocol::protocol::WarningEvent;
+use codex_thread_store::PersistContext;
 use codex_thread_store::ReadThreadParams;
 use serde_json::Value;
 use tracing::instrument;
@@ -364,6 +369,38 @@ pub(crate) async fn run_turn_stop_hooks(
     outcome
 }
 
+#[instrument(level = "trace", skip_all)]
+pub(crate) async fn run_session_end_hooks(sess: &Arc<Session>) {
+    let hooks = sess.hooks();
+    let preview_runs = hooks.preview_session_end();
+    if preview_runs.is_empty() {
+        return;
+    }
+
+    let turn_context = sess.new_default_turn().await;
+
+    // SessionEnd is root-only; ThreadSpawn uses SubagentStart/SubagentStop and other subagents
+    // are internal implementation details.
+    if matches!(&turn_context.session_source, SessionSource::SubAgent(_)) {
+        return;
+    }
+
+    let request = codex_hooks::SessionEndRequest {
+        session_id: sess.session_id().into(),
+        turn_id: turn_context.sub_id.clone(),
+        #[allow(deprecated)]
+        cwd: turn_context.cwd.clone(),
+        transcript_path: sess.hook_transcript_path().await,
+    };
+    if let Err(err) = sess.flush_rollout().await {
+        tracing::warn!("failed to flush transcript before SessionEnd hook: {err}");
+    }
+    emit_hook_started_events(sess, &turn_context, preview_runs).await;
+
+    let outcome = hooks.run_session_end(request).await;
+    emit_hook_completed_events(sess, &turn_context, outcome.hook_events).await;
+}
+
 pub(crate) async fn run_pre_compact_hooks(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
@@ -490,7 +527,7 @@ pub(crate) async fn run_legacy_after_agent_hook(
     };
     let event = EventMsg::Error(codex_protocol::protocol::ErrorEvent {
         message,
-        codex_error_info: None,
+        codex_error_info: Some(CodexErrorInfo::Other),
     });
     sess.send_event(turn_context, event).await;
     true
@@ -528,6 +565,10 @@ pub(crate) async fn inspect_pending_input(
             should_stop: false,
             additional_contexts: Vec::new(),
         },
+        TurnInput::InterAgentCommunication(_) => HookRuntimeOutcome {
+            should_stop: false,
+            additional_contexts: Vec::new(),
+        },
     }
 }
 
@@ -536,6 +577,7 @@ pub(crate) async fn record_pending_input(
     turn_context: &Arc<TurnContext>,
     pending_input: TurnInput,
     additional_contexts: Vec<String>,
+    persist_context: PersistContext,
 ) {
     match pending_input {
         TurnInput::UserInput { content, client_id } => {
@@ -543,15 +585,65 @@ pub(crate) async fn record_pending_input(
                 turn_context.as_ref(),
                 content.as_slice(),
                 client_id,
+                persist_context,
             )
             .await;
         }
         TurnInput::ResponseItem(item) => {
-            sess.record_conversation_items(turn_context, std::slice::from_ref(&item))
+            sess.record_annotated_conversation_items(turn_context, vec![item])
+                .await;
+        }
+        TurnInput::InterAgentCommunication(communication) => {
+            sess.record_inter_agent_communication(turn_context, communication)
                 .await;
         }
     }
     record_additional_contexts(sess, turn_context, additional_contexts).await;
+}
+
+/// Processes finished async hook results at a safe turn boundary.
+///
+/// Before the user prompt, records additional context directly into conversation
+/// history so results from a previous turn appear before the new prompt. After
+/// sampling, injects context into the active turn's pending-input queue so it
+/// reaches the next sampling request. Warnings and telemetry are handled in both
+/// cases.
+pub(crate) async fn drain_async_hook_results(
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+    before_user_prompt: bool,
+) {
+    while let Ok(result) = sess.async_hook_results.try_recv() {
+        let additional_contexts = result
+            .run
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == HookOutputEntryKind::Context)
+            .map(|entry| entry.text.clone())
+            .collect::<Vec<_>>();
+
+        if before_user_prompt {
+            record_additional_contexts(sess, turn_context, additional_contexts).await;
+        } else if !additional_contexts.is_empty() {
+            let _ = sess
+                .inject_if_running(additional_context_messages(additional_contexts))
+                .await;
+        }
+
+        for entry in &result.run.entries {
+            if entry.kind == HookOutputEntryKind::Warning {
+                sess.send_event(
+                    turn_context,
+                    EventMsg::Warning(WarningEvent {
+                        message: entry.text.clone(),
+                    }),
+                )
+                .await;
+            }
+        }
+
+        emit_hook_completed_events(sess, turn_context, vec![result]).await;
+    }
 }
 
 async fn run_context_injecting_hook<Fut, Outcome>(
@@ -610,7 +702,10 @@ async fn emit_hook_started_events(
     turn_context: &Arc<TurnContext>,
     preview_runs: Vec<HookRunSummary>,
 ) {
-    for run in preview_runs {
+    for run in preview_runs
+        .into_iter()
+        .filter(|run| run.execution_mode == HookExecutionMode::Sync)
+    {
         sess.send_event(
             turn_context,
             EventMsg::HookStarted(HookStartedEvent {
@@ -630,8 +725,10 @@ pub(crate) async fn emit_hook_completed_events(
     for completed in completed_events {
         emit_hook_completed_metrics(turn_context, &completed);
         track_hook_completed_analytics(sess, turn_context, &completed);
-        sess.send_event(turn_context, EventMsg::HookCompleted(completed))
-            .await;
+        if completed.run.execution_mode == HookExecutionMode::Sync {
+            sess.send_event(turn_context, EventMsg::HookCompleted(completed))
+                .await;
+        }
     }
 }
 
@@ -676,6 +773,7 @@ fn hook_run_analytics_payload(
                 .turn_id
                 .clone()
                 .unwrap_or_else(|| turn_context.sub_id.clone()),
+            turn_context.originator.clone(),
         ),
         HookRunFact {
             event_name: completed.run.event_name,
@@ -693,6 +791,7 @@ fn hook_run_metric_tags(run: &HookRunSummary) -> [(&'static str, &'static str); 
         HookEventName::PreCompact => "PreCompact",
         HookEventName::PostCompact => "PostCompact",
         HookEventName::SessionStart => "SessionStart",
+        HookEventName::SessionEnd => "SessionEnd",
         HookEventName::UserPromptSubmit => "UserPromptSubmit",
         HookEventName::SubagentStart => "SubagentStart",
         HookEventName::SubagentStop => "SubagentStop",
@@ -727,12 +826,11 @@ fn hook_run_metric_tags(run: &HookRunSummary) -> [(&'static str, &'static str); 
 }
 
 fn hook_permission_mode(turn_context: &TurnContext) -> String {
-    match turn_context.approval_policy.value() {
+    match turn_context.approval_policy() {
         AskForApproval::Never => "bypassPermissions",
-        AskForApproval::UnlessTrusted
-        | AskForApproval::OnFailure
-        | AskForApproval::OnRequest
-        | AskForApproval::Granular(_) => "default",
+        AskForApproval::UnlessTrusted | AskForApproval::OnRequest | AskForApproval::Granular(_) => {
+            "default"
+        }
     }
     .to_string()
 }
@@ -777,9 +875,12 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::additional_context_messages;
+    use super::emit_hook_completed_events;
+    use super::emit_hook_started_events;
     use super::hook_run_analytics_payload;
     use super::hook_run_metric_tags;
     use crate::session::tests::make_session_and_context;
+    use crate::session::tests::make_session_and_context_with_rx;
     use codex_protocol::protocol::HookCompletedEvent;
     use codex_protocol::protocol::HookRunSummary;
     use codex_utils_absolute_path::test_support::PathBufExt;
@@ -802,7 +903,9 @@ mod tests {
                             .iter()
                             .map(|item| match item {
                                 ContentItem::InputText { text } => text.as_str(),
-                                ContentItem::InputImage { .. } | ContentItem::OutputText { .. } => {
+                                ContentItem::InputImage { .. }
+                                | ContentItem::InputAudio { .. }
+                                | ContentItem::OutputText { .. } => {
                                     panic!("expected input text content, got {item:?}")
                                 }
                             })
@@ -817,6 +920,57 @@ mod tests {
                 ("developer", "second tide note".to_string()),
             ],
         );
+    }
+
+    #[tokio::test]
+    async fn hook_lifecycle_notifications_only_report_synchronous_runs() {
+        let (session, turn_context, events) = make_session_and_context_with_rx().await;
+        let mut synchronous_run = sample_hook_run(HookRunStatus::Running, HookSource::User);
+        synchronous_run.id = "synchronous-hook".to_string();
+        let mut asynchronous_run = synchronous_run.clone();
+        asynchronous_run.id = "asynchronous-hook".to_string();
+        asynchronous_run.execution_mode = HookExecutionMode::Async;
+
+        emit_hook_started_events(
+            &session,
+            &turn_context,
+            vec![asynchronous_run.clone(), synchronous_run.clone()],
+        )
+        .await;
+
+        let started = events.try_recv().expect("synchronous hook should start");
+        assert!(matches!(
+            started.msg,
+            codex_protocol::protocol::EventMsg::HookStarted(event)
+                if event.run.id == synchronous_run.id
+        ));
+        assert!(events.try_recv().is_err());
+
+        asynchronous_run.status = HookRunStatus::Completed;
+        synchronous_run.status = HookRunStatus::Completed;
+        emit_hook_completed_events(
+            &session,
+            &turn_context,
+            vec![
+                HookCompletedEvent {
+                    turn_id: Some(turn_context.sub_id.clone()),
+                    run: asynchronous_run,
+                },
+                HookCompletedEvent {
+                    turn_id: Some(turn_context.sub_id.clone()),
+                    run: synchronous_run.clone(),
+                },
+            ],
+        )
+        .await;
+
+        let completed = events.try_recv().expect("synchronous hook should complete");
+        assert!(matches!(
+            completed.msg,
+            codex_protocol::protocol::EventMsg::HookCompleted(event)
+                if event.run.id == synchronous_run.id
+        ));
+        assert!(events.try_recv().is_err());
     }
 
     #[tokio::test]

@@ -1,24 +1,27 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::sync::Arc;
 
-use codex_config::ConfigEditsBuilder;
 use codex_config::McpServerConfig;
 use codex_config::McpServerTransportConfig;
 use codex_config::load_global_mcp_servers;
 use codex_login::default_client::is_first_party_originator;
 use codex_login::default_client::originator;
+use codex_protocol::protocol::AskForApproval;
 use codex_protocol::request_user_input::RequestUserInputArgs;
 use codex_protocol::request_user_input::RequestUserInputQuestion;
 use codex_protocol::request_user_input::RequestUserInputQuestionOption;
 use codex_protocol::request_user_input::RequestUserInputResponse;
+use codex_rmcp_client::McpOAuthClientRegistration;
+use codex_rmcp_client::OAuthDiscoveryTimeout;
+use codex_rmcp_client::StreamableHttpRedirectMode;
 use codex_rmcp_client::perform_oauth_login;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-use crate::SkillMetadata;
+use crate::config::edit::ConfigEditsBuilder;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
-use crate::skills::model::SkillToolDependency;
 use codex_mcp::ElicitationReviewerHandle;
 use codex_mcp::McpOAuthLoginSupport;
 use codex_mcp::McpPermissionPromptAutoApproveContext;
@@ -26,6 +29,8 @@ use codex_mcp::mcp_permission_prompt_is_auto_approved;
 use codex_mcp::oauth_login_support;
 use codex_mcp::resolve_oauth_scopes;
 use codex_mcp::should_retry_without_scopes;
+use codex_skills::SkillMetadata;
+use codex_skills::SkillToolDependency;
 
 const SKILL_MCP_DEPENDENCY_PROMPT_ID: &str = "skill_mcp_dependency_install";
 const MCP_DEPENDENCY_OPTION_INSTALL: &str = "Install";
@@ -132,8 +137,28 @@ pub(crate) async fn maybe_install_mcp_dependencies(
         return;
     }
 
+    let (_, runtime_context) = sess.runtime_mcp_config_and_context(config).await;
     for (name, server_config) in added {
-        let oauth_config = match oauth_login_support(&server_config.transport).await {
+        let http_client = match runtime_context.resolve_http_client(&name, &server_config) {
+            Ok(http_client) => http_client,
+            Err(err) => {
+                warn!("failed to resolve MCP dependency runtime for {name}: {err}");
+                continue;
+            }
+        };
+        let discovery_timeout = if server_config.is_local_environment() {
+            OAuthDiscoveryTimeout::LOCAL
+        } else {
+            OAuthDiscoveryTimeout::Requested
+        };
+        let login_support = oauth_login_support(
+            &server_config.transport,
+            Arc::clone(&http_client),
+            discovery_timeout,
+            StreamableHttpRedirectMode::Legacy,
+        )
+        .await;
+        let oauth_config = match login_support {
             McpOAuthLoginSupport::Supported(config) => config,
             McpOAuthLoginSupport::Unsupported => continue,
             McpOAuthLoginSupport::Unknown(err) => {
@@ -148,33 +173,40 @@ pub(crate) async fn maybe_install_mcp_dependencies(
             oauth_config.discovered_scopes.clone(),
         );
         let oauth_client_id = server_config.oauth_client_id();
+        let oauth_credential_name = server_config.oauth_credential_name(&name);
         let first_attempt = perform_oauth_login(
-            &name,
+            oauth_credential_name.as_ref(),
             &oauth_config.url,
             config.mcp_oauth_credentials_store_mode,
+            config.auth_keyring_backend_kind(),
             oauth_config.http_headers.clone(),
             oauth_config.env_http_headers.clone(),
             &resolved_scopes.scopes,
             oauth_client_id,
+            McpOAuthClientRegistration::Auto,
             server_config.oauth_resource.as_deref(),
             config.mcp_oauth_callback_port,
             config.mcp_oauth_callback_url.as_deref(),
+            Arc::clone(&http_client),
         )
         .await;
 
         if let Err(err) = first_attempt {
             if should_retry_without_scopes(&resolved_scopes, &err) {
                 if let Err(err) = perform_oauth_login(
-                    &name,
+                    oauth_credential_name.as_ref(),
                     &oauth_config.url,
                     config.mcp_oauth_credentials_store_mode,
+                    config.auth_keyring_backend_kind(),
                     oauth_config.http_headers,
                     oauth_config.env_http_headers,
                     &[],
                     oauth_client_id,
+                    McpOAuthClientRegistration::Auto,
                     server_config.oauth_resource.as_deref(),
                     config.mcp_oauth_callback_port,
                     config.mcp_oauth_callback_url.as_deref(),
+                    Arc::clone(&http_client),
                 )
                 .await
                 {
@@ -197,14 +229,8 @@ pub(crate) async fn maybe_install_mcp_dependencies(
         warn!("failed to refresh MCP dependencies for mentioned skills: {err}");
         return;
     }
-    let refresh_servers = sess.runtime_mcp_servers(&refresh_config).await;
-    sess.refresh_mcp_servers_now(
-        turn_context,
-        refresh_servers,
-        config.mcp_oauth_credentials_store_mode,
-        elicitation_reviewer,
-    )
-    .await;
+    sess.refresh_mcp_servers_now(turn_context, &refresh_config, elicitation_reviewer)
+        .await;
 }
 
 async fn should_install_mcp_dependencies(
@@ -214,11 +240,15 @@ async fn should_install_mcp_dependencies(
     cancellation_token: &CancellationToken,
 ) -> bool {
     if mcp_permission_prompt_is_auto_approved(
-        turn_context.approval_policy.value(),
+        turn_context.approval_policy(),
         &turn_context.permission_profile(),
         McpPermissionPromptAutoApproveContext::default(),
     ) {
         return true;
+    }
+
+    if turn_context.approval_policy() == AskForApproval::Never {
+        return false;
     }
 
     let server_list = format_missing_mcp_dependencies(missing);
@@ -246,6 +276,7 @@ async fn should_install_mcp_dependencies(
     };
     let args = RequestUserInputArgs {
         questions: vec![question],
+        is_blocking: true,
         auto_resolution_ms: None,
     };
     let sub_id = &turn_context.sub_id;
@@ -354,16 +385,19 @@ fn mcp_dependency_to_server_config(
             .as_ref()
             .ok_or_else(|| "missing url for streamable_http dependency".to_string())?;
         return Ok(McpServerConfig {
+            auth: Default::default(),
             transport: McpServerTransportConfig::StreamableHttp {
                 url: url.clone(),
                 bearer_token_env_var: None,
                 http_headers: None,
                 env_http_headers: None,
+                http_headers_helper: None,
             },
             environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
             enabled: true,
             required: false,
             supports_parallel_tool_calls: false,
+            omit_tools_from: None,
             disabled_reason: None,
             startup_timeout_sec: None,
             tool_timeout_sec: None,
@@ -383,6 +417,7 @@ fn mcp_dependency_to_server_config(
             .as_ref()
             .ok_or_else(|| "missing command for stdio dependency".to_string())?;
         return Ok(McpServerConfig {
+            auth: Default::default(),
             transport: McpServerTransportConfig::Stdio {
                 command: command.clone(),
                 args: Vec::new(),
@@ -394,6 +429,7 @@ fn mcp_dependency_to_server_config(
             enabled: true,
             required: false,
             supports_parallel_tool_calls: false,
+            omit_tools_from: None,
             disabled_reason: None,
             startup_timeout_sec: None,
             tool_timeout_sec: None,

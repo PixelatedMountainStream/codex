@@ -1,13 +1,16 @@
+use crate::JsonSchema;
+use crate::TS;
+use codex_protocol::protocol::CodexResponseHandoffMode;
+use codex_protocol::protocol::ConversationTextRole;
 use codex_protocol::protocol::RealtimeAudioFrame as CoreRealtimeAudioFrame;
 use codex_protocol::protocol::RealtimeConversationVersion;
 use codex_protocol::protocol::RealtimeOutputModality;
 use codex_protocol::protocol::RealtimeVoice;
 use codex_protocol::protocol::RealtimeVoicesList;
-use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
-use ts_rs::TS;
+use std::collections::BTreeMap;
 
 /// EXPERIMENTAL - thread realtime audio chunk.
 #[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, JsonSchema, TS)]
@@ -65,12 +68,54 @@ impl From<ThreadRealtimeAudioChunk> for CoreRealtimeAudioFrame {
 #[ts(export_to = "v2/")]
 pub struct ThreadRealtimeStartParams {
     pub thread_id: String,
+    /// Leaves Codex response handoffs to the client's explicit append calls instead of forwarding
+    /// them automatically. Defaults to false.
+    #[ts(optional = nullable)]
+    pub client_managed_handoffs: Option<bool>,
+    /// Controls whether a realtime V3 delegation produces an acknowledgement filler.
+    /// Omitted values preserve the Realtime API's default behavior.
+    #[ts(optional = nullable)]
+    pub delegation_ack_filler: Option<bool>,
+    /// Routes any transcript tail remaining at session end through Codex. Defaults to false.
+    /// TODO: Remove this rollout knob once transcript-tail flushing is always enabled.
+    #[ts(optional = nullable)]
+    pub flush_transcript_tail_on_session_end: Option<bool>,
+    // TODO: Remove this experiment-only delivery path after response-item testing is complete.
+    /// Sends automatic Codex responses as realtime conversation items instead of handoff appends.
+    #[ts(optional = nullable)]
+    pub codex_responses_as_items: Option<bool>,
+    // TODO: Remove this experiment-only prefix with `codex_responses_as_items`.
+    /// Optional prefix added to automatic Codex response items when `codexResponsesAsItems` is true.
+    #[ts(optional = nullable)]
+    pub codex_response_item_prefix: Option<String>,
+    /// Selects how automatic Codex responses are routed in Frameless Bidi sessions. Omitted values
+    /// default to `thinking`. Realtime V1 and V2 ignore this setting.
+    #[ts(optional = nullable)]
+    pub codex_response_handoff_mode: Option<CodexResponseHandoffMode>,
+    /// Overrides BEM channel prefixes by `analysis`, `commentary`, or `final`.
+    /// Omitted channels retain their default uppercase bracketed prefixes.
+    #[ts(optional = nullable)]
+    pub codex_response_handoff_channel_prefixes: Option<BTreeMap<String, Vec<String>>>,
     /// Overrides the configured realtime model for this session only.
     #[ts(optional = nullable)]
     pub model: Option<String>,
     /// Selects text or audio output for the realtime session. Transport and voice stay
     /// independent so clients can choose how they connect separately from what the model emits.
     pub output_modality: RealtimeOutputModality,
+    /// Set to false to start without Codex's startup context. Omitted or null includes it.
+    #[ts(optional = nullable)]
+    pub include_startup_context: Option<bool>,
+    /// Adds complete role-bearing text items to the initial Frameless Bidi session history.
+    /// This is only supported by realtime V3 and is sent during session startup. Requests are
+    /// limited to 128 items and 8,192 estimated text tokens in total.
+    #[ts(optional = nullable)]
+    pub initial_items: Option<Vec<ThreadRealtimeInitialItem>>,
+    /// Developer instructions given to the backing Codex model when this realtime session starts.
+    #[ts(optional = nullable)]
+    pub realtime_start_instructions: Option<String>,
+    /// Developer instructions given to the backing Codex model when this realtime session ends.
+    #[ts(optional = nullable)]
+    pub realtime_end_instructions: Option<String>,
     #[serde(
         default,
         deserialize_with = "crate::protocol::serde_helpers::deserialize_double_option",
@@ -88,6 +133,15 @@ pub struct ThreadRealtimeStartParams {
     pub version: Option<RealtimeConversationVersion>,
     #[ts(optional = nullable)]
     pub voice: Option<RealtimeVoice>,
+}
+
+/// EXPERIMENTAL - role-bearing text item included when a realtime V3 session starts.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadRealtimeInitialItem {
+    pub role: ConversationTextRole,
+    pub text: String,
 }
 
 /// EXPERIMENTAL - transport used by thread realtime.
@@ -131,6 +185,8 @@ pub struct ThreadRealtimeAppendAudioResponse {}
 pub struct ThreadRealtimeAppendTextParams {
     pub thread_id: String,
     pub text: String,
+    #[serde(default)]
+    pub role: ConversationTextRole,
 }
 
 /// EXPERIMENTAL - response for appending realtime text input.
@@ -138,6 +194,21 @@ pub struct ThreadRealtimeAppendTextParams {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ThreadRealtimeAppendTextResponse {}
+
+/// EXPERIMENTAL - append speakable text to thread realtime.
+#[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadRealtimeAppendSpeechParams {
+    pub thread_id: String,
+    pub text: String,
+}
+
+/// EXPERIMENTAL - response for appending realtime speech.
+#[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadRealtimeAppendSpeechResponse {}
 
 /// EXPERIMENTAL - stop thread realtime.
 #[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, JsonSchema, TS)]

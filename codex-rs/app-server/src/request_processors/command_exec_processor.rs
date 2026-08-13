@@ -1,4 +1,6 @@
 use super::*;
+use codex_core::exec_env::inject_apply_patch_env;
+use codex_protocol::shell_environment::is_non_inheritable_env_var;
 
 #[derive(Clone)]
 pub(crate) struct CommandExecRequestProcessor {
@@ -163,6 +165,8 @@ impl CommandExecRequestProcessor {
                 }
             }
         }
+        env.retain(|name, _| !is_non_inheritable_env_var(name));
+        inject_apply_patch_env(&mut env, &self.config.features);
         let timeout_ms = match timeout_ms {
             Some(timeout_ms) => match u64::try_from(timeout_ms) {
                 Ok(timeout_ms) => Some(timeout_ms),
@@ -297,6 +301,7 @@ impl CommandExecRequestProcessor {
             network: started_network_proxy
                 .as_ref()
                 .map(codex_core::config::StartedNetworkProxy::proxy),
+            network_environment_id: None,
             sandbox_permissions: SandboxPermissions::UseDefault,
             windows_sandbox_level,
             windows_sandbox_private_desktop: self

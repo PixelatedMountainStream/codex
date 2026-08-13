@@ -83,12 +83,34 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--code-mode-host-bin",
+        type=Path,
+        help=(
+            "Optional prebuilt codex-code-mode-host executable. If omitted, "
+            "the host is built with Cargo."
+        ),
+    )
+    parser.add_argument(
         "--bwrap-bin",
         type=Path,
         help=(
             "Optional prebuilt Linux bwrap executable. If omitted for Linux "
             "targets, bwrap is built with Cargo."
         ),
+    )
+    zsh_source = parser.add_mutually_exclusive_group()
+    zsh_source.add_argument(
+        "--zsh-manifest",
+        type=Path,
+        help=(
+            "Optional DotSlash manifest for the patched zsh fork instead of "
+            "scripts/codex_package/codex-zsh."
+        ),
+    )
+    zsh_source.add_argument(
+        "--zsh-bin",
+        type=Path,
+        help="Optional prebuilt zsh executable instead of fetching from a manifest.",
     )
     parser.add_argument(
         "--codex-command-runner-bin",
@@ -140,6 +162,11 @@ def main() -> int:
             "prebuilt entrypoint executable",
             "--entrypoint-bin",
         ),
+        code_mode_host_bin=resolve_optional_input_path(
+            args.code_mode_host_bin,
+            "prebuilt code-mode host executable",
+            "--code-mode-host-bin",
+        ),
         bwrap_bin=resolve_optional_input_path(
             args.bwrap_bin,
             "prebuilt Linux bwrap executable",
@@ -159,8 +186,9 @@ def main() -> int:
     version = read_workspace_version()
     inputs = PackageInputs(
         entrypoint_bin=source_outputs.entrypoint_bin,
+        code_mode_host_bin=source_outputs.code_mode_host_bin,
         rg_bin=resolve_rg_bin(spec, args.rg_bin),
-        zsh_bin=resolve_zsh_bin(spec),
+        zsh_bin=resolve_zsh_bin(spec, args.zsh_manifest, zsh_bin=args.zsh_bin),
         bwrap_bin=source_outputs.bwrap_bin,
         codex_command_runner_bin=source_outputs.codex_command_runner_bin,
         codex_windows_sandbox_setup_bin=source_outputs.codex_windows_sandbox_setup_bin,

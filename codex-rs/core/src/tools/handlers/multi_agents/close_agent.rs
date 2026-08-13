@@ -1,7 +1,6 @@
 use super::*;
 use crate::tools::handlers::multi_agents_spec::create_close_agent_tool_v1;
-use crate::turn_timing::now_unix_timestamp_ms;
-use codex_protocol::error::CodexErr;
+use codex_protocol::error::CodexErrorDetails;
 use codex_tools::ToolSpec;
 
 pub(crate) struct Handler;
@@ -44,15 +43,20 @@ async fn handle_close_agent(
     let known_agent = receiver_agent.is_some();
     let receiver_agent = receiver_agent.unwrap_or_default();
     session
-        .send_event(
+        .emit_turn_item_started(
             &turn,
-            CollabCloseBeginEvent {
-                call_id: call_id.clone(),
-                started_at_ms: now_unix_timestamp_ms(),
+            &TurnItem::CollabAgentToolCall(CollabAgentToolCallItem {
+                id: call_id.clone(),
+                tool: CollabAgentTool::CloseAgent,
+                status: CollabAgentToolCallStatus::InProgress,
                 sender_thread_id: session.thread_id,
-                receiver_thread_id: agent_id,
-            }
-            .into(),
+                receiver_thread_ids: vec![agent_id],
+                receiver_agents: Vec::new(),
+                prompt: None,
+                model: None,
+                reasoning_effort: None,
+                agents_states: Default::default(),
+            }),
         )
         .await;
     let status = match session
@@ -62,24 +66,32 @@ async fn handle_close_agent(
         .await
     {
         Ok(mut status_rx) => status_rx.borrow_and_update().clone(),
-        Err(CodexErr::ThreadNotFound(_)) if known_agent => {
+        Err(err)
+            if known_agent && matches!(err.details(), CodexErrorDetails::ThreadNotFound(_)) =>
+        {
             session.services.agent_control.get_status(agent_id).await
         }
         Err(err) => {
             let status = session.services.agent_control.get_status(agent_id).await;
             session
-                .send_event(
+                .emit_turn_item_completed(
                     &turn,
-                    CollabCloseEndEvent {
-                        call_id: call_id.clone(),
-                        completed_at_ms: now_unix_timestamp_ms(),
+                    TurnItem::CollabAgentToolCall(CollabAgentToolCallItem {
+                        id: call_id.clone(),
+                        tool: CollabAgentTool::CloseAgent,
+                        status: collab_tool_call_status(&status, Some(agent_id)),
                         sender_thread_id: session.thread_id(),
-                        receiver_thread_id: agent_id,
-                        receiver_agent_nickname: receiver_agent.agent_nickname.clone(),
-                        receiver_agent_role: receiver_agent.agent_role.clone(),
-                        status,
-                    }
-                    .into(),
+                        receiver_thread_ids: vec![agent_id],
+                        receiver_agents: vec![CollabAgentRef {
+                            thread_id: agent_id,
+                            agent_nickname: receiver_agent.agent_nickname.clone(),
+                            agent_role: receiver_agent.agent_role.clone(),
+                        }],
+                        prompt: None,
+                        model: None,
+                        reasoning_effort: None,
+                        agents_states: [(agent_id, status)].into_iter().collect(),
+                    }),
                 )
                 .await;
             return Err(collab_agent_error(agent_id, err));
@@ -90,18 +102,24 @@ async fn handle_close_agent(
         .map_err(|err| collab_agent_error(agent_id, err))
         .map(|_| ());
     session
-        .send_event(
+        .emit_turn_item_completed(
             &turn,
-            CollabCloseEndEvent {
-                call_id,
-                completed_at_ms: now_unix_timestamp_ms(),
+            TurnItem::CollabAgentToolCall(CollabAgentToolCallItem {
+                id: call_id,
+                tool: CollabAgentTool::CloseAgent,
+                status: collab_tool_call_status(&status, Some(agent_id)),
                 sender_thread_id: session.thread_id,
-                receiver_thread_id: agent_id,
-                receiver_agent_nickname: receiver_agent.agent_nickname,
-                receiver_agent_role: receiver_agent.agent_role,
-                status: status.clone(),
-            }
-            .into(),
+                receiver_thread_ids: vec![agent_id],
+                receiver_agents: vec![CollabAgentRef {
+                    thread_id: agent_id,
+                    agent_nickname: receiver_agent.agent_nickname,
+                    agent_role: receiver_agent.agent_role,
+                }],
+                prompt: None,
+                model: None,
+                reasoning_effort: None,
+                agents_states: [(agent_id, status.clone())].into_iter().collect(),
+            }),
         )
         .await;
     result?;

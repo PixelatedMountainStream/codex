@@ -8,12 +8,26 @@ use super::NetworkPolicyAmendment;
 use super::RequestPermissionProfile;
 use super::UserInput;
 use super::shared::v2_enum_from_core;
+use crate::JsonSchema;
+use crate::TS;
+use crate::protocol::item_builders::CommandExecutionPresentation;
 use crate::protocol::item_builders::convert_patch_changes;
+use crate::protocol::item_builders::review_output_text;
 use codex_experimental_api_macros::ExperimentalApi;
+use codex_extension_items::ExtensionItem;
+pub use codex_extension_items::image_generation::ImageGenerationFailure;
+pub use codex_extension_items::image_generation::ImageGenerationItem;
+pub use codex_extension_items::sleep::SleepItem;
+pub use codex_extension_items::web_search::WebSearchAction;
+pub use codex_extension_items::web_search::WebSearchItem;
 use codex_protocol::approvals::GuardianAssessmentAction as CoreGuardianAssessmentAction;
 use codex_protocol::approvals::GuardianAssessmentDecisionSource as CoreGuardianAssessmentDecisionSource;
 use codex_protocol::approvals::GuardianCommandSource as CoreGuardianCommandSource;
 use codex_protocol::items::AgentMessageContent as CoreAgentMessageContent;
+use codex_protocol::items::CollabAgentTool as CoreCollabAgentTool;
+use codex_protocol::items::CollabAgentToolCallStatus as CoreCollabAgentToolCallStatus;
+use codex_protocol::items::CommandExecutionStatus as CoreCommandExecutionStatus;
+use codex_protocol::items::DynamicToolCallStatus as CoreDynamicToolCallStatus;
 use codex_protocol::items::McpToolCallStatus as CoreMcpToolCallStatus;
 use codex_protocol::items::TurnItem as CoreTurnItem;
 use codex_protocol::memory_citation::MemoryCitation as CoreMemoryCitation;
@@ -31,14 +45,14 @@ use codex_protocol::protocol::PatchApplyStatus as CorePatchApplyStatus;
 use codex_protocol::protocol::ReviewDecision as CoreReviewDecision;
 use codex_protocol::protocol::SubAgentActivityKind as CoreSubAgentActivityKind;
 use codex_utils_absolute_path::AbsolutePathBuf;
-use schemars::JsonSchema;
+use codex_utils_path_uri::LegacyAppPathString;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use serde_with::serde_as;
 use std::collections::HashMap;
+use std::io;
 use std::path::PathBuf;
-use ts_rs::TS;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
@@ -68,6 +82,9 @@ impl From<CoreReviewDecision> for CommandExecutionApprovalDecision {
     fn from(value: CoreReviewDecision) -> Self {
         match value {
             CoreReviewDecision::Approved => Self::Accept,
+            // MCP approvals are handled through elicitations, so an MCP policy amendment should
+            // never appear in a command execution approval. To be cautious here, we fail closed.
+            CoreReviewDecision::ApprovedMcpPolicyAmendment => Self::Decline,
             CoreReviewDecision::ApprovedExecpolicyAmendment {
                 proposed_execpolicy_amendment,
             } => Self::AcceptWithExecpolicyAmendment {
@@ -80,7 +97,7 @@ impl From<CoreReviewDecision> for CommandExecutionApprovalDecision {
                 network_policy_amendment: network_policy_amendment.into(),
             },
             CoreReviewDecision::Abort => Self::Cancel,
-            CoreReviewDecision::Denied => Self::Decline,
+            CoreReviewDecision::Denied { .. } => Self::Decline,
             CoreReviewDecision::TimedOut => Self::Decline,
         }
     }
@@ -108,7 +125,7 @@ pub enum CommandAction {
     Read {
         command: String,
         name: String,
-        path: AbsolutePathBuf,
+        path: LegacyAppPathString,
     },
     ListFiles {
         command: String,
@@ -172,7 +189,7 @@ impl CommandAction {
             } => CoreParsedCommand::Read {
                 cmd,
                 name,
-                path: path.into_path_buf(),
+                path: PathBuf::from(path.into_string()),
             },
             CommandAction::ListFiles { command: cmd, path } => {
                 CoreParsedCommand::ListFiles { cmd, path }
@@ -191,7 +208,7 @@ impl CommandAction {
             CoreParsedCommand::Read { cmd, name, path } => CommandAction::Read {
                 command: cmd,
                 name,
-                path: cwd.join(path),
+                path: cwd.join(path).into(),
             },
             CoreParsedCommand::ListFiles { cmd, path } => {
                 CommandAction::ListFiles { command: cmd, path }
@@ -238,7 +255,10 @@ pub enum ThreadItem {
     #[ts(rename_all = "camelCase")]
     /// EXPERIMENTAL - proposed plan item content. The completed plan item is
     /// authoritative and may not match the concatenation of `PlanDelta` text.
-    Plan { id: String, text: String },
+    Plan {
+        id: String,
+        text: String,
+    },
     #[serde(rename_all = "camelCase")]
     #[ts(rename_all = "camelCase")]
     Reasoning {
@@ -252,10 +272,16 @@ pub enum ThreadItem {
     #[ts(rename_all = "camelCase")]
     CommandExecution {
         id: String,
+        /// Trusted first-party plugin id when this command resolves to one plugin script.
+        #[serde(default)]
+        plugin_id: Option<String>,
+        /// Safe plugin-relative path when this command resolves to one plugin script.
+        #[serde(default)]
+        script_path: Option<String>,
         /// The command to be executed.
         command: String,
         /// The command's working directory.
-        cwd: AbsolutePathBuf,
+        cwd: LegacyAppPathString,
         /// Identifier for the underlying PTY process (when available).
         process_id: Option<String>,
         #[serde(default)]
@@ -288,10 +314,13 @@ pub enum ThreadItem {
         tool: String,
         status: McpToolCallStatus,
         arguments: JsonValue,
+        app_context: Option<McpToolCallAppContext>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
+        /// Deprecated: use `appContext.resourceUri` instead.
         mcp_app_resource_uri: Option<String>,
         plugin_id: Option<String>,
+        read_only_hint: Option<bool>,
         result: Option<Box<McpToolCallResult>>,
         error: Option<McpToolCallError>,
         /// The duration of the MCP tool call in milliseconds.
@@ -343,36 +372,43 @@ pub enum ThreadItem {
         agent_thread_id: String,
         agent_path: String,
     },
+    WebSearch(WebSearchItem),
     #[serde(rename_all = "camelCase")]
     #[ts(rename_all = "camelCase")]
-    WebSearch {
+    ImageView {
         id: String,
-        query: String,
-        action: Option<WebSearchAction>,
+        path: LegacyAppPathString,
+    },
+    Sleep(SleepItem),
+    ImageGeneration(ImageGenerationItem),
+    #[serde(rename_all = "camelCase")]
+    #[ts(rename_all = "camelCase")]
+    EnteredReviewMode {
+        id: String,
+        review: String,
     },
     #[serde(rename_all = "camelCase")]
     #[ts(rename_all = "camelCase")]
-    ImageView { id: String, path: AbsolutePathBuf },
-    #[serde(rename_all = "camelCase")]
-    #[ts(rename_all = "camelCase")]
-    ImageGeneration {
+    ExitedReviewMode {
         id: String,
-        status: String,
-        revised_prompt: Option<String>,
-        result: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[ts(optional)]
-        saved_path: Option<AbsolutePathBuf>,
+        review: String,
     },
     #[serde(rename_all = "camelCase")]
     #[ts(rename_all = "camelCase")]
-    EnteredReviewMode { id: String, review: String },
-    #[serde(rename_all = "camelCase")]
-    #[ts(rename_all = "camelCase")]
-    ExitedReviewMode { id: String, review: String },
-    #[serde(rename_all = "camelCase")]
-    #[ts(rename_all = "camelCase")]
-    ContextCompaction { id: String },
+    ContextCompaction {
+        id: String,
+    },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
+pub struct McpToolCallAppContext {
+    pub connector_id: String,
+    pub link_id: Option<String>,
+    pub resource_uri: Option<String>,
+    pub app_name: Option<String>,
+    pub action_name: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
@@ -397,12 +433,13 @@ impl ThreadItem {
             | ThreadItem::DynamicToolCall { id, .. }
             | ThreadItem::CollabAgentToolCall { id, .. }
             | ThreadItem::SubAgentActivity { id, .. }
-            | ThreadItem::WebSearch { id, .. }
             | ThreadItem::ImageView { id, .. }
-            | ThreadItem::ImageGeneration { id, .. }
             | ThreadItem::EnteredReviewMode { id, .. }
             | ThreadItem::ExitedReviewMode { id, .. }
             | ThreadItem::ContextCompaction { id, .. } => id,
+            ThreadItem::WebSearch(item) => &item.id,
+            ThreadItem::Sleep(item) => &item.id,
+            ThreadItem::ImageGeneration(item) => &item.id,
         }
     }
 }
@@ -687,9 +724,11 @@ impl From<CoreGuardianAssessmentAction> for GuardianApprovalReviewAction {
     }
 }
 
-impl From<GuardianApprovalReviewAction> for CoreGuardianAssessmentAction {
-    fn from(value: GuardianApprovalReviewAction) -> Self {
-        match value {
+impl TryFrom<GuardianApprovalReviewAction> for CoreGuardianAssessmentAction {
+    type Error = io::Error;
+
+    fn try_from(value: GuardianApprovalReviewAction) -> Result<Self, Self::Error> {
+        Ok(match value {
             GuardianApprovalReviewAction::Command {
                 source,
                 command,
@@ -742,46 +781,26 @@ impl From<GuardianApprovalReviewAction> for CoreGuardianAssessmentAction {
                 permissions,
             } => Self::RequestPermissions {
                 reason,
-                permissions: permissions.into(),
+                permissions: permissions.try_into()?,
             },
-        }
+        })
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
-#[serde(tag = "type", rename_all = "camelCase")]
-#[ts(tag = "type", rename_all = "camelCase")]
-#[ts(export_to = "v2/")]
-pub enum WebSearchAction {
-    Search {
-        query: Option<String>,
-        queries: Option<Vec<String>>,
-    },
-    OpenPage {
-        url: Option<String>,
-    },
-    FindInPage {
-        url: Option<String>,
-        pattern: Option<String>,
-    },
-    #[serde(other)]
-    Other,
-}
-
-impl From<codex_protocol::models::WebSearchAction> for WebSearchAction {
-    fn from(value: codex_protocol::models::WebSearchAction) -> Self {
-        match value {
-            codex_protocol::models::WebSearchAction::Search { query, queries } => {
-                WebSearchAction::Search { query, queries }
-            }
-            codex_protocol::models::WebSearchAction::OpenPage { url } => {
-                WebSearchAction::OpenPage { url }
-            }
-            codex_protocol::models::WebSearchAction::FindInPage { url, pattern } => {
-                WebSearchAction::FindInPage { url, pattern }
-            }
-            codex_protocol::models::WebSearchAction::Other => WebSearchAction::Other,
+pub(crate) fn web_search_action_from_core(
+    value: codex_protocol::models::WebSearchAction,
+) -> WebSearchAction {
+    match value {
+        codex_protocol::models::WebSearchAction::Search { query, queries } => {
+            WebSearchAction::Search { query, queries }
         }
+        codex_protocol::models::WebSearchAction::OpenPage { url } => {
+            WebSearchAction::OpenPage { url }
+        }
+        codex_protocol::models::WebSearchAction::FindInPage { url, pattern } => {
+            WebSearchAction::FindInPage { url, pattern }
+        }
+        codex_protocol::models::WebSearchAction::Other => WebSearchAction::Other,
     }
 }
 
@@ -825,21 +844,106 @@ impl From<CoreTurnItem> for ThreadItem {
                 summary: reasoning.summary_text,
                 content: reasoning.raw_content,
             },
-            CoreTurnItem::WebSearch(search) => ThreadItem::WebSearch {
+            CoreTurnItem::CommandExecution(command) => {
+                let presentation = CommandExecutionPresentation::from_raw(
+                    &command.command,
+                    &command.parsed_cmd,
+                    &command.cwd,
+                );
+                ThreadItem::CommandExecution {
+                    id: command.id,
+                    plugin_id: command.plugin_id,
+                    script_path: command.script_path,
+                    command: presentation.command,
+                    cwd: command.cwd.clone().into(),
+                    process_id: command.process_id,
+                    source: command.source.into(),
+                    status: command.status.into(),
+                    command_actions: presentation.command_actions,
+                    aggregated_output: command
+                        .aggregated_output
+                        .filter(|output| !output.is_empty()),
+                    exit_code: command.exit_code,
+                    duration_ms: command
+                        .duration
+                        .and_then(|duration| i64::try_from(duration.as_millis()).ok()),
+                }
+            }
+            CoreTurnItem::DynamicToolCall(call) => ThreadItem::DynamicToolCall {
+                id: call.id,
+                namespace: call.namespace,
+                tool: call.tool,
+                arguments: call.arguments,
+                status: call.status.into(),
+                content_items: call.content_items.map(|items| {
+                    items
+                        .into_iter()
+                        .map(DynamicToolCallOutputContentItem::from)
+                        .collect()
+                }),
+                success: call.success,
+                duration_ms: call
+                    .duration
+                    .and_then(|duration| i64::try_from(duration.as_millis()).ok()),
+            },
+            CoreTurnItem::CollabAgentToolCall(call) => ThreadItem::CollabAgentToolCall {
+                id: call.id,
+                tool: call.tool.into(),
+                status: call.status.into(),
+                sender_thread_id: call.sender_thread_id.to_string(),
+                receiver_thread_ids: call
+                    .receiver_thread_ids
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+                prompt: call.prompt,
+                model: call.model,
+                reasoning_effort: call.reasoning_effort,
+                agents_states: call
+                    .agents_states
+                    .into_iter()
+                    .map(|(thread_id, status)| (thread_id.to_string(), status.into()))
+                    .collect(),
+            },
+            CoreTurnItem::SubAgentActivity(activity) => ThreadItem::SubAgentActivity {
+                id: activity.id,
+                kind: activity.kind.into(),
+                agent_thread_id: activity.agent_thread_id.to_string(),
+                agent_path: String::from(activity.agent_path),
+            },
+            CoreTurnItem::WebSearch(search) => ThreadItem::WebSearch(WebSearchItem {
                 id: search.id,
                 query: search.query,
-                action: Some(WebSearchAction::from(search.action)),
-            },
+                action: Some(web_search_action_from_core(search.action)),
+                results: search.results,
+            }),
             CoreTurnItem::ImageView(image) => ThreadItem::ImageView {
                 id: image.id,
-                path: image.path,
+                path: image.path.into(),
             },
-            CoreTurnItem::ImageGeneration(image) => ThreadItem::ImageGeneration {
-                id: image.id,
-                status: image.status,
-                revised_prompt: image.revised_prompt,
-                result: image.result,
-                saved_path: image.saved_path,
+            CoreTurnItem::Extension(extension) => match extension {
+                ExtensionItem::ImageGeneration(item) => ThreadItem::ImageGeneration(item),
+                ExtensionItem::Sleep(item) => ThreadItem::Sleep(item),
+                ExtensionItem::WebSearch(item) => ThreadItem::WebSearch(item),
+            },
+            CoreTurnItem::ImageGeneration(image) => {
+                ThreadItem::ImageGeneration(ImageGenerationItem {
+                    id: image.id,
+                    status: image.status,
+                    revised_prompt: image.revised_prompt,
+                    result: image.result,
+                    transparent_background: None,
+                    failure: None,
+                    saved_path: image.saved_path,
+                })
+            }
+            CoreTurnItem::EnteredReviewMode(review) => ThreadItem::EnteredReviewMode {
+                id: review.id,
+                review: review.user_facing_hint,
+            },
+            CoreTurnItem::ExitedReviewMode(review) => ThreadItem::ExitedReviewMode {
+                id: review.id,
+                review: review_output_text(review.review_output.as_ref()),
             },
             CoreTurnItem::FileChange(file_change) => ThreadItem::FileChange {
                 id: file_change.id,
@@ -861,8 +965,16 @@ impl From<CoreTurnItem> for ThreadItem {
                     tool: mcp.tool,
                     status: McpToolCallStatus::from(mcp.status),
                     arguments: mcp.arguments,
+                    app_context: mcp.connector_id.map(|connector_id| McpToolCallAppContext {
+                        connector_id,
+                        link_id: mcp.link_id,
+                        resource_uri: mcp.mcp_app_resource_uri.clone(),
+                        app_name: mcp.app_name,
+                        action_name: mcp.action_name,
+                    }),
                     mcp_app_resource_uri: mcp.mcp_app_resource_uri,
                     plugin_id: mcp.plugin_id,
+                    read_only_hint: mcp.read_only_hint,
                     result: mcp.result.map(McpToolCallResult::from).map(Box::new),
                     error: mcp.error.map(McpToolCallError::from),
                     duration_ms,
@@ -897,6 +1009,17 @@ pub enum CommandExecutionStatus {
 impl From<CoreExecCommandStatus> for CommandExecutionStatus {
     fn from(value: CoreExecCommandStatus) -> Self {
         Self::from(&value)
+    }
+}
+
+impl From<CoreCommandExecutionStatus> for CommandExecutionStatus {
+    fn from(value: CoreCommandExecutionStatus) -> Self {
+        match value {
+            CoreCommandExecutionStatus::InProgress => Self::InProgress,
+            CoreCommandExecutionStatus::Completed => Self::Completed,
+            CoreCommandExecutionStatus::Failed => Self::Failed,
+            CoreCommandExecutionStatus::Declined => Self::Declined,
+        }
     }
 }
 
@@ -987,6 +1110,16 @@ impl From<CoreMcpToolCallStatus> for McpToolCallStatus {
     }
 }
 
+impl From<CoreDynamicToolCallStatus> for DynamicToolCallStatus {
+    fn from(value: CoreDynamicToolCallStatus) -> Self {
+        match value {
+            CoreDynamicToolCallStatus::InProgress => Self::InProgress,
+            CoreDynamicToolCallStatus::Completed => Self::Completed,
+            CoreDynamicToolCallStatus::Failed => Self::Failed,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
@@ -1012,6 +1145,28 @@ pub enum CollabAgentToolCallStatus {
     InProgress,
     Completed,
     Failed,
+}
+
+impl From<CoreCollabAgentTool> for CollabAgentTool {
+    fn from(value: CoreCollabAgentTool) -> Self {
+        match value {
+            CoreCollabAgentTool::SpawnAgent => Self::SpawnAgent,
+            CoreCollabAgentTool::SendInput => Self::SendInput,
+            CoreCollabAgentTool::ResumeAgent => Self::ResumeAgent,
+            CoreCollabAgentTool::Wait => Self::Wait,
+            CoreCollabAgentTool::CloseAgent => Self::CloseAgent,
+        }
+    }
+}
+
+impl From<CoreCollabAgentToolCallStatus> for CollabAgentToolCallStatus {
+    fn from(value: CoreCollabAgentToolCallStatus) -> Self {
+        match value {
+            CoreCollabAgentToolCallStatus::InProgress => Self::InProgress,
+            CoreCollabAgentToolCallStatus::Completed => Self::Completed,
+            CoreCollabAgentToolCallStatus::Failed => Self::Failed,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
@@ -1306,6 +1461,9 @@ pub struct CommandExecutionRequestApprovalParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional = nullable)]
     pub approval_id: Option<String>,
+    /// Environment in which the command will run.
+    #[serde(default)]
+    pub environment_id: Option<String>,
     /// Optional explanatory reason (e.g. request for network access).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional = nullable)]
@@ -1321,7 +1479,7 @@ pub struct CommandExecutionRequestApprovalParams {
     /// The command's working directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional = nullable)]
-    pub cwd: Option<AbsolutePathBuf>,
+    pub cwd: Option<LegacyAppPathString>,
     /// Best-effort parsed command actions for friendly display.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional = nullable)]
@@ -1416,6 +1574,26 @@ pub enum DynamicToolCallOutputContentItem {
     InputText { text: String },
     #[serde(rename_all = "camelCase")]
     InputImage { image_url: String },
+    #[serde(rename_all = "camelCase")]
+    InputAudio { audio_url: String },
+}
+
+impl From<codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem>
+    for DynamicToolCallOutputContentItem
+{
+    fn from(item: codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem) -> Self {
+        match item {
+            codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem::InputText { text } => {
+                Self::InputText { text }
+            }
+            codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem::InputImage {
+                image_url,
+            } => Self::InputImage { image_url },
+            codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem::InputAudio {
+                audio_url,
+            } => Self::InputAudio { audio_url },
+        }
+    }
 }
 
 impl From<DynamicToolCallOutputContentItem>
@@ -1426,6 +1604,9 @@ impl From<DynamicToolCallOutputContentItem>
             DynamicToolCallOutputContentItem::InputText { text } => Self::InputText { text },
             DynamicToolCallOutputContentItem::InputImage { image_url } => {
                 Self::InputImage { image_url }
+            }
+            DynamicToolCallOutputContentItem::InputAudio { audio_url } => {
+                Self::InputAudio { audio_url }
             }
         }
     }
@@ -1455,7 +1636,7 @@ pub struct ToolRequestUserInputQuestion {
     pub options: Option<Vec<ToolRequestUserInputOption>>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[derive(Serialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 /// EXPERIMENTAL. Params sent with a request_user_input event.
@@ -1464,9 +1645,39 @@ pub struct ToolRequestUserInputParams {
     pub turn_id: String,
     pub item_id: String,
     pub questions: Vec<ToolRequestUserInputQuestion>,
+    pub is_blocking: bool,
+    /// @deprecated Use `isBlocking` to decide whether the request should block.
     #[serde(default)]
     #[ts(type = "number | null")]
     pub auto_resolution_ms: Option<u64>,
+}
+
+impl<'de> Deserialize<'de> for ToolRequestUserInputParams {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct WireToolRequestUserInputParams {
+            thread_id: String,
+            turn_id: String,
+            item_id: String,
+            questions: Vec<ToolRequestUserInputQuestion>,
+            is_blocking: Option<bool>,
+            auto_resolution_ms: Option<u64>,
+        }
+
+        let wire = WireToolRequestUserInputParams::deserialize(deserializer)?;
+        Ok(Self {
+            thread_id: wire.thread_id,
+            turn_id: wire.turn_id,
+            item_id: wire.item_id,
+            questions: wire.questions,
+            is_blocking: wire.is_blocking.unwrap_or(true),
+            auto_resolution_ms: wire.auto_resolution_ms,
+        })
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

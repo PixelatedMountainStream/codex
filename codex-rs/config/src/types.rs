@@ -4,6 +4,7 @@
 // definitions that do not contain business logic.
 
 pub use crate::mcp_types::AppToolApproval;
+pub use crate::mcp_types::McpServerAuth;
 pub use crate::mcp_types::McpServerConfig;
 pub use crate::mcp_types::McpServerDisabledReason;
 pub use crate::mcp_types::McpServerEnvVar;
@@ -11,14 +12,12 @@ pub use crate::mcp_types::McpServerOAuthConfig;
 pub use crate::mcp_types::McpServerToolConfig;
 pub use crate::mcp_types::McpServerTransportConfig;
 pub use crate::mcp_types::RawMcpServerConfig;
+pub use crate::shell_environment_policy::ShellEnvironmentPolicyToml;
 pub use codex_protocol::config_types::AltScreenMode;
 pub use codex_protocol::config_types::ApprovalsReviewer;
-use codex_protocol::config_types::EnvironmentVariablePattern;
 pub use codex_protocol::config_types::ModeKind;
 pub use codex_protocol::config_types::Personality;
 pub use codex_protocol::config_types::ServiceTier;
-use codex_protocol::config_types::ShellEnvironmentPolicy;
-use codex_protocol::config_types::ShellEnvironmentPolicyInherit;
 pub use codex_protocol::config_types::WebSearchMode;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::collections::BTreeMap;
@@ -83,6 +82,25 @@ impl fmt::Display for SessionPickerViewMode {
     }
 }
 
+/// Working directory to use when resuming or forking a session.
+#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResumeCwdMode {
+    /// Use the directory where Codex was launched.
+    Current,
+    /// Use the latest working directory recorded in the selected session.
+    Session,
+}
+
+impl ResumeCwdMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::Session => "session",
+        }
+    }
+}
+
 /// Determine where Codex should store CLI auth credentials.
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
@@ -102,7 +120,9 @@ pub enum AuthCredentialsStoreMode {
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum OAuthCredentialsStoreMode {
-    /// `Keyring` when available; otherwise, `File`.
+    /// Prefer `Keyring` and use `File` when keyring storage is unavailable.
+    /// Once an MCP client loads credentials from one store, that client keeps the resolved store
+    /// for its lifetime so refreshes cannot switch to a possibly stale credential source.
     /// Credentials stored in the keyring will only be readable by Codex unless the user explicitly grants access via OS-level keyring access.
     #[default]
     Auto,
@@ -111,6 +131,26 @@ pub enum OAuthCredentialsStoreMode {
     File,
     /// Keyring when available, otherwise fail.
     Keyring,
+}
+
+/// Determine how auth credentials should use keyring-backed storage.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthKeyringBackendKind {
+    /// Store the serialized auth payload directly in the OS keyring.
+    Direct,
+    /// Store auth payloads in the local encrypted secrets file, with the file key in the OS keyring.
+    Secrets,
+}
+
+impl Default for AuthKeyringBackendKind {
+    fn default() -> Self {
+        if cfg!(windows) {
+            Self::Secrets
+        } else {
+            Self::Direct
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema)]
@@ -146,18 +186,6 @@ pub enum UriBasedFileOpener {
     /// Option to disable the URI-based file opener.
     #[serde(rename = "none")]
     None,
-}
-
-impl UriBasedFileOpener {
-    pub fn get_scheme(&self) -> Option<&str> {
-        match self {
-            UriBasedFileOpener::VsCode => Some("vscode"),
-            UriBasedFileOpener::VsCodeInsiders => Some("vscode-insiders"),
-            UriBasedFileOpener::Windsurf => Some("windsurf"),
-            UriBasedFileOpener::Cursor => Some("cursor"),
-            UriBasedFileOpener::None => None,
-        }
-    }
 }
 
 /// Settings that govern if and what will be written to `~/.codex/history.jsonl`.
@@ -397,6 +425,10 @@ pub struct AppsDefaultConfig {
         skip_serializing_if = "std::clone::Clone::clone"
     )]
     pub open_world_enabled: bool,
+
+    /// Approval mode for tools unless overridden by per-app or per-tool settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_tools_approval_mode: Option<AppToolApproval>,
 }
 
 /// Per-tool settings for a single app tool.
@@ -733,6 +765,11 @@ pub struct Tui {
     #[serde(default)]
     pub session_picker_view: Option<SessionPickerViewMode>,
 
+    /// Working directory to use when resuming or forking a session.
+    /// When unset, prompt if the current and session directories differ.
+    #[serde(default)]
+    pub resume_cwd: Option<ResumeCwdMode>,
+
     /// Keybinding overrides for the TUI.
     ///
     /// This supports rebinding selected actions globally and by context.
@@ -894,67 +931,6 @@ pub struct SandboxWorkspaceWrite {
     pub exclude_tmpdir_env_var: bool,
     #[serde(default)]
     pub exclude_slash_tmp: bool,
-}
-
-impl From<SandboxWorkspaceWrite> for codex_app_server_protocol::SandboxSettings {
-    fn from(sandbox_workspace_write: SandboxWorkspaceWrite) -> Self {
-        Self {
-            writable_roots: sandbox_workspace_write.writable_roots,
-            network_access: Some(sandbox_workspace_write.network_access),
-            exclude_tmpdir_env_var: Some(sandbox_workspace_write.exclude_tmpdir_env_var),
-            exclude_slash_tmp: Some(sandbox_workspace_write.exclude_slash_tmp),
-        }
-    }
-}
-
-/// Policy for building the `env` when spawning a process via shell-like tools.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
-#[schemars(deny_unknown_fields)]
-pub struct ShellEnvironmentPolicyToml {
-    pub inherit: Option<ShellEnvironmentPolicyInherit>,
-
-    pub ignore_default_excludes: Option<bool>,
-
-    /// List of regular expressions.
-    pub exclude: Option<Vec<String>>,
-
-    pub r#set: Option<HashMap<String, String>>,
-
-    /// List of regular expressions.
-    pub include_only: Option<Vec<String>>,
-
-    pub experimental_use_profile: Option<bool>,
-}
-
-impl From<ShellEnvironmentPolicyToml> for ShellEnvironmentPolicy {
-    fn from(toml: ShellEnvironmentPolicyToml) -> Self {
-        // Default to inheriting the full environment when not specified.
-        let inherit = toml.inherit.unwrap_or(ShellEnvironmentPolicyInherit::All);
-        let ignore_default_excludes = toml.ignore_default_excludes.unwrap_or(true);
-        let exclude = toml
-            .exclude
-            .unwrap_or_default()
-            .into_iter()
-            .map(|s| EnvironmentVariablePattern::new_case_insensitive(&s))
-            .collect();
-        let r#set = toml.r#set.unwrap_or_default();
-        let include_only = toml
-            .include_only
-            .unwrap_or_default()
-            .into_iter()
-            .map(|s| EnvironmentVariablePattern::new_case_insensitive(&s))
-            .collect();
-        let use_profile = toml.experimental_use_profile.unwrap_or(false);
-
-        Self {
-            inherit,
-            ignore_default_excludes,
-            exclude,
-            r#set,
-            include_only,
-            use_profile,
-        }
-    }
 }
 
 #[cfg(test)]

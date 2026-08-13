@@ -1,4 +1,5 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used)]
+use codex_utils_absolute_path::test_support::PathExt;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
@@ -42,6 +43,7 @@ fn write_minimal_rollout_with_id_at_path(file: &Path, id: Uuid) {
             "timestamp": "2024-01-01T00:00:00.000Z",
             "type": "session_meta",
             "payload": {
+                "session_id": id,
                 "id": id,
                 "timestamp": "2024-01-01T00:00:00Z",
                 "cwd": ".",
@@ -65,9 +67,12 @@ async fn upsert_thread_metadata(
     thread_id: ThreadId,
     rollout_path: PathBuf,
 ) -> StateDbHandle {
-    let runtime = StateRuntime::init(codex_home.to_path_buf(), "test-provider".to_string())
-        .await
-        .unwrap();
+    let runtime = StateRuntime::init(
+        codex_state::SqliteConfig::new_for_testing(codex_home.abs()),
+        "test-provider".to_string(),
+    )
+    .await
+    .unwrap();
     runtime
         .mark_backfill_complete(/*last_watermark*/ None)
         .await
@@ -187,6 +192,7 @@ async fn find_locates_rollout_file_written_by_recorder() -> std::io::Result<()> 
             /*parent_thread_id*/ None,
             SessionSource::Exec,
             /*thread_source*/ None,
+            "test_originator".to_string(),
             BaseInstructions::default(),
             Vec::new(),
         ),

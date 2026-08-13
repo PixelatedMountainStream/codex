@@ -10,19 +10,28 @@ use codex_tools::ToolCall;
 use codex_tools::ToolExecutor;
 
 use crate::ExtensionData;
+use crate::ExtensionMetrics;
 
+mod context;
 mod mcp;
 mod prompt;
+mod skill_invocation;
 mod thread_lifecycle;
 mod tool_lifecycle;
 mod turn_input;
 mod turn_lifecycle;
+mod world_state;
 
+pub use context::TurnContextContributionInput;
 pub use mcp::McpServerContribution;
 pub use mcp::McpServerContributionContext;
 pub use prompt::PromptFragment;
 pub use prompt::PromptSlot;
+pub use skill_invocation::SkillInvocationInput;
+pub use skill_invocation::SkillInvocationKind;
+pub use thread_lifecycle::ThreadIdleCause;
 pub use thread_lifecycle::ThreadIdleInput;
+pub use thread_lifecycle::ThreadOriginator;
 pub use thread_lifecycle::ThreadResumeInput;
 pub use thread_lifecycle::ThreadStartInput;
 pub use thread_lifecycle::ThreadStopInput;
@@ -37,6 +46,10 @@ pub use turn_lifecycle::TurnAbortInput;
 pub use turn_lifecycle::TurnErrorInput;
 pub use turn_lifecycle::TurnStartInput;
 pub use turn_lifecycle::TurnStopInput;
+pub use world_state::PreviousWorldStateSection;
+pub use world_state::RenderedWorldStateFragment;
+pub use world_state::WorldStateContributionInput;
+pub use world_state::WorldStateSectionContribution;
 
 /// Boxed, sendable future returned by asynchronous extension contributors.
 pub type ExtensionFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -49,8 +62,8 @@ pub type ExtensionFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// Thread-scoped resolution exposes the host-seeded thread inputs; global
 /// resolution exposes none and must not imply a local fallback. Thread inputs
 /// are frozen for the runtime and do not include lifecycle-contributor state.
-/// Plugin-owned servers and their provenance continue to be resolved by the
-/// plugin manager until that ownership moves into an extension explicitly.
+/// Auto-discovered plugin servers are resolved by the plugin manager. A
+/// thread-selected plugin contribution must carry its own package provenance.
 pub trait McpServerContributor<C: Sync>: Send + Sync {
     /// Stable identity used for registration provenance and conflict diagnostics.
     fn id(&self) -> &'static str;
@@ -62,19 +75,53 @@ pub trait McpServerContributor<C: Sync>: Send + Sync {
 }
 
 /// Extension contribution that adds prompt fragments during prompt assembly.
+///
+/// Implementations should use the method matching the scope needed by the
+/// fragment: thread/session context for stable inputs, and turn context for
+/// fragments that depend on turn-local host state.
 pub trait ContextContributor: Send + Sync {
-    fn contribute<'a>(
+    /// Returns thread-scoped context using the supplied extension state.
+    fn contribute_thread_context<'a>(
         &'a self,
         session_store: &'a ExtensionData,
         thread_store: &'a ExtensionData,
-    ) -> ExtensionFuture<'a, Vec<PromptFragment>>;
+    ) -> ExtensionFuture<'a, Vec<PromptFragment>> {
+        Box::pin(async move {
+            let _self = self;
+            let _session_store = session_store;
+            let _thread_store = thread_store;
+            Vec::new()
+        })
+    }
+
+    fn contribute_turn_context<'a>(
+        &'a self,
+        input: TurnContextContributionInput<'a>,
+    ) -> ExtensionFuture<'a, Vec<PromptFragment>> {
+        Box::pin(async move {
+            let _self = self;
+            let _input = input;
+            Vec::new()
+        })
+    }
+
+    fn contribute_world_state<'a>(
+        &'a self,
+        input: WorldStateContributionInput<'a>,
+    ) -> ExtensionFuture<'a, Vec<WorldStateSectionContribution>> {
+        Box::pin(async move {
+            let _self = self;
+            let _input = input;
+            Vec::new()
+        })
+    }
 }
 
 /// Contributor for host-owned thread lifecycle gates.
 ///
 /// Implementations should use these callbacks to seed, rehydrate, or flush
-/// extension-private thread state. Heavy dependencies belong on the extension
-/// value created by the host, not in these inputs.
+/// extension-private thread state and retain any session capabilities supplied
+/// by the host. Other heavy dependencies belong on the extension value.
 pub trait ThreadLifecycleContributor<C: Sync>: Send + Sync {
     /// Called after host startup has initialized the thread-scoped store.
     fn on_thread_start<'a>(&'a self, input: ThreadStartInput<'a, C>) -> ExtensionFuture<'a, ()> {
@@ -160,10 +207,12 @@ pub trait TurnLifecycleContributor: Send + Sync {
 /// host-specific dependencies belong on the extension value installed by the
 /// host, not in this input.
 pub trait TurnInputContributor: Send + Sync {
-    /// Returns additional contextual fragments for one submitted turn.
+    /// Returns additional contextual fragments for one submitted turn. The optional metrics
+    /// capability is bound to the effective model for that turn.
     fn contribute<'a>(
         &'a self,
         input: TurnInputContext,
+        extension_metrics: Option<Arc<dyn ExtensionMetrics>>,
         session_store: &'a ExtensionData,
         thread_store: &'a ExtensionData,
         turn_store: &'a ExtensionData,
@@ -207,14 +256,41 @@ pub trait TokenUsageContributor: Send + Sync {
     }
 }
 
+/// Contributor for skill invocations observed by the host or an owning extension.
+///
+/// Implementations should treat the skill resource as an opaque identity and keep this callback
+/// cheap because it runs inline with skill loading or command dispatch.
+pub trait SkillInvocationContributor: Send + Sync {
+    /// Called after one explicit skill load or deduplicated implicit skill invocation is observed.
+    fn on_skill_invocation<'a>(
+        &'a self,
+        _input: SkillInvocationInput<'a>,
+    ) -> ExtensionFuture<'a, ()> {
+        Box::pin(async move {
+            let _self = self;
+            let _input = _input;
+        })
+    }
+}
+
 /// Extension contribution that exposes native tools owned by a feature.
 pub trait ToolContributor: Send + Sync {
-    /// Returns the native tools visible for the supplied extension stores.
+    /// Returns native tools bound to the supplied extension state.
     fn tools(
         &self,
         session_store: &ExtensionData,
         thread_store: &ExtensionData,
     ) -> Vec<Arc<dyn ToolExecutor<ToolCall>>>;
+
+    /// Returns native tools bound to one sampling step.
+    fn tools_for_step(
+        &self,
+        session_store: &ExtensionData,
+        thread_store: &ExtensionData,
+        _step_store: &ExtensionData,
+    ) -> Vec<Arc<dyn ToolExecutor<ToolCall>>> {
+        self.tools(session_store, thread_store)
+    }
 }
 
 /// Contributor for host-owned tool lifecycle gates.

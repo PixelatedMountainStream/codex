@@ -16,6 +16,18 @@ fn detects_environment_context_fragment() {
 }
 
 #[test]
+fn detects_skill_instructions_fragment_case_insensitively() {
+    for text in [
+        "<skill>\n<name>demo</name>\n</skill>",
+        "  <SKILL>\n<name>demo</name>\n</SKILL>  ",
+    ] {
+        assert!(is_contextual_user_fragment(&ContentItem::InputText {
+            text: text.to_string(),
+        }));
+    }
+}
+
+#[test]
 fn detects_agents_instructions_fragment() {
     for text in [
         "# AGENTS.md instructions for /tmp\n\n<INSTRUCTIONS>\nbody\n</INSTRUCTIONS>",
@@ -72,6 +84,14 @@ fn detects_internal_model_context_fragment() {
     );
     assert!(is_contextual_user_fragment(&ContentItem::InputText {
         text
+    }));
+}
+
+#[test]
+fn detects_recommended_plugins_fragment() {
+    assert!(is_contextual_user_fragment(&ContentItem::InputText {
+        text: "<recommended_plugins>\n- Google Drive (google-drive@openai-curated-remote)\n</recommended_plugins>"
+            .to_string(),
     }));
 }
 

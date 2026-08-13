@@ -98,6 +98,7 @@ async fn run_startup_hooks_review_app(
         app_event_tx.clone(),
         &keymap,
     );
+    let mut chord_matcher = crate::keymap::KeyChordMatcher::default();
     draw_view(tui, &view)?;
 
     let tui_events = tui.event_stream();
@@ -107,8 +108,21 @@ async fn run_startup_hooks_review_app(
         let Some(event) = tui_events.next().await else {
             return Ok(StartupHooksReviewOutcome::Continue);
         };
+        tui.screen_size_for_event(&event)?;
         match event {
             TuiEvent::Key(key_event) => {
+                let key_event = match chord_matcher.advance(
+                    key_event,
+                    &keymap.chords,
+                    crate::keymap::KeymapContextSet::new(crate::keymap::KeymapContext::List),
+                    tokio::time::Instant::now(),
+                ) {
+                    crate::keymap::KeyChordMatch::PassThrough => key_event,
+                    crate::keymap::KeyChordMatch::Completed(dispatch_event) => dispatch_event,
+                    crate::keymap::KeyChordMatch::Pending(_)
+                    | crate::keymap::KeyChordMatch::Cancelled
+                    | crate::keymap::KeyChordMatch::Ignored => continue,
+                };
                 if matches!(key_event.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                     view.handle_key_event(key_event);
                 }
@@ -167,7 +181,7 @@ async fn run_startup_hooks_review_app(
                 }
             }
             TuiEvent::Paste(_) => {}
-            TuiEvent::Draw | TuiEvent::Resize => draw_view(tui, &view)?,
+            TuiEvent::Draw | TuiEvent::Resume | TuiEvent::Resize(_) => draw_view(tui, &view)?,
         }
     }
 }
@@ -258,7 +272,7 @@ fn selection_item(name: &str, is_disabled: bool) -> SelectionItem {
 fn draw_view(tui: &mut Tui, view: &ListSelectionView) -> Result<()> {
     tui.draw(u16::MAX, |frame| {
         let area = frame.area();
-        frame.render_widget_ref(Clear, area);
+        frame.render_widget_ref(&Clear, area);
         let view_area = Rect::new(
             area.x,
             area.y,
@@ -291,6 +305,7 @@ mod tests {
     use crate::test_support::PathBufExt;
     use crate::test_support::test_path_buf;
     use codex_app_server_protocol::HookEventName;
+    use codex_app_server_protocol::HookExecutionMode;
     use codex_app_server_protocol::HookHandlerType;
     use codex_app_server_protocol::HookMetadata;
     use codex_app_server_protocol::HookSource;
@@ -306,11 +321,13 @@ mod tests {
             key: key.to_string(),
             event_name: HookEventName::PreToolUse,
             handler_type: HookHandlerType::Command,
+            execution_mode: HookExecutionMode::Sync,
             is_managed: false,
             matcher: Some("Bash".to_string()),
             command: Some("/tmp/hook.sh".to_string()),
             timeout_sec: 30,
             status_message: None,
+            additional_context_limit: None,
             source_path: test_path_buf("/tmp/hooks.json").abs(),
             source: HookSource::User,
             plugin_id: None,

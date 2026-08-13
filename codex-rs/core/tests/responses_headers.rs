@@ -5,6 +5,7 @@ use codex_core::ModelClient;
 use codex_core::Prompt;
 use codex_core::ResponseEvent;
 use codex_login::CodexAuth;
+use codex_login::auth::AgentIdentityAuthPolicy;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::WireApi;
 use codex_otel::SessionTelemetry;
@@ -87,6 +88,7 @@ async fn responses_stream_includes_subagent_header_on_review() {
         websocket_connect_timeout_ms: None,
         requires_openai_auth: false,
         supports_websockets: false,
+        supports_standalone_web_search: false,
     };
 
     let codex_home = TempDir::new().expect("failed to create TempDir");
@@ -120,14 +122,18 @@ async fn responses_stream_includes_subagent_header_on_review() {
 
     let client = ModelClient::new(
         /*auth_manager*/ None,
+        AgentIdentityAuthPolicy::JwtOnly,
         thread_id,
         provider.clone(),
         session_source.clone(),
+        "test_originator".to_string(),
         config.model_verbosity,
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
+        /*concurrent_reasoning_summaries_enabled*/ false,
         /*attestation_provider*/ None,
+        config.http_client_factory(),
     );
     let responses_metadata = test_turn_responses_metadata(&client, thread_id, &session_source);
     let mut client_session = client.new_session();
@@ -140,6 +146,7 @@ async fn responses_stream_includes_subagent_header_on_review() {
             text: "hello".into(),
         }],
         phase: None,
+        internal_chat_message_metadata_passthrough: None,
     }];
 
     let mut stream = client_session
@@ -217,6 +224,7 @@ async fn responses_stream_includes_subagent_header_on_other() {
         websocket_connect_timeout_ms: None,
         requires_openai_auth: false,
         supports_websockets: false,
+        supports_standalone_web_search: false,
     };
 
     let codex_home = TempDir::new().expect("failed to create TempDir");
@@ -250,14 +258,18 @@ async fn responses_stream_includes_subagent_header_on_other() {
 
     let client = ModelClient::new(
         /*auth_manager*/ None,
+        AgentIdentityAuthPolicy::JwtOnly,
         thread_id,
         provider.clone(),
         session_source.clone(),
+        "test_originator".to_string(),
         config.model_verbosity,
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
+        /*concurrent_reasoning_summaries_enabled*/ false,
         /*attestation_provider*/ None,
+        config.http_client_factory(),
     );
     let responses_metadata = test_turn_responses_metadata(&client, thread_id, &session_source);
     let mut client_session = client.new_session();
@@ -270,6 +282,7 @@ async fn responses_stream_includes_subagent_header_on_other() {
             text: "hello".into(),
         }],
         phase: None,
+        internal_chat_message_metadata_passthrough: None,
     }];
 
     let mut stream = client_session
@@ -328,6 +341,7 @@ async fn responses_respects_model_info_overrides_from_config() {
         websocket_connect_timeout_ms: None,
         requires_openai_auth: false,
         supports_websockets: false,
+        supports_standalone_web_search: false,
     };
 
     let codex_home = TempDir::new().expect("failed to create TempDir");
@@ -335,7 +349,6 @@ async fn responses_respects_model_info_overrides_from_config() {
     config.model = Some("gpt-3.5-turbo".to_string());
     config.model_provider_id = provider.name.clone();
     config.model_provider = provider.clone();
-    config.model_supports_reasoning_summaries = Some(true);
     config.model_reasoning_summary = Some(ReasoningSummary::Detailed);
     let effort = config.model_reasoning_effort.clone();
     let summary = config.model_reasoning_summary;
@@ -366,14 +379,18 @@ async fn responses_respects_model_info_overrides_from_config() {
 
     let client = ModelClient::new(
         /*auth_manager*/ None,
+        AgentIdentityAuthPolicy::JwtOnly,
         thread_id,
         provider.clone(),
         session_source.clone(),
+        "test_originator".to_string(),
         config.model_verbosity,
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
+        /*concurrent_reasoning_summaries_enabled*/ false,
         /*attestation_provider*/ None,
+        config.http_client_factory(),
     );
     let responses_metadata = test_turn_responses_metadata(&client, thread_id, &session_source);
     let mut client_session = client.new_session();
@@ -386,6 +403,7 @@ async fn responses_respects_model_info_overrides_from_config() {
             text: "hello".into(),
         }],
         phase: None,
+        internal_chat_message_metadata_passthrough: None,
     }];
 
     let mut stream = client_session
@@ -445,8 +463,8 @@ async fn responses_stream_includes_turn_metadata_header_for_git_workspace_e2e() 
     test.submit_turn("hello")
         .await
         .expect("submit first turn prompt");
-    let initial_header = first_request
-        .single_request()
+    let initial_request = first_request.single_request();
+    let initial_header = initial_request
         .header("x-codex-turn-metadata")
         .expect("x-codex-turn-metadata header should be present");
     let initial_parsed: serde_json::Value =
@@ -473,6 +491,24 @@ async fn responses_stream_includes_turn_metadata_header_for_git_workspace_e2e() 
             .get("sandbox")
             .and_then(serde_json::Value::as_str),
         Some("none")
+    );
+    assert_eq!(
+        initial_parsed
+            .get("sandbox_mode")
+            .and_then(serde_json::Value::as_str),
+        Some("danger-full-access")
+    );
+    let body_metadata: serde_json::Value = serde_json::from_str(
+        initial_request.body_json()["client_metadata"]["x-codex-turn-metadata"]
+            .as_str()
+            .expect("request body should include x-codex-turn-metadata"),
+    )
+    .expect("body x-codex-turn-metadata should be valid JSON");
+    assert_eq!(
+        body_metadata
+            .get("sandbox_mode")
+            .and_then(serde_json::Value::as_str),
+        Some("danger-full-access")
     );
     assert_eq!(
         initial_parsed

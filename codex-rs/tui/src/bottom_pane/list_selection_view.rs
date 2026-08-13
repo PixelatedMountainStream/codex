@@ -16,8 +16,8 @@ use super::selection_popup_common::render_menu_surface;
 use super::selection_popup_common::wrap_styled_line;
 use crate::app_event_sender::AppEventSender;
 use crate::clipboard_paste::normalize_pasted_search_query;
-use crate::key_hint::KeyBinding;
 use crate::key_hint::KeyBindingListExt;
+use crate::key_hint::ShortcutHint;
 use crate::key_hint::is_plain_text_key_event;
 use crate::keymap::ListKeymap;
 use crate::render::renderable::ColumnRenderable;
@@ -34,6 +34,7 @@ use super::selection_popup_common::GenericDisplayRow;
 use super::selection_popup_common::measure_rows_height_with_col_width_mode;
 use super::selection_popup_common::render_rows_single_line_with_col_width_mode;
 use super::selection_popup_common::render_rows_with_col_width_mode;
+pub(crate) use super::selection_row_layout::SelectionDescriptionLayout;
 use super::selection_tabs::SelectionTab;
 use super::selection_tabs::render_tab_bar;
 use super::selection_tabs::tab_bar_height;
@@ -134,7 +135,7 @@ pub(crate) struct SelectionItem {
     pub name_prefix_spans: Vec<Span<'static>>,
     pub toggle: Option<SelectionToggle>,
     pub toggle_placeholder: Option<&'static str>,
-    pub display_shortcut: Option<KeyBinding>,
+    pub display_shortcut: Option<ShortcutHint>,
     pub description: Option<String>,
     pub selected_description: Option<String>,
     pub is_current: bool,
@@ -145,6 +146,8 @@ pub(crate) struct SelectionItem {
     pub dismiss_parent_on_child_accept: bool,
     pub search_value: Option<String>,
     pub disabled_reason: Option<String>,
+    /// Optional marker rendered in place of the number for a disabled row.
+    pub disabled_gutter_marker: Option<&'static str>,
 }
 
 /// Construction-time configuration for [`ListSelectionView`].
@@ -158,6 +161,8 @@ pub(crate) struct SelectionItem {
 /// `AutoAllRows` measures all rows to ensure stable column widths as the user scrolls
 /// `Fixed` used a fixed 30/70  split between columns
 /// `row_display` controls whether rows can wrap or stay single-line with ellipsis truncation
+/// `description_layout` optionally moves descriptions below labels when their
+/// column would become too narrow.
 pub(crate) struct SelectionViewParams {
     pub view_id: Option<&'static str>,
     pub title: Option<String>,
@@ -172,6 +177,7 @@ pub(crate) struct SelectionViewParams {
     pub search_placeholder: Option<String>,
     pub col_width_mode: ColumnWidthMode,
     pub row_display: SelectionRowDisplay,
+    pub description_layout: SelectionDescriptionLayout,
     /// Rendered left-column width to use for auto-sized rows.
     pub name_column_width: Option<usize>,
     pub header: Box<dyn Renderable>,
@@ -200,6 +206,9 @@ pub(crate) struct SelectionViewParams {
     /// Receives the *actual* item index, not the filtered/visible index.
     pub on_selection_changed: OnSelectionChangedCallback,
 
+    /// Whether cancellation keys can dismiss the picker.
+    pub allow_cancel: bool,
+
     /// Called when the picker is dismissed via Esc/Ctrl+C without selecting.
     pub on_cancel: OnCancelCallback,
 }
@@ -220,6 +229,7 @@ impl Default for SelectionViewParams {
             search_placeholder: None,
             col_width_mode: ColumnWidthMode::AutoVisible,
             row_display: SelectionRowDisplay::Wrapped,
+            description_layout: SelectionDescriptionLayout::Columns,
             name_column_width: None,
             header: Box::new(()),
             initial_selected_idx: None,
@@ -229,6 +239,7 @@ impl Default for SelectionViewParams {
             stacked_side_content: None,
             preserve_side_content_bg: false,
             on_selection_changed: None,
+            allow_cancel: true,
             on_cancel: None,
         }
     }
@@ -256,6 +267,7 @@ pub(crate) struct ListSelectionView {
     search_placeholder: Option<String>,
     col_width_mode: ColumnWidthMode,
     row_display: SelectionRowDisplay,
+    description_layout: SelectionDescriptionLayout,
     name_column_width: Option<usize>,
     filtered_indices: Vec<usize>,
     last_selected_actual_idx: Option<usize>,
@@ -270,9 +282,68 @@ pub(crate) struct ListSelectionView {
     /// Called when the highlighted item changes (navigation, filter, number-key).
     on_selection_changed: OnSelectionChangedCallback,
 
+    allow_cancel: bool,
+
     /// Called when the picker is dismissed via Esc/Ctrl+C without selecting.
     on_cancel: OnCancelCallback,
     keymap: ListKeymap,
+}
+
+const SELECTION_TOGGLE_ON_PREFIX: &str = "[*] ";
+const SELECTION_TOGGLE_OFF_PREFIX: &str = "[ ] ";
+pub(crate) const SELECTION_TOGGLE_UNAVAILABLE_PREFIX: &str = "[-] ";
+pub(crate) const SELECTION_TOGGLE_BLOCKED_PREFIX: &str = "[!] ";
+
+fn selection_toggle_prefix(toggle: &SelectionToggle) -> &'static str {
+    if toggle.is_on {
+        SELECTION_TOGGLE_ON_PREFIX
+    } else {
+        SELECTION_TOGGLE_OFF_PREFIX
+    }
+}
+
+fn selection_item_toggle_prefix(item: &SelectionItem) -> Option<&'static str> {
+    item.toggle
+        .as_ref()
+        .map(selection_toggle_prefix)
+        .or(item.toggle_placeholder)
+}
+
+impl ListSelectionView {
+    fn selected_item_has_toggle(&self) -> bool {
+        self.selected_actual_idx()
+            .and_then(|actual_idx| self.active_items().get(actual_idx))
+            .is_some_and(|item| item.toggle.is_some() && Self::item_is_enabled(item))
+    }
+
+    fn selected_item_has_toggle_placeholder(&self) -> bool {
+        self.selected_actual_idx()
+            .and_then(|actual_idx| self.active_items().get(actual_idx))
+            .is_some_and(|item| {
+                item.toggle.is_none()
+                    && item.toggle_placeholder.is_some()
+                    && Self::item_is_enabled(item)
+            })
+    }
+
+    fn toggle_selected(&mut self) {
+        let Some(actual_idx) = self.selected_actual_idx() else {
+            return;
+        };
+        let app_event_tx = self.app_event_tx.clone();
+        let Some(item) = self.active_items_mut().get_mut(actual_idx) else {
+            return;
+        };
+        if !Self::item_is_enabled(item) {
+            return;
+        }
+        let Some(toggle) = item.toggle.as_mut() else {
+            return;
+        };
+
+        toggle.is_on = !toggle.is_on;
+        (toggle.action)(toggle.is_on, &app_event_tx);
+    }
 }
 
 impl ListSelectionView {
@@ -331,6 +402,7 @@ impl ListSelectionView {
             },
             col_width_mode: params.col_width_mode,
             row_display: params.row_display,
+            description_layout: params.description_layout,
             name_column_width: params.name_column_width,
             filtered_indices: Vec::new(),
             last_selected_actual_idx: None,
@@ -342,6 +414,7 @@ impl ListSelectionView {
             stacked_side_content: params.stacked_side_content,
             preserve_side_content_bg: params.preserve_side_content_bg,
             on_selection_changed: params.on_selection_changed,
+            allow_cancel: params.allow_cancel,
             on_cancel: params.on_cancel,
             keymap,
         };
@@ -414,6 +487,11 @@ impl ListSelectionView {
             .selected_actual_idx()
             .filter(|actual_idx| self.enabled_actual_idx(*actual_idx).is_some())
             .or_else(|| {
+                self.initial_selected_idx
+                    .take()
+                    .filter(|actual_idx| self.enabled_actual_idx(*actual_idx).is_some())
+            })
+            .or_else(|| {
                 (!self.is_searchable)
                     .then(|| {
                         self.active_items()
@@ -421,11 +499,6 @@ impl ListSelectionView {
                             .position(|item| item.is_current && Self::item_is_enabled(item))
                     })
                     .flatten()
-            })
-            .or_else(|| {
-                self.initial_selected_idx
-                    .take()
-                    .filter(|actual_idx| self.enabled_actual_idx(*actual_idx).is_some())
             });
 
         if self.is_searchable && !self.search_query.is_empty() {
@@ -517,7 +590,14 @@ impl ListSelectionView {
                         // numbers be used for the search query).
                         format!("{prefix} ")
                     } else if is_disabled {
-                        format!("{prefix} {}", " ".repeat(enabled_row_number_width + 2))
+                        if let Some(disabled_gutter_marker) = item.disabled_gutter_marker {
+                            let marker_width = UnicodeWidthStr::width(disabled_gutter_marker);
+                            let marker_padding =
+                                " ".repeat(enabled_row_number_width.saturating_sub(marker_width));
+                            format!("{prefix} {marker_padding}{disabled_gutter_marker}  ")
+                        } else {
+                            format!("{prefix} {}", " ".repeat(enabled_row_number_width + 2))
+                        }
                     } else {
                         enabled_row_number += 1;
                         let n = enabled_row_number;
@@ -526,10 +606,8 @@ impl ListSelectionView {
                     let wrap_prefix_width = UnicodeWidthStr::width(wrap_prefix.as_str());
                     let mut name_prefix_spans = Vec::new();
                     name_prefix_spans.push(wrap_prefix.into());
-                    if let Some(toggle) = &item.toggle {
-                        name_prefix_spans.push(if toggle.is_on { "[*] " } else { "[ ] " }.into());
-                    } else if let Some(placeholder) = item.toggle_placeholder {
-                        name_prefix_spans.push(placeholder.into());
+                    if let Some(toggle_prefix) = selection_item_toggle_prefix(item) {
+                        name_prefix_spans.push(toggle_prefix.into());
                     }
                     name_prefix_spans.extend(item.name_prefix_spans.clone());
                     let description = is_selected
@@ -604,22 +682,6 @@ impl ListSelectionView {
         item.disabled_reason.is_none() && !item.is_disabled
     }
 
-    fn selected_item_has_toggle(&self) -> bool {
-        self.selected_actual_idx()
-            .and_then(|actual_idx| self.active_items().get(actual_idx))
-            .is_some_and(|item| item.toggle.is_some() && Self::item_is_enabled(item))
-    }
-
-    fn selected_item_has_toggle_placeholder(&self) -> bool {
-        self.selected_actual_idx()
-            .and_then(|actual_idx| self.active_items().get(actual_idx))
-            .is_some_and(|item| {
-                item.toggle.is_none()
-                    && item.toggle_placeholder.is_some()
-                    && Self::item_is_enabled(item)
-            })
-    }
-
     fn actual_idx_for_enabled_number(&self, number: usize) -> Option<usize> {
         if number == 0 {
             return None;
@@ -631,25 +693,6 @@ impl ListSelectionView {
             .filter(|(_, item)| Self::item_is_enabled(item))
             .nth(number - 1)
             .map(|(idx, _)| idx)
-    }
-
-    fn toggle_selected(&mut self) {
-        let Some(actual_idx) = self.selected_actual_idx() else {
-            return;
-        };
-        let app_event_tx = self.app_event_tx.clone();
-        let Some(item) = self.active_items_mut().get_mut(actual_idx) else {
-            return;
-        };
-        if !Self::item_is_enabled(item) {
-            return;
-        }
-        let Some(toggle) = item.toggle.as_mut() else {
-            return;
-        };
-
-        toggle.is_on = !toggle.is_on;
-        (toggle.action)(toggle.is_on, &app_event_tx);
     }
 
     fn move_up(&mut self) {
@@ -907,6 +950,10 @@ impl ListSelectionView {
 }
 
 impl BottomPaneView for ListSelectionView {
+    fn keymap_contexts(&self) -> crate::keymap::KeymapContextSet {
+        crate::keymap::KeymapContextSet::new(crate::keymap::KeymapContext::List)
+    }
+
     fn handle_key_event(&mut self, key_event: KeyEvent) {
         // Searchable lists reserve printable characters for query input. This
         // keeps vim-style plain j/k/h/l useful in non-search lists without
@@ -968,7 +1015,7 @@ impl BottomPaneView for ListSelectionView {
             } if self.is_searchable
                 && self.search_query.is_empty()
                 && self.selected_item_has_toggle_placeholder() => {}
-            _ if self.keymap.cancel.is_pressed(key_event) => {
+            _ if self.allow_cancel && self.keymap.cancel.is_pressed(key_event) => {
                 self.on_ctrl_c();
             }
             _ if self.keymap.accept.is_pressed(key_event) => self.accept(),
@@ -1062,6 +1109,9 @@ impl BottomPaneView for ListSelectionView {
     }
 
     fn on_ctrl_c(&mut self) -> CancellationEvent {
+        if !self.allow_cancel {
+            return CancellationEvent::NotHandled;
+        }
         if let Some(cb) = &self.on_cancel {
             cb(&self.app_event_tx);
         }
@@ -1085,7 +1135,8 @@ impl Renderable for ListSelectionView {
 
         // Measure wrapped height for up to MAX_POPUP_ROWS items.
         let rows = self.build_rows();
-        let column_width = ColumnWidthConfig::new(self.col_width_mode, self.name_column_width);
+        let column_width = ColumnWidthConfig::new(self.col_width_mode, self.name_column_width)
+            .with_description_layout(self.description_layout);
         let rows_height = match self.row_display {
             SelectionRowDisplay::Wrapped => measure_rows_height_with_col_width_mode(
                 &rows,
@@ -1163,7 +1214,8 @@ impl Renderable for ListSelectionView {
         let header_height = header.desired_height(inner_width);
         let tab_height = tab_bar_height(&self.tabs, self.active_tab_idx.unwrap_or(0), inner_width);
         let rows = self.build_rows();
-        let column_width = ColumnWidthConfig::new(self.col_width_mode, self.name_column_width);
+        let column_width = ColumnWidthConfig::new(self.col_width_mode, self.name_column_width)
+            .with_description_layout(self.description_layout);
         let rows_height = match self.row_display {
             SelectionRowDisplay::Wrapped => measure_rows_height_with_col_width_mode(
                 &rows,
@@ -1239,7 +1291,11 @@ impl Renderable for ListSelectionView {
         // -- List rows --
         if list_area.height > 0 {
             let render_area = Rect {
-                x: list_area.x.saturating_sub(2),
+                x: if rows.is_empty() {
+                    list_area.x
+                } else {
+                    list_area.x.saturating_sub(2)
+                },
                 y: list_area.y,
                 width: effective_rows_width.max(1),
                 height: list_area.height,
@@ -1683,6 +1739,29 @@ mod tests {
             lines.contains("filters"),
             "expected search query line to include rendered query, got {lines:?}"
         );
+    }
+
+    #[test]
+    fn empty_searchable_list_aligns_message_with_search() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let view = new_view(
+            SelectionViewParams {
+                title: Some("Select a base branch".to_string()),
+                footer_hint: Some(standard_popup_hint_line()),
+                is_searchable: true,
+                search_placeholder: Some("Type to search branches".to_string()),
+                ..Default::default()
+            },
+            tx,
+        );
+
+        let rendered = render_lines_with_width(&view, /*width*/ 48)
+            .lines()
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_snapshot!("list_selection_empty_searchable", rendered);
     }
 
     #[test]
@@ -2492,6 +2571,41 @@ mod tests {
             "list_selection_narrow_width_preserves_rows",
             render_lines_with_width(&view, /*width*/ 24)
         );
+    }
+
+    #[test]
+    fn snapshot_narrow_width_counts_halfwidth_sound_marks() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let items = vec![
+            SelectionItem {
+                name: "abｶﾞc".to_string(),
+                description: Some("dakuten description".to_string()),
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: "aﾊﾟc".to_string(),
+                description: Some("handakuten description".to_string()),
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+        ];
+        let view = new_view(
+            SelectionViewParams {
+                title: Some("Halfwidth sound marks".to_string()),
+                items,
+                ..Default::default()
+            },
+            tx,
+        );
+
+        let rendered = format!(
+            "width 20:\n{}\n\nwidth 24:\n{}",
+            render_lines_with_width(&view, /*width*/ 20),
+            render_lines_with_width(&view, /*width*/ 24)
+        );
+        assert_snapshot!("list_selection_halfwidth_sound_marks_narrow", rendered);
     }
 
     #[test]

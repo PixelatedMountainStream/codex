@@ -55,6 +55,7 @@ mod tests {
     use crate::provider::RetryConfig;
     use crate::search::AllowedCaller;
     use crate::search::ApproximateLocation;
+    use crate::search::ExternalWebAccess;
     use crate::search::LocationType;
     use crate::search::OpenOperation;
     use crate::search::SearchCommands;
@@ -69,6 +70,7 @@ mod tests {
     use codex_client::Response;
     use codex_client::StreamResponse;
     use codex_client::TransportError;
+    use codex_protocol::ResponseItemId;
     use codex_protocol::models::ContentItem;
     use codex_protocol::models::ResponseItem;
     use http::StatusCode;
@@ -137,6 +139,12 @@ mod tests {
             serde_json::to_vec(&json!({
                 "encrypted_output": "ciphertext",
                 "output": "search result",
+                "results": [{
+                    "type": "text_result",
+                    "ref_id": "turn0search0",
+                    "url": "https://example.com/result",
+                    "future_field": {"preserved": true},
+                }],
             }))
             .expect("serialize response"),
         );
@@ -149,7 +157,7 @@ mod tests {
                     model: "gpt-test".to_string(),
                     reasoning: None,
                     input: Some(SearchInput::Items(vec![ResponseItem::Message {
-                        id: None,
+                        id: Some(ResponseItemId::with_suffix("msg", "search")),
                         role: "user".to_string(),
                         content: vec![
                             ContentItem::InputText {
@@ -161,6 +169,7 @@ mod tests {
                             },
                         ],
                         phase: None,
+                        internal_chat_message_metadata_passthrough: None,
                     }])),
                     commands: Some(SearchCommands {
                         search_query: Some(vec![SearchQuery {
@@ -192,7 +201,7 @@ mod tests {
                             caption: Some(true),
                         }),
                         allowed_callers: Some(vec![AllowedCaller::Direct]),
-                        external_web_access: Some(true),
+                        external_web_access: Some(ExternalWebAccess::Boolean(true)),
                     }),
                     max_output_tokens: Some(2500),
                 },
@@ -206,6 +215,12 @@ mod tests {
             SearchResponse {
                 encrypted_output: Some("ciphertext".to_string()),
                 output: "search result".to_string(),
+                results: Some(vec![json!({
+                    "type": "text_result",
+                    "ref_id": "turn0search0",
+                    "url": "https://example.com/result",
+                    "future_field": {"preserved": true},
+                })]),
             }
         );
 
@@ -227,6 +242,7 @@ mod tests {
                 "model": "gpt-test",
                 "input": [{
                     "type": "message",
+                    "id": "msg_search",
                     "role": "user",
                     "content": [
                         {"type": "input_text", "text": "find this"},
@@ -261,6 +277,42 @@ mod tests {
                 },
                 "max_output_tokens": 2500
             })
+        );
+    }
+    #[test]
+    fn search_response_defaults_missing_results_for_older_endpoints() {
+        let response: SearchResponse = serde_json::from_value(json!({
+            "encrypted_output": null,
+            "output": "search result",
+        }))
+        .expect("response without results should deserialize");
+
+        assert_eq!(
+            response,
+            SearchResponse {
+                encrypted_output: None,
+                output: "search result".to_string(),
+                results: None,
+            }
+        );
+    }
+
+    #[test]
+    fn search_response_preserves_supported_empty_results() {
+        let response: SearchResponse = serde_json::from_value(json!({
+            "encrypted_output": null,
+            "output": "search result",
+            "results": [],
+        }))
+        .expect("response with empty results should deserialize");
+
+        assert_eq!(
+            response,
+            SearchResponse {
+                encrypted_output: None,
+                output: "search result".to_string(),
+                results: Some(Vec::new()),
+            }
         );
     }
 }

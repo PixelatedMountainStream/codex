@@ -4,6 +4,7 @@
 //! catalog state into one-time TUI prompts or warning cells without owning the main event loop.
 
 use super::*;
+use codex_config::ConfigLayerSource;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
@@ -68,10 +69,7 @@ pub(super) fn emit_skill_load_warnings(app_event_tx: &AppEventSender, errors: &[
 pub(super) fn emit_project_config_warnings(app_event_tx: &AppEventSender, config: &Config) {
     let mut disabled_folders = Vec::new();
 
-    for layer in config.config_layer_stack.get_layers(
-        ConfigLayerStackOrdering::LowestPrecedenceFirst,
-        /*include_disabled*/ true,
-    ) {
+    for layer in config.config_layer_stack.all_layers_low_to_high() {
         let ConfigLayerSource::Project { dot_codex_folder } = &layer.name else {
             continue;
         };
@@ -214,17 +212,18 @@ pub(super) fn select_model_availability_nux(
     available_models: &[ModelPreset],
     nux_config: &ModelAvailabilityNuxConfig,
 ) -> Option<StartupTooltipOverride> {
-    available_models.iter().find_map(|preset| {
-        let ModelAvailabilityNux { message } = preset.availability_nux.as_ref()?;
-        let shown_count = nux_config
-            .shown_count
-            .get(&preset.model)
-            .copied()
-            .unwrap_or_default();
-        (shown_count < MODEL_AVAILABILITY_NUX_MAX_SHOW_COUNT).then(|| StartupTooltipOverride {
-            model_slug: preset.model.clone(),
-            message: message.clone(),
-        })
+    let preset = available_models
+        .iter()
+        .find(|preset| preset.availability_nux.is_some())?;
+    let ModelAvailabilityNux { message } = preset.availability_nux.as_ref()?;
+    let shown_count = nux_config
+        .shown_count
+        .get(&preset.model)
+        .copied()
+        .unwrap_or_default();
+    (shown_count < MODEL_AVAILABILITY_NUX_MAX_SHOW_COUNT).then(|| StartupTooltipOverride {
+        model_slug: preset.model.clone(),
+        message: message.clone(),
     })
 }
 

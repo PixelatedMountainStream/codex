@@ -9,6 +9,9 @@ use codex_utils_output_truncation::TruncationPolicy;
 use pretty_assertions::assert_eq;
 use std::sync::Arc;
 
+use crate::environment_selection::TurnEnvironmentState;
+use crate::function_tool::FunctionCallError;
+use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
 use crate::tools::context::ExecCommandToolOutput;
 use crate::tools::context::ToolCallSource;
@@ -16,6 +19,7 @@ use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::hook_names::HookToolName;
 use crate::tools::registry::CoreToolRuntime;
+use crate::tools::registry::ToolExecutor;
 use crate::turn_diff_tracker::TurnDiffTracker;
 use tokio::sync::Mutex;
 
@@ -27,9 +31,11 @@ async fn invocation_for_payload(
     payload: ToolPayload,
 ) -> ToolInvocation {
     let (session, turn) = make_session_and_context().await;
+    let turn = Arc::new(turn);
     ToolInvocation {
         session: session.into(),
-        turn: turn.into(),
+        step_context: StepContext::for_test(Arc::clone(&turn)),
+        turn,
         cancellation_token: tokio_util::sync::CancellationToken::new(),
         tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
         call_id: call_id.to_string(),
@@ -165,6 +171,46 @@ fn test_get_command_rejects_explicit_login_when_disallowed() -> anyhow::Result<(
     Ok(())
 }
 
+#[tokio::test]
+async fn exec_command_rejects_login_when_selected_environment_disallows_it() {
+    let (session, mut turn) = make_session_and_context().await;
+    assert!(turn.config.permissions.allow_login_shell);
+    let TurnEnvironmentState::Ready(environment) = turn
+        .environments
+        .environments
+        .first_mut()
+        .expect("primary environment")
+    else {
+        panic!("primary environment should be ready");
+    };
+    environment.config.allow_login_shell = false;
+
+    let turn = Arc::new(turn);
+    let invocation = ToolInvocation {
+        session: session.into(),
+        step_context: StepContext::for_test(Arc::clone(&turn)),
+        turn,
+        cancellation_token: tokio_util::sync::CancellationToken::new(),
+        tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+        call_id: "login-disallowed".to_string(),
+        tool_name: codex_tools::ToolName::plain("exec_command"),
+        source: ToolCallSource::Direct,
+        payload: ToolPayload::Function {
+            arguments: serde_json::json!({ "cmd": "echo hello", "login": true }).to_string(),
+        },
+    };
+
+    let Err(FunctionCallError::RespondToModel(message)) =
+        ExecCommandHandler::default().handle(invocation).await
+    else {
+        panic!("expected login-shell rejection");
+    };
+    assert_eq!(
+        message,
+        "login shell is disabled by config; omit `login` or set it to false."
+    );
+}
+
 #[test]
 fn test_get_command_rejects_explicit_shell_in_zsh_fork_mode() -> anyhow::Result<()> {
     let json = r#"{"cmd": "echo hello", "shell": "/bin/bash"}"#;
@@ -236,12 +282,14 @@ async fn exec_command_pre_tool_use_payload_uses_raw_command() {
         arguments: serde_json::json!({ "cmd": "printf exec command" }).to_string(),
     };
     let (session, turn) = make_session_and_context().await;
+    let turn = Arc::new(turn);
     let handler = ExecCommandHandler::default();
 
     assert_eq!(
         handler.pre_tool_use_payload(&ToolInvocation {
             session: session.into(),
-            turn: turn.into(),
+            step_context: StepContext::for_test(Arc::clone(&turn)),
+            turn,
             cancellation_token: tokio_util::sync::CancellationToken::new(),
             tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
             call_id: "call-43".to_string(),
@@ -262,12 +310,14 @@ async fn exec_command_pre_tool_use_payload_skips_write_stdin() {
         arguments: serde_json::json!({ "chars": "echo hi" }).to_string(),
     };
     let (session, turn) = make_session_and_context().await;
+    let turn = Arc::new(turn);
     let handler = WriteStdinHandler;
 
     assert_eq!(
         handler.pre_tool_use_payload(&ToolInvocation {
             session: session.into(),
-            turn: turn.into(),
+            step_context: StepContext::for_test(Arc::clone(&turn)),
+            turn,
             cancellation_token: tokio_util::sync::CancellationToken::new(),
             tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
             call_id: "call-44".to_string(),
@@ -294,6 +344,7 @@ async fn exec_command_post_tool_use_payload_uses_output_for_noninteractive_one_s
         process_id: None,
         exit_code: Some(0),
         original_token_count: None,
+        output_omitted_bytes: None,
         hook_command: Some("echo three".to_string()),
     };
     let invocation = invocation_for_payload("exec_command", "call-43", payload).await;
@@ -324,6 +375,7 @@ async fn exec_command_post_tool_use_payload_uses_output_for_interactive_completi
         process_id: None,
         exit_code: Some(0),
         original_token_count: None,
+        output_omitted_bytes: None,
         hook_command: Some("echo three".to_string()),
     };
     let invocation = invocation_for_payload("exec_command", "call-44", payload).await;
@@ -355,6 +407,7 @@ async fn exec_command_post_tool_use_payload_skips_running_sessions() {
         process_id: Some(45),
         exit_code: None,
         original_token_count: None,
+        output_omitted_bytes: None,
         hook_command: Some("echo three".to_string()),
     };
     let invocation = invocation_for_payload("exec_command", "call-45", payload).await;
@@ -381,6 +434,7 @@ async fn write_stdin_post_tool_use_payload_uses_original_exec_call_id_and_comman
         process_id: None,
         exit_code: Some(0),
         original_token_count: None,
+        output_omitted_bytes: None,
         hook_command: Some("sleep 1; echo finished".to_string()),
     };
     let invocation = invocation_for_payload("write_stdin", "write-stdin-call", payload).await;
@@ -412,6 +466,7 @@ async fn write_stdin_post_tool_use_payload_keeps_parallel_session_metadata_separ
         process_id: None,
         exit_code: Some(0),
         original_token_count: None,
+        output_omitted_bytes: None,
         hook_command: Some("sleep 2; echo alpha".to_string()),
     };
     let output_b = ExecCommandToolOutput {
@@ -424,6 +479,7 @@ async fn write_stdin_post_tool_use_payload_keeps_parallel_session_metadata_separ
         process_id: None,
         exit_code: Some(0),
         original_token_count: None,
+        output_omitted_bytes: None,
         hook_command: Some("sleep 1; echo beta".to_string()),
     };
     let invocation_b = invocation_for_payload("write_stdin", "write-call-b", payload.clone()).await;

@@ -3,6 +3,10 @@
 use super::*;
 
 impl ChatWidget {
+    pub(crate) fn keymap_contexts(&self) -> crate::keymap::KeymapContextSet {
+        self.bottom_pane.keymap_contexts()
+    }
+
     pub(crate) fn handle_key_event(&mut self, key_event: KeyEvent) {
         if self.bottom_pane.has_active_view()
             && !matches!(
@@ -17,9 +21,15 @@ impl ChatWidget {
             && !key_hint::ctrl(KeyCode::Char('r')).is_press(key_event)
             && !key_hint::ctrl(KeyCode::Char('u')).is_press(key_event)
         {
+            let should_pause_active_goal = self
+                .bottom_pane
+                .active_view_will_interrupt_turn_on_key_event(key_event);
             self.bottom_pane.handle_key_event(key_event);
+            if should_pause_active_goal {
+                self.pause_active_goal_for_interrupt();
+            }
             if self.bottom_pane.no_modal_or_popup_active() {
-                self.maybe_send_next_queued_input();
+                self.on_modal_or_popup_closed();
             }
             return;
         }
@@ -104,8 +114,8 @@ impl ChatWidget {
             && self.has_queued_follow_up_messages()
             && self.bottom_pane.no_modal_or_popup_active()
         {
-            if let Some(user_message) = self.pop_latest_queued_user_message() {
-                self.restore_user_message_to_composer(user_message);
+            if let Some(composer) = self.pop_latest_queued_composer_state() {
+                self.restore_composer_state(composer);
                 self.refresh_pending_input_preview();
                 self.request_redraw();
             }
@@ -133,7 +143,9 @@ impl ChatWidget {
             && !self.should_handle_vim_insert_escape(key_event)
         {
             self.input_queue.submit_pending_steers_after_interrupt = true;
-            if !self.submit_op(AppCommand::interrupt()) {
+            if self.submit_op(AppCommand::interrupt()) {
+                self.pause_active_goal_for_interrupt();
+            } else {
                 self.input_queue.submit_pending_steers_after_interrupt = false;
             }
             return;
@@ -160,12 +172,21 @@ impl ChatWidget {
                 && !self.bottom_pane.is_task_running()
                 && self.bottom_pane.no_modal_or_popup_active() =>
             {
-                self.cycle_collaboration_mode();
-                self.refresh_plan_mode_nudge();
+                if self.blocks_direct_input {
+                    self.add_error_message(PARENT_OWNED_INPUT_MESSAGE.to_string());
+                } else {
+                    self.cycle_collaboration_mode();
+                    self.refresh_plan_mode_nudge();
+                }
             }
             _ => {
                 let had_modal_or_popup = !self.bottom_pane.no_modal_or_popup_active();
+                let should_pause_active_goal =
+                    self.bottom_pane.should_interrupt_running_task(key_event);
                 let input_result = self.bottom_pane.handle_key_event(key_event);
+                if should_pause_active_goal {
+                    self.pause_active_goal_for_interrupt();
+                }
                 self.handle_composer_input_result(input_result, had_modal_or_popup);
             }
         }
@@ -216,6 +237,24 @@ impl ChatWidget {
         self.request_redraw();
     }
 
+    pub(crate) fn selected_index_for_present_view(&self, view_id: &'static str) -> Option<usize> {
+        self.bottom_pane.selected_index_for_present_view(view_id)
+    }
+
+    pub(crate) fn replace_selection_view_if_present(
+        &mut self,
+        view_id: &'static str,
+        params: SelectionViewParams,
+    ) -> bool {
+        let replaced = self
+            .bottom_pane
+            .replace_selection_view_if_present(view_id, params);
+        if replaced {
+            self.refresh_plan_mode_nudge();
+        }
+        replaced
+    }
+
     pub(crate) fn no_modal_or_popup_active(&self) -> bool {
         self.bottom_pane.no_modal_or_popup_active()
     }
@@ -242,14 +281,6 @@ impl ChatWidget {
         self.copy_last_agent_markdown_with(crate::clipboard_copy::copy_to_clipboard);
     }
 
-    pub(crate) fn truncate_agent_copy_history_to_user_turn_count(
-        &mut self,
-        user_turn_count: usize,
-    ) {
-        self.transcript
-            .truncate_copy_history_to_user_turn_count(user_turn_count);
-    }
-
     /// Inner implementation with an injectable clipboard backend for testing.
     pub(super) fn copy_last_agent_markdown_with(
         &mut self,
@@ -268,11 +299,6 @@ impl ChatWidget {
                     "Copy failed: {error}"
                 ))),
             },
-            _ if self.transcript.copy_history_evicted_by_rollback => {
-                self.add_to_history(history_cell::new_error_event(format!(
-                    "Cannot copy that response after rewinding. Only the most recent {MAX_AGENT_COPY_HISTORY} responses are available to /copy."
-                )));
-            }
             _ => self.add_to_history(history_cell::new_error_event(
                 "No agent response to copy".into(),
             )),
@@ -355,21 +381,17 @@ impl ChatWidget {
     /// pane. If cancellable work is active, Ctrl+C also submits `Op::Interrupt` after the shortcut
     /// is armed.
     ///
-    /// Active realtime conversations take precedence over bottom-pane Ctrl+C handling so the
-    /// first press always stops live voice, even when the composer contains the recording meter.
-    ///
     /// When the double-press quit shortcut is enabled, pressing the same shortcut again before
     /// expiry requests a shutdown-first quit.
     fn on_ctrl_c(&mut self) {
         let key = key_hint::ctrl(KeyCode::Char('c'));
-        if self.realtime_conversation.is_live() {
-            self.bottom_pane.clear_quit_shortcut_hint();
-            self.quit_shortcut_expires_at = None;
-            self.quit_shortcut_key = None;
-            self.stop_realtime_conversation_from_ui();
-            return;
-        }
         let modal_or_popup_active = !self.bottom_pane.no_modal_or_popup_active();
+        let should_pause_active_goal = self
+            .bottom_pane
+            .active_view_will_interrupt_turn_on_key_event(KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+            ));
         if self.bottom_pane.on_ctrl_c() == CancellationEvent::Handled {
             if DOUBLE_PRESS_QUIT_SHORTCUT_ENABLED {
                 if modal_or_popup_active {
@@ -380,6 +402,12 @@ impl ChatWidget {
                     self.arm_quit_shortcut(key);
                 }
             }
+            if should_pause_active_goal {
+                self.pause_active_goal_for_interrupt();
+            }
+            if modal_or_popup_active && self.bottom_pane.no_modal_or_popup_active() {
+                self.on_modal_or_popup_closed();
+            }
             return;
         }
 
@@ -388,8 +416,9 @@ impl ChatWidget {
                 self.quit_shortcut_expires_at = None;
                 self.quit_shortcut_key = None;
                 self.bottom_pane.clear_quit_shortcut_hint();
-                self.pause_active_goal_for_interrupt();
-                self.submit_op(AppCommand::interrupt_and_restore_prompt_if_no_output());
+                if self.submit_op(AppCommand::interrupt()) {
+                    self.pause_active_goal_for_interrupt();
+                }
             } else {
                 self.request_quit_without_confirmation();
             }
@@ -405,9 +434,8 @@ impl ChatWidget {
 
         self.arm_quit_shortcut(key);
 
-        if self.is_cancellable_work_active() {
+        if self.is_cancellable_work_active() && self.submit_op(AppCommand::interrupt()) {
             self.pause_active_goal_for_interrupt();
-            self.submit_op(AppCommand::interrupt_and_restore_prompt_if_no_output());
         }
     }
 

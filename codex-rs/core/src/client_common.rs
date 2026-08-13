@@ -1,15 +1,14 @@
 pub use codex_api::ResponseEvent;
-use codex_config::types::Personality;
 use codex_protocol::error::Result;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::ResponseItem;
-use codex_protocol::protocol::InterAgentCommunication;
 use codex_tools::ToolSpec;
 use futures::Stream;
 use serde_json::Value;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
 use tokio::sync::mpsc;
@@ -23,15 +22,12 @@ pub struct Prompt {
 
     /// Tools available to the model, including additional tools sourced from
     /// external MCP servers.
-    pub(crate) tools: Vec<ToolSpec>,
+    pub(crate) tools: Arc<[ToolSpec]>,
 
     /// Whether parallel tool calls are permitted for this prompt.
     pub(crate) parallel_tool_calls: bool,
 
     pub base_instructions: BaseInstructions,
-
-    /// Optionally specify the personality of the model.
-    pub personality: Option<Personality>,
 
     /// Optional the output schema for the model's response.
     pub output_schema: Option<Value>,
@@ -44,10 +40,9 @@ impl Default for Prompt {
     fn default() -> Self {
         Self {
             input: Vec::new(),
-            tools: Vec::new(),
+            tools: Arc::default(),
             parallel_tool_calls: false,
             base_instructions: BaseInstructions::default(),
-            personality: None,
             output_schema: None,
             output_schema_strict: true,
         }
@@ -55,30 +50,11 @@ impl Default for Prompt {
 }
 
 impl Prompt {
-    pub(crate) fn get_formatted_input(&self) -> Vec<ResponseItem> {
-        self.input
-            .iter()
-            .cloned()
-            .map(|item| {
-                let ResponseItem::Message { role, content, .. } = &item else {
-                    return item;
-                };
-                if role != "assistant" {
-                    return item;
-                }
-                InterAgentCommunication::from_message_content(content)
-                    .filter(|communication| communication.encrypted_content.is_some())
-                    .map(|communication| communication.to_model_input_item())
-                    .unwrap_or(item)
-            })
-            .collect()
-    }
-
     pub(crate) fn get_formatted_input_for_request(
         &self,
         use_responses_lite: bool,
     ) -> Vec<ResponseItem> {
-        let mut input = self.get_formatted_input();
+        let mut input = self.input.clone();
         if use_responses_lite {
             strip_image_details(&mut input);
         }
@@ -108,7 +84,8 @@ fn strip_image_details(items: &mut [ResponseItem]) {
                     }
                 }
             }
-            ResponseItem::Reasoning { .. }
+            ResponseItem::AdditionalTools { .. }
+            | ResponseItem::Reasoning { .. }
             | ResponseItem::AgentMessage { .. }
             | ResponseItem::LocalShellCall { .. }
             | ResponseItem::FunctionCall { .. }
@@ -118,7 +95,7 @@ fn strip_image_details(items: &mut [ResponseItem]) {
             | ResponseItem::WebSearchCall { .. }
             | ResponseItem::ImageGenerationCall { .. }
             | ResponseItem::Compaction { .. }
-            | ResponseItem::CompactionTrigger
+            | ResponseItem::CompactionTrigger { .. }
             | ResponseItem::ContextCompaction { .. }
             | ResponseItem::Other => {}
         }

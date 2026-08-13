@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used)]
 #![cfg(target_os = "macos")]
 
 use anyhow::Result;
@@ -38,6 +38,7 @@ use serde_json::Value;
 use serde_json::json;
 use std::fs;
 use std::path::Path;
+use test_case::test_case;
 
 fn absolute_path(path: &Path) -> AbsolutePathBuf {
     AbsolutePathBuf::try_from(path).expect("absolute path")
@@ -315,7 +316,7 @@ async fn approved_folder_write_request_permissions_unblocks_later_exec_without_s
     let exec_output = responses
         .function_call_output_text("exec-call")
         .map(|output| json!({ "output": output }))
-        .unwrap_or_else(|| panic!("expected exec-call output"));
+        .expect("expected exec-call output");
     let (exit_code, stdout) = parse_result(&exec_output);
     assert!(exit_code.is_none() || exit_code == Some(0));
     assert!(stdout.contains("folder-grant-ok"));
@@ -328,16 +329,17 @@ async fn approved_folder_write_request_permissions_unblocks_later_exec_without_s
     Ok(())
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[test_case(false ; "without_strict_auto_review")]
+#[test_case(true ; "with_strict_auto_review")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(target_os = "macos")]
-async fn approved_folder_write_request_permissions_unblocks_later_apply_patch() -> Result<()> {
+async fn approved_folder_write_request_permissions_unblocks_later_apply_patch(
+    strict_auto_review: bool,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
     skip_if_sandbox!(Ok(()));
 
-    apply_patch_after_request_permissions(/*strict_auto_review*/ false).await?;
-    apply_patch_after_request_permissions(/*strict_auto_review*/ true).await?;
-
-    Ok(())
+    apply_patch_after_request_permissions(strict_auto_review).await
 }
 
 async fn apply_patch_after_request_permissions(strict_auto_review: bool) -> Result<()> {
@@ -498,7 +500,7 @@ async fn apply_patch_after_request_permissions(strict_auto_review: bool) -> Resu
                 })
         })
         .map(|output| json!({ "output": output }))
-        .unwrap_or_else(|| panic!("expected apply-patch-call output"));
+        .expect("expected apply-patch-call output");
     let (exit_code, stdout) = parse_result(&patch_output);
     assert!(exit_code.is_none() || exit_code == Some(0));
     assert!(
@@ -509,6 +511,8 @@ async fn apply_patch_after_request_permissions(strict_auto_review: bool) -> Resu
         fs::read_to_string(&requested_file)?,
         format!("{patch_content}\n")
     );
+
+    test.codex.shutdown_and_wait().await?;
 
     Ok(())
 }

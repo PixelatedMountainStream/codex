@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 
-use codex_app_server_protocol::ConfigLayerSource;
+use crate::ConfigLayerSource;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use thiserror::Error;
@@ -74,10 +74,6 @@ impl ThreadConfigLoadError {
 
     pub fn code(&self) -> ThreadConfigLoadErrorCode {
         self.code
-    }
-
-    pub fn status_code(&self) -> Option<u16> {
-        self.status_code
     }
 }
 
@@ -288,6 +284,7 @@ mod tests {
                     wire_api = "responses"
                     requires_openai_auth = false
                     supports_websockets = true
+                    supports_standalone_web_search = true
 
                     [features]
                     plugins = false
@@ -316,6 +313,7 @@ mod tests {
             websocket_connect_timeout_ms: None,
             requires_openai_auth: false,
             supports_websockets: true,
+            supports_standalone_web_search: true,
         }
     }
 }

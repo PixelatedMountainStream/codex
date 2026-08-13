@@ -1,7 +1,6 @@
 use super::*;
 use crate::tools::handlers::multi_agents_spec::create_interrupt_agent_tool_v2;
-use crate::turn_timing::now_unix_timestamp_ms;
-use codex_protocol::error::CodexErr;
+use codex_protocol::error::CodexErrorDetails;
 use codex_tools::ToolSpec;
 
 pub(crate) struct Handler;
@@ -67,23 +66,29 @@ async fn handle_interrupt_agent(
         .interrupt_agent(agent_id)
         .await
     {
-        Ok(_) | Err(CodexErr::ThreadNotFound(_)) | Err(CodexErr::InternalAgentDied) => Ok(()),
+        Ok(_) => Ok(()),
+        Err(err)
+            if matches!(
+                err.details(),
+                CodexErrorDetails::ThreadNotFound(_) | CodexErrorDetails::InternalAgentDied
+            ) =>
+        {
+            Ok(())
+        }
         Err(err) => Err(collab_agent_error(agent_id, err)),
     };
     result?;
-    session
-        .send_event(
-            &turn,
-            SubAgentActivityEvent {
-                event_id: call_id,
-                occurred_at_ms: now_unix_timestamp_ms(),
-                agent_thread_id: agent_id,
-                agent_path: receiver_agent_path,
-                kind: SubAgentActivityKind::Interrupted,
-            }
-            .into(),
-        )
-        .await;
+    emit_sub_agent_activity(
+        &session,
+        &turn,
+        SubAgentActivityItem {
+            id: call_id,
+            agent_thread_id: agent_id,
+            agent_path: receiver_agent_path,
+            kind: SubAgentActivityKind::Interrupted,
+        },
+    )
+    .await;
 
     Ok(InterruptAgentResult {
         previous_status: status,

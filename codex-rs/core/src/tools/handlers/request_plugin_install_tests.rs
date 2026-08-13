@@ -1,4 +1,5 @@
 use super::*;
+use crate::plugins::plugins_manager_for_config;
 use crate::plugins::test_support::load_plugins_config;
 use crate::plugins::test_support::write_curated_plugin_sha;
 use crate::plugins::test_support::write_openai_curated_marketplace;
@@ -10,7 +11,6 @@ use codex_config::types::ToolSuggestDisabledTool;
 use codex_config::types::ToolSuggestDiscoverable;
 use codex_config::types::ToolSuggestDiscoverableType;
 use codex_core_plugins::PluginInstallRequest;
-use codex_core_plugins::PluginsManager;
 use codex_core_plugins::startup_sync::curated_plugins_repo_path;
 use codex_rmcp_client::ElicitationResponse;
 use codex_tools::DiscoverablePluginInfo;
@@ -21,6 +21,16 @@ use rmcp::model::ElicitationAction;
 use serde_json::json;
 use tempfile::tempdir;
 
+#[test]
+fn request_plugin_install_does_not_support_parallel_tool_calls() {
+    let handler = RequestPluginInstallHandler::new(
+        Vec::new(),
+        ToolSuggestPresentation::RecommendationContext,
+    );
+
+    assert!(!handler.supports_parallel_tool_calls());
+}
+
 #[tokio::test]
 async fn verified_plugin_install_completed_requires_installed_plugin() {
     let codex_home = tempdir().expect("tempdir should succeed");
@@ -30,7 +40,7 @@ async fn verified_plugin_install_completed_requires_installed_plugin() {
     write_plugins_feature_config(codex_home.path());
 
     let config = load_plugins_config(codex_home.path()).await;
-    let plugins_manager = PluginsManager::new(codex_home.path().to_path_buf());
+    let plugins_manager = plugins_manager_for_config(&config);
 
     assert!(!verified_plugin_install_completed(
         "sample@openai-curated",
@@ -39,13 +49,16 @@ async fn verified_plugin_install_completed_requires_installed_plugin() {
     ));
 
     plugins_manager
-        .install_plugin(PluginInstallRequest {
-            plugin_name: "sample".to_string(),
-            marketplace_path: AbsolutePathBuf::try_from(
-                curated_root.join(".agents/plugins/marketplace.json"),
-            )
-            .expect("marketplace path"),
-        })
+        .install_plugin(
+            &config.config_layer_stack,
+            PluginInstallRequest {
+                plugin_name: "sample".to_string(),
+                marketplace_path: AbsolutePathBuf::try_from(
+                    curated_root.join(".agents/plugins/marketplace.json"),
+                )
+                .expect("marketplace path"),
+            },
+        )
         .await
         .expect("plugin should install");
 
@@ -66,6 +79,24 @@ fn remote_plugin_install_suggestions_skip_core_installed_verification() {
         "snowflake@openai-curated"
     ));
     assert!(!is_remote_plugin_install_suggestion("Plugin_123"));
+}
+
+#[test]
+fn recommended_plugin_install_args_accept_legacy_tool_id() {
+    let current: RecommendedPluginInstallArgs = serde_json::from_value(json!({
+        "plugin_id": "google-drive@openai-curated-remote",
+        "suggest_reason": "Use Google Drive for this request"
+    }))
+    .expect("current arguments should deserialize");
+    let legacy: RecommendedPluginInstallArgs = serde_json::from_value(json!({
+        "tool_type": "plugin",
+        "action_type": "install",
+        "tool_id": "google-drive@openai-curated-remote",
+        "suggest_reason": "Use Google Drive for this request"
+    }))
+    .expect("legacy arguments should deserialize");
+
+    assert_eq!(current, legacy);
 }
 
 #[test]
@@ -214,6 +245,8 @@ fn connector_tool(id: &str, name: &str) -> DiscoverableTool {
         description: None,
         logo_url: None,
         logo_url_dark: None,
+        icon_assets: None,
+        icon_dark_assets: None,
         distribution_channel: None,
         branding: None,
         app_metadata: None,

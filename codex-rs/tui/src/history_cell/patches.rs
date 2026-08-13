@@ -1,6 +1,7 @@
 //! Patch summaries and image-tool transcript helpers.
 
 use super::*;
+use codex_utils_path_uri::LegacyAppPathString;
 
 #[derive(Debug)]
 pub(crate) struct PatchHistoryCell {
@@ -42,11 +43,7 @@ pub(crate) fn new_patch_apply_failure(stderr: String) -> PlainHistoryCell {
 
     if !stderr.trim().is_empty() {
         let output = output_lines(
-            Some(&CommandOutput {
-                exit_code: 1,
-                formatted_output: String::new(),
-                aggregated_output: stderr,
-            }),
+            Some(&CommandOutput::new(/*exit_code*/ 1, stderr)),
             OutputLinesParams {
                 line_limit: TOOL_CALL_MAX_LINES,
                 only_err: true,
@@ -60,8 +57,12 @@ pub(crate) fn new_patch_apply_failure(stderr: String) -> PlainHistoryCell {
     PlainHistoryCell { lines }
 }
 
-pub(crate) fn new_view_image_tool_call(path: AbsolutePathBuf, cwd: &Path) -> PlainHistoryCell {
-    let display_path = display_path_for(path.as_path(), cwd);
+pub(crate) fn new_view_image_tool_call(path: LegacyAppPathString, cwd: &Path) -> PlainHistoryCell {
+    let display_path = path
+        .to_inferred_path_uri()
+        .and_then(|path| path.to_abs_path().ok())
+        .map(|path| display_path_for(path.as_path(), cwd))
+        .unwrap_or_else(|| path.into_string());
 
     let lines: Vec<Line<'static>> = vec![
         vec!["• ".dim(), "Viewed Image".bold()].into(),
@@ -73,15 +74,17 @@ pub(crate) fn new_view_image_tool_call(path: AbsolutePathBuf, cwd: &Path) -> Pla
 
 pub(crate) fn new_image_generation_call(
     call_id: String,
+    status: &str,
     revised_prompt: Option<String>,
     saved_path: Option<AbsolutePathBuf>,
 ) -> PlainHistoryCell {
-    let detail = revised_prompt.unwrap_or_else(|| call_id.clone());
-
-    let mut lines: Vec<Line<'static>> = vec![
-        vec!["• ".dim(), "Generated Image:".bold()].into(),
-        vec!["  └ ".dim(), detail.dim()].into(),
-    ];
+    let detail = revised_prompt.unwrap_or(call_id);
+    let heading = if status == "failed" {
+        vec!["✗ ".red().bold(), "Image generation failed".bold()].into()
+    } else {
+        vec!["• ".dim(), "Generated Image:".bold()].into()
+    };
+    let mut lines: Vec<Line<'static>> = vec![heading, vec!["  └ ".dim(), detail.dim()].into()];
     if let Some(saved_path) = saved_path {
         let saved_path = Url::from_file_path(saved_path.as_path())
             .map(|url| url.to_string())

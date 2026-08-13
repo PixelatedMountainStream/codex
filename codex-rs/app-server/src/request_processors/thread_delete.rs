@@ -1,6 +1,5 @@
 //! `thread/delete` request handling.
 
-use super::thread_processor::core_thread_write_error;
 use super::thread_processor::unsupported_thread_store_operation;
 use super::*;
 
@@ -37,23 +36,7 @@ impl ThreadRequestProcessor {
         let thread_id = ThreadId::from_string(&params.thread_id)
             .map_err(|err| invalid_request(format!("invalid thread id: {err}")))?;
 
-        let mut thread_ids = self.state_db_spawn_subtree_thread_ids(thread_id).await?;
-        let mut seen = thread_ids.iter().copied().collect::<HashSet<_>>();
-
-        match self
-            .thread_manager
-            .list_agent_subtree_thread_ids(thread_id)
-            .await
-        {
-            Ok(live_thread_ids) => {
-                for live_thread_id in live_thread_ids {
-                    if seen.insert(live_thread_id) {
-                        thread_ids.push(live_thread_id);
-                    }
-                }
-            }
-            Err(err) => return Err(core_thread_write_error("delete thread", err)),
-        }
+        let thread_ids = self.state_db_spawn_subtree_thread_ids(thread_id).await?;
 
         self.validate_root_thread_delete(thread_id, thread_ids.len() > 1)
             .await?;
@@ -64,25 +47,12 @@ impl ThreadRequestProcessor {
         let mut delete_order: Vec<_> = thread_ids.iter().skip(1).rev().copied().collect();
         delete_order.push(thread_id);
 
-        for thread_id_to_delete in delete_order.iter().copied() {
-            match self
-                .thread_store
-                .delete_thread(StoreDeleteThreadParams {
-                    thread_id: thread_id_to_delete,
-                })
-                .await
-            {
-                Ok(()) => {}
-                Err(ThreadStoreError::ThreadNotFound { .. }) => {
-                    warn!(
-                        "thread {thread_id_to_delete} was already missing while deleting {thread_id}"
-                    );
-                }
-                Err(err) => {
-                    return Err(thread_store_delete_error(err));
-                }
-            }
-        }
+        self.thread_store
+            .delete_threads(StoreDeleteThreadsParams {
+                thread_ids: delete_order.clone(),
+            })
+            .await
+            .map_err(thread_store_delete_error)?;
 
         if let Some(state_db) = self.state_db.as_ref() {
             state_db
@@ -179,7 +149,9 @@ fn thread_store_delete_error(err: ThreadStoreError) -> JSONRPCErrorError {
         ThreadStoreError::ThreadNotFound { thread_id } => {
             invalid_request(format!("thread not found: {thread_id}"))
         }
-        ThreadStoreError::InvalidRequest { message } => invalid_request(message),
+        ThreadStoreError::InvalidRequest { message } | ThreadStoreError::Conflict { message } => {
+            invalid_request(message)
+        }
         ThreadStoreError::Unsupported { operation } => {
             unsupported_thread_store_operation(operation)
         }

@@ -5,14 +5,36 @@
 
 use super::*;
 
+const LEGACY_SAFETY_ACCESS_BLOCK_PREFIX: &str =
+    "Invalid prompt: we've limited access to this content for safety reasons.";
+const BIO_POLICY_SAFETY_ACCESS_BLOCK_PREFIX: &str =
+    "This content was flagged for possible biological risk.";
+
+fn is_safety_access_block_message(message: &str) -> bool {
+    message.starts_with(LEGACY_SAFETY_ACCESS_BLOCK_PREFIX)
+        || message.starts_with(BIO_POLICY_SAFETY_ACCESS_BLOCK_PREFIX)
+}
+
 impl ChatWidget {
+    fn clear_guardian_review_status(&mut self) {
+        self.status_state.pending_guardian_review_status.clear();
+        if self.status_state.current_status.is_guardian_review() {
+            let header = self
+                .mcp_startup_status_header()
+                .unwrap_or_else(|| String::from("Working"));
+            self.set_status_header(header);
+        }
+    }
+
     /// Synchronize the bottom-pane "task running" indicator with the current lifecycles.
     ///
     /// The bottom pane only has one running flag, but this module treats it as a derived state of
     /// both the agent turn lifecycle and MCP startup lifecycle.
     pub(super) fn update_task_running_state(&mut self) {
         self.bottom_pane.set_task_running(
-            self.turn_lifecycle.agent_turn_running || self.mcp_startup_status.is_some(),
+            self.turn_lifecycle.agent_turn_running
+                || self.review.is_review_mode
+                || self.mcp_startup_status.is_some(),
         );
         self.refresh_plan_mode_nudge();
         self.refresh_status_surfaces();
@@ -48,10 +70,13 @@ impl ChatWidget {
 
     pub(super) fn on_task_started(&mut self) {
         self.input_queue.user_turn_pending_start = false;
+        self.reset_safety_buffering_for_turn_start();
         self.turn_lifecycle.start(Instant::now());
         self.transcript.reset_turn_flags();
         self.adaptive_chunking.reset();
-        self.plan_stream_controller = None;
+        if self.plan_stream_controller.take().is_some() {
+            self.request_pending_usage_output_insertion_after_stream_shutdown();
+        }
         self.turn_runtime_metrics = RuntimeMetricsSummary::default();
         self.session_telemetry.reset_runtime_metrics();
         self.bottom_pane.clear_quit_shortcut_hint();
@@ -67,8 +92,9 @@ impl ChatWidget {
         if self.mcp_startup_status.is_none() || !self.status_header_is_mcp_startup_owned() {
             self.set_status_header(String::from("Working"));
         }
-        self.full_reasoning_buffer.clear();
+        self.reasoning_summary_parts.clear();
         self.reasoning_buffer.clear();
+        self.reasoning_header = None;
         self.set_ambient_pet_notification(
             crate::pets::PetNotificationKind::Running,
             /*body*/ None,
@@ -83,20 +109,9 @@ impl ChatWidget {
         from_replay: bool,
     ) {
         self.input_queue.submit_pending_steers_after_interrupt = false;
-        // Use `last_agent_message` from the turn-complete notification as the copy
-        // source only when no earlier item-level event (AgentMessageItem, plan
-        // commit, review output) already recorded markdown for this turn. This
-        // prevents the final summary from overwriting a more specific source.
         let sanitized_last_agent_message = last_agent_message.as_deref().map(|message| {
             parse_assistant_markdown(message, self.config.cwd.as_path()).visible_markdown
         });
-        if let Some(message) = sanitized_last_agent_message
-            .as_ref()
-            .filter(|message| !message.is_empty())
-            && !self.transcript.saw_copy_source_this_turn
-        {
-            self.record_agent_markdown(message);
-        }
         // For desktop notifications: prefer the notification payload, fall back to
         // the item-level copy source if present, otherwise send an empty string.
         let notification_response = sanitized_last_agent_message
@@ -122,9 +137,11 @@ impl ChatWidget {
                 self.add_boxed_history(cell);
             }
             if let Some(source) = source {
+                self.note_stream_consolidation_queued();
                 self.app_event_tx
                     .send(AppEvent::ConsolidateProposedPlan(source));
             }
+            self.request_pending_usage_output_insertion_after_stream_shutdown();
         }
         self.flush_unified_exec_wait_streak();
         if !from_replay {
@@ -161,7 +178,9 @@ impl ChatWidget {
         self.status_state.pending_status_indicator_restore = false;
         self.input_queue.user_turn_pending_start = false;
         self.clear_active_hook_cell();
+        self.clear_guardian_review_status();
         self.turn_lifecycle.finish();
+        self.clear_safety_buffering();
         self.update_task_running_state();
         self.running_commands.clear();
         self.suppressed_exec_calls.clear();
@@ -293,6 +312,7 @@ impl ChatWidget {
     /// This does not clear MCP startup tracking, because MCP startup can overlap with turn cleanup
     /// and should continue to drive the bottom-pane running indicator while it is in progress.
     pub(super) fn finalize_turn(&mut self) {
+        self.clear_safety_buffering();
         // Drop preview-only stream tail content on any termination path before
         // failed-cell finalization, so transient tail cells are never persisted.
         self.clear_active_stream_tail();
@@ -304,6 +324,7 @@ impl ChatWidget {
         self.clear_active_hook_cell();
         // Reset running state and clear streaming buffers.
         self.input_queue.user_turn_pending_start = false;
+        self.clear_guardian_review_status();
         self.turn_lifecycle.finish();
         self.update_task_running_state();
         self.running_commands.clear();
@@ -313,8 +334,9 @@ impl ChatWidget {
         self.adaptive_chunking.reset();
         self.stream_controller = None;
         self.plan_stream_controller = None;
+        self.request_pending_usage_output_insertion_after_stream_shutdown();
         self.status_state.pending_status_indicator_restore = false;
-        self.clear_cancel_edit();
+        self.safety_buffering_prompt = None;
         self.request_status_line_branch_refresh();
         self.request_status_line_git_summary_refresh();
         self.maybe_show_pending_rate_limit_prompt();
@@ -335,7 +357,7 @@ impl ChatWidget {
         self.maybe_send_next_queued_input();
     }
 
-    pub(super) fn on_error(&mut self, message: String) {
+    fn on_error(&mut self, message: String) {
         self.input_queue.submit_pending_steers_after_interrupt = false;
         self.flush_answer_stream_with_separator();
         self.finalize_turn();
@@ -350,6 +372,14 @@ impl ChatWidget {
         self.maybe_send_next_queued_input();
     }
 
+    pub(crate) fn handle_turn_start_rejection(&mut self, message: String) -> bool {
+        if !self.input_queue.user_turn_pending_start {
+            return false;
+        }
+        self.on_error(message);
+        true
+    }
+
     pub(super) fn on_cyber_policy_error(&mut self) {
         self.input_queue.submit_pending_steers_after_interrupt = false;
         self.finalize_turn();
@@ -361,8 +391,9 @@ impl ChatWidget {
     }
 
     pub(super) fn on_rate_limit_error(&mut self, error_kind: RateLimitErrorKind, message: String) {
+        let usage_limit_error = matches!(error_kind, RateLimitErrorKind::UsageLimit);
         let rate_limit_reached_type = self.codex_rate_limit_reached_type.map(|kind| {
-            if matches!(error_kind, RateLimitErrorKind::UsageLimit) {
+            if usage_limit_error {
                 match kind {
                     RateLimitReachedType::WorkspaceOwnerCreditsDepleted => {
                         RateLimitReachedType::WorkspaceOwnerUsageLimitReached
@@ -377,7 +408,6 @@ impl ChatWidget {
             }
         });
         self.codex_rate_limit_reached_type = rate_limit_reached_type;
-
         match rate_limit_reached_type {
             Some(RateLimitReachedType::WorkspaceOwnerCreditsDepleted) => {
                 self.on_error(
@@ -419,6 +449,19 @@ impl ChatWidget {
             .is_some_and(is_app_server_cyber_policy_error)
         {
             self.on_cyber_policy_error();
+        } else if is_safety_access_block_message(&message)
+            || serde_json::from_str::<serde_json::Value>(&message).is_ok_and(|response| {
+                response["error"]["code"].as_str() == Some("bio_policy")
+                    || response["error"]["message"]
+                        .as_str()
+                        .is_some_and(is_safety_access_block_message)
+            })
+        {
+            self.input_queue.submit_pending_steers_after_interrupt = false;
+            self.finalize_turn();
+            self.add_to_history(history_cell::new_safety_access_block_event());
+            self.request_redraw();
+            self.maybe_send_next_queued_input();
         } else if let Some(info) = codex_error_info
             .as_ref()
             .and_then(app_server_rate_limit_error_kind)

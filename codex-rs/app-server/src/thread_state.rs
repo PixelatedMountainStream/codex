@@ -3,6 +3,7 @@ use crate::outgoing_message::ConnectionRequestId;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadGoal;
 use codex_app_server_protocol::ThreadHistoryBuilder;
+use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadSettings;
 use codex_app_server_protocol::Turn;
 use codex_app_server_protocol::TurnError;
@@ -10,10 +11,15 @@ use codex_core::CodexThread;
 use codex_core::ThreadConfigSnapshot;
 use codex_file_watcher::WatchRegistration;
 use codex_protocol::ThreadId;
+#[cfg(test)]
+use codex_protocol::config_types::MultiAgentMode;
+use codex_protocol::items::AgentMessageContent as CoreAgentMessageContent;
+use codex_protocol::items::TurnItem as CoreTurnItem;
+use codex_protocol::models::MessagePhase;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::RolloutItem;
+use codex_rollout::RolloutItem;
 use codex_rollout::state_db::StateDbHandle;
-use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::LegacyAppPathString;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -31,13 +37,18 @@ pub(crate) struct PendingThreadResumeRequest {
     pub(crate) request_id: ConnectionRequestId,
     pub(crate) history_items: Vec<RolloutItem>,
     pub(crate) config_snapshot: ThreadConfigSnapshot,
-    pub(crate) instruction_sources: Vec<AbsolutePathBuf>,
+    pub(crate) instruction_sources: Vec<LegacyAppPathString>,
     pub(crate) thread_summary: codex_app_server_protocol::Thread,
     pub(crate) emit_thread_goal_update: bool,
     pub(crate) thread_goal_state_db: Option<StateDbHandle>,
     pub(crate) include_turns: bool,
     pub(crate) initial_turns_page:
         Option<codex_app_server_protocol::ThreadResumeInitialTurnsPageParams>,
+    pub(crate) paginated_turns: Option<Vec<Turn>>,
+    pub(crate) paginated_initial_turns_page: Option<codex_app_server_protocol::TurnsPage>,
+    pub(crate) paginated_initial_turns_page_with_active_slot:
+        Option<codex_app_server_protocol::TurnsPage>,
+    pub(crate) resume_cursor_store: Option<Arc<dyn codex_thread_store::ThreadStore>>,
     pub(crate) redact_resume_payloads: bool,
 }
 
@@ -49,6 +60,10 @@ pub(crate) enum ThreadListenerCommand {
     EmitThreadGoalUpdated {
         turn_id: Option<String>,
         goal: ThreadGoal,
+    },
+    // EmitWarning is used to order extension warnings with other thread notifications.
+    EmitWarning {
+        message: String,
     },
     // EmitThreadGoalCleared is used to order app-server goal clears with running-thread resume responses.
     EmitThreadGoalCleared,
@@ -70,6 +85,7 @@ pub(crate) struct TurnSummary {
     pub(crate) started_at: Option<i64>,
     pub(crate) command_execution_started: HashSet<String>,
     pub(crate) last_error: Option<TurnError>,
+    pub(crate) last_agent_message: Option<ThreadItem>,
 }
 
 #[derive(Default)]
@@ -143,12 +159,22 @@ impl ThreadState {
         if let EventMsg::TurnStarted(payload) = event {
             self.turn_summary.started_at = payload.started_at;
         }
-        self.current_turn_history.handle_event(event);
-        if matches!(event, EventMsg::TurnAborted(_) | EventMsg::TurnComplete(_))
-            && !self.current_turn_history.has_active_turn()
+        if let EventMsg::ItemCompleted(payload) = event
+            && let CoreTurnItem::AgentMessage(item) = &payload.item
+            && matches!(item.phase, Some(MessagePhase::FinalAnswer) | None)
+            && item.content.iter().any(|content| {
+                matches!(content, CoreAgentMessageContent::Text { text } if !text.trim().is_empty())
+            })
         {
+            self.turn_summary.last_agent_message =
+                Some(ThreadItem::from(CoreTurnItem::AgentMessage(item.clone())));
+        }
+        self.current_turn_history.handle_event(event);
+        if matches!(event, EventMsg::TurnAborted(_) | EventMsg::TurnComplete(_)) {
             self.last_terminal_turn_id = Some(event_turn_id.to_string());
-            self.current_turn_history.reset();
+            if !self.current_turn_history.has_active_turn() {
+                self.current_turn_history.reset();
+            }
         }
     }
 
@@ -200,6 +226,7 @@ mod tests {
     use codex_protocol::config_types::CollaborationMode;
     use codex_protocol::config_types::ModeKind;
     use codex_protocol::config_types::Settings;
+    use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
 
     #[test]
@@ -240,6 +267,7 @@ mod tests {
                     developer_instructions: None,
                 },
             },
+            multi_agent_mode: MultiAgentMode::ExplicitRequestOnly,
             personality: None,
         }
     }
@@ -327,6 +355,23 @@ impl ThreadStateManager {
                     .then_some(*connection_id)
             })
             .min_by_key(|connection_id| connection_id.0)
+    }
+
+    pub(crate) async fn wait_for_thread_subscriber(&self, thread_id: ThreadId) {
+        let mut has_connections = {
+            let mut state = self.state.lock().await;
+            state
+                .threads
+                .entry(thread_id)
+                .or_default()
+                .has_connections_watcher
+                .subscribe()
+        };
+        while !*has_connections.borrow_and_update() {
+            if has_connections.changed().await.is_err() {
+                break;
+            }
+        }
     }
 
     pub(crate) async fn subscribed_connection_ids(&self, thread_id: ThreadId) -> Vec<ConnectionId> {

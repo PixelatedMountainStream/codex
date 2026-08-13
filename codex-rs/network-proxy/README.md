@@ -5,6 +5,10 @@
 - an HTTP proxy (default `127.0.0.1:3128`)
 - a SOCKS5 proxy (default `127.0.0.1:8081`, enabled by default)
 
+On Windows, managed HTTP listeners prefer ports `3128-3159`, and SOCKS5 listeners prefer ports
+`8081-8112`. An explicitly configured port is attempted first. If every preferred port is occupied,
+the proxy preserves its existing ephemeral loopback fallback.
+
 It enforces an allow/deny policy and a "limited" mode intended for read-only network access.
 
 ## Quickstart
@@ -34,13 +38,15 @@ allow_upstream_proxy = true
 dangerously_allow_non_loopback_proxy = false
 mode = "full" # default when unset; use "limited" for read-only mode
 # HTTPS MITM is enabled automatically when `mode = "limited"` or when MITM hooks are configured.
-# CA cert/key are managed internally under $CODEX_HOME/proxy/ (ca.pem + ca.key).
-# When MITM is active, spawned commands receive CA bundle env vars pointing at
-# immutable bundles under $CODEX_HOME/proxy/ so common HTTPS clients trust the managed CA.
+# The CA private key remains in proxy memory. When MITM is active, spawned commands receive CA
+# bundle env vars pointing at immutable public files under $CODEX_HOME/proxy/ so common HTTPS
+# clients trust the managed CA.
 
 # If false, local/private networking is rejected. Explicit allowlisting of local IP literals
 # (or `localhost`) is required to permit them.
 # Hostnames that resolve to local/private IPs are still blocked even if allowlisted.
+# Clients that always bypass proxies for loopback, such as Go's `net/http`, remain blocked by
+# the operating-system sandbox when local binding is disabled.
 allow_local_binding = false
 
 # DANGEROUS (macOS-only): bypasses unix socket allowlisting and permits any

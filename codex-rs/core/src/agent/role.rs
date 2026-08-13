@@ -2,9 +2,9 @@
 //!
 //! Roles are selected at spawn time and are loaded with the same config machinery as
 //! `config.toml`. This module resolves built-in and user-defined role files, inserts the role as a
-//! high-precedence layer, and preserves the caller's current provider and service tier unless the
-//! role layer sets them. It does not decide when to spawn a sub-agent or which role to use; the
-//! multi-agent tool handler owns that orchestration.
+//! high-precedence layer, and preserves the caller's current model, reasoning effort, provider,
+//! and service tier unless the role layer sets them. It does not decide when to spawn a sub-agent
+//! or which role to use; the multi-agent tool handler owns that orchestration.
 
 use crate::config::AgentRoleConfig;
 use crate::config::Config;
@@ -12,13 +12,14 @@ use crate::config::ConfigOverrides;
 use crate::config::agent_roles::parse_agent_role_file_contents;
 use crate::config::deserialize_config_toml_with_base;
 use anyhow::anyhow;
-use codex_app_server_protocol::ConfigLayerSource;
 use codex_config::ConfigLayerEntry;
+use codex_config::ConfigLayerSource;
 use codex_config::ConfigLayerStack;
-use codex_config::ConfigLayerStackOrdering;
 use codex_config::config_toml::ConfigToml;
 use codex_config::loader::resolve_relative_paths_in_config_toml;
 use codex_exec_server::LOCAL_FS;
+use codex_features::Feature;
+use codex_protocol::models::BaseInstructionsProvenance;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -39,13 +40,48 @@ pub(crate) async fn apply_role_to_config(
     config: &mut Config,
     role_name: Option<&str>,
 ) -> Result<(), String> {
+    apply_role_to_config_with_developer_instructions(
+        config,
+        role_name,
+        RoleDeveloperInstructions::UseConfigLayers,
+    )
+    .await
+}
+
+/// Applies a v2 role without losing developer instructions selected by its caller.
+///
+/// A role's own top-level developer instructions still take precedence. When its role file omits
+/// that setting, rebuilding the config must not restore inherited instructions from older layers.
+pub(crate) async fn apply_role_to_config_for_multi_agent_v2(
+    config: &mut Config,
+    role_name: Option<&str>,
+) -> Result<(), String> {
+    apply_role_to_config_with_developer_instructions(
+        config,
+        role_name,
+        RoleDeveloperInstructions::PreserveCallerInstructions,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum RoleDeveloperInstructions {
+    UseConfigLayers,
+    PreserveCallerInstructions,
+}
+
+async fn apply_role_to_config_with_developer_instructions(
+    config: &mut Config,
+    role_name: Option<&str>,
+    developer_instructions: RoleDeveloperInstructions,
+) -> Result<(), String> {
     let role_name = role_name.unwrap_or(DEFAULT_ROLE_NAME);
 
     let role = resolve_role_config(config, role_name)
         .cloned()
         .ok_or_else(|| format!("unknown agent_type '{role_name}'"))?;
 
-    apply_role_to_config_inner(config, role_name, &role)
+    apply_role_to_config_inner(config, role_name, &role, developer_instructions)
         .await
         .map_err(|err| {
             tracing::warn!("failed to apply role to config: {err}");
@@ -57,6 +93,7 @@ async fn apply_role_to_config_inner(
     config: &mut Config,
     role_name: &str,
     role: &AgentRoleConfig,
+    developer_instructions: RoleDeveloperInstructions,
 ) -> anyhow::Result<()> {
     let is_built_in = !config.agent_roles.contains_key(role_name);
     let Some(config_file) = role.config_file.as_ref() else {
@@ -75,6 +112,7 @@ async fn apply_role_to_config_inner(
     *config = reload::build_next_config(
         config,
         role_layer_toml,
+        developer_instructions,
         preserve_current_provider,
         preserve_current_service_tier,
     )
@@ -132,24 +170,64 @@ mod reload {
     pub(super) async fn build_next_config(
         config: &Config,
         role_layer_toml: TomlValue,
+        developer_instructions: RoleDeveloperInstructions,
         preserve_current_provider: bool,
         preserve_current_service_tier: bool,
     ) -> anyhow::Result<Config> {
+        let preserve_current_model = role_layer_toml.get("model").is_none();
+        let preserve_current_reasoning_effort =
+            role_layer_toml.get("model_reasoning_effort").is_none();
+        let preserve_current_base_instructions = role_layer_toml.get("instructions").is_none()
+            && role_layer_toml.get("model_instructions_file").is_none();
+        let mut overrides = reload_overrides(
+            config,
+            preserve_current_model,
+            preserve_current_provider,
+            preserve_current_service_tier,
+        );
+        if let (RoleDeveloperInstructions::PreserveCallerInstructions, Some(_), None) = (
+            developer_instructions,
+            &config.multi_agent_v2.subagent_developer_instructions,
+            role_layer_toml.get("developer_instructions"),
+        ) {
+            overrides
+                .developer_instructions
+                .clone_from(&config.developer_instructions);
+        }
         let config_layer_stack = build_config_layer_stack(config, &role_layer_toml)?;
         let merged_config = deserialize_effective_config(config, &config_layer_stack)?;
 
-        let next_config = Config::load_config_with_layer_stack(
+        let mut next_config = Config::load_config_with_layer_stack(
             LOCAL_FS.as_ref(),
             merged_config,
-            reload_overrides(
-                config,
-                preserve_current_provider,
-                preserve_current_service_tier,
-            ),
+            overrides,
             config.codex_home.clone(),
             config_layer_stack,
         )
         .await?;
+        if preserve_current_reasoning_effort {
+            next_config
+                .model_reasoning_effort
+                .clone_from(&config.model_reasoning_effort);
+        }
+        if preserve_current_base_instructions {
+            let personality_changed = config.personality != next_config.personality
+                || config.features.enabled(Feature::Personality)
+                    != next_config.features.enabled(Feature::Personality);
+            if personality_changed
+                && matches!(
+                    config.base_instructions_provenance,
+                    Some(BaseInstructionsProvenance::Model { .. })
+                )
+            {
+                next_config.base_instructions = None;
+                next_config.base_instructions_provenance = None;
+            } else {
+                next_config.base_instructions = config.base_instructions.clone();
+                next_config.base_instructions_provenance =
+                    config.base_instructions_provenance.clone();
+            }
+        }
         Ok(next_config)
     }
 
@@ -179,11 +257,7 @@ mod reload {
     fn existing_layers(config: &Config) -> Vec<ConfigLayerEntry> {
         config
             .config_layer_stack
-            .get_layers(
-                ConfigLayerStackOrdering::LowestPrecedenceFirst,
-                /*include_disabled*/ true,
-            )
-            .into_iter()
+            .all_layers_low_to_high()
             .cloned()
             .collect()
     }
@@ -200,11 +274,15 @@ mod reload {
 
     fn reload_overrides(
         config: &Config,
+        preserve_current_model: bool,
         preserve_current_provider: bool,
         preserve_current_service_tier: bool,
     ) -> ConfigOverrides {
         ConfigOverrides {
             cwd: Some(config.cwd.to_path_buf()),
+            model: preserve_current_model
+                .then(|| config.model.clone())
+                .flatten(),
             model_provider: preserve_current_provider.then(|| config.model_provider_id.clone()),
             service_tier: preserve_current_service_tier.then(|| config.service_tier.clone()),
             codex_linux_sandbox_exe: config.codex_linux_sandbox_exe.clone(),
@@ -241,10 +319,7 @@ pub(crate) mod spawn_tool_spec {
             }
         }
 
-        format!(
-            "Optional type name for the new agent. If omitted, `{DEFAULT_ROLE_NAME}` is used.\nAvailable roles:\n{}",
-            formatted_roles.join("\n"),
-        )
+        format!("Available roles:\n{}", formatted_roles.join("\n"))
     }
 
     fn format_role(name: &str, declaration: &AgentRoleConfig) -> String {

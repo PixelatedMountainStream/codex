@@ -12,8 +12,8 @@ use crate::app_event::FeedbackCategory;
 use crate::app_event::HistoryLookupResponse;
 use crate::app_event::PermissionProfileSelection;
 use crate::app_event::PluginLocation;
+use crate::app_event::PluginRemoteSectionError;
 use crate::app_event::RateLimitRefreshOrigin;
-use crate::app_event::RealtimeAudioDeviceKind;
 #[cfg(target_os = "windows")]
 use crate::app_event::WindowsSandboxEnableMode;
 use crate::app_event_sender::AppEventSender;
@@ -23,9 +23,13 @@ use crate::app_server_session::AppServerStartedThread;
 use crate::app_server_session::TurnPermissionsOverride;
 use crate::app_server_session::app_server_rate_limit_snapshots;
 use crate::bottom_pane::AppLinkViewParams;
+use crate::bottom_pane::ApplyPatchApprovalRequest;
 use crate::bottom_pane::ApprovalRequest;
+use crate::bottom_pane::ExecApprovalRequest;
 use crate::bottom_pane::FeedbackAudience;
+use crate::bottom_pane::McpElicitationApprovalRequest;
 use crate::bottom_pane::McpServerElicitationFormRequest;
+use crate::bottom_pane::PermissionsApprovalRequest;
 use crate::bottom_pane::SelectionItem;
 use crate::bottom_pane::SelectionViewParams;
 use crate::bottom_pane::popup_consts::standard_popup_hint_line;
@@ -45,12 +49,14 @@ use crate::history_cell::HistoryCell;
 use crate::history_cell::UpdateAvailableHistoryCell;
 use crate::hooks_rpc::HookTrustUpdate;
 use crate::key_hint::KeyBindingListExt;
+use crate::keymap::KeyChordMatcher;
 use crate::keymap::RuntimeKeymap;
 use crate::legacy_core::config::Config;
 use crate::legacy_core::config::ConfigBuilder;
 use crate::legacy_core::config::ConfigOverrides;
 use crate::legacy_core::config::PermissionProfileSnapshot;
 use crate::legacy_core::config::edit::ConfigEditsBuilder;
+use crate::managed_new_thread_defaults::apply_managed_new_thread_defaults;
 use crate::model_catalog::ModelCatalog;
 use crate::model_migration::ModelMigrationOutcome;
 use crate::model_migration::migration_copy_for_models;
@@ -88,7 +94,6 @@ use codex_app_server_protocol::AskForApproval;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::CodexErrorInfo as AppServerCodexErrorInfo;
 use codex_app_server_protocol::ConfigBatchWriteParams;
-use codex_app_server_protocol::ConfigLayerSource;
 use codex_app_server_protocol::ConfigReadResponse;
 use codex_app_server_protocol::ConfigValueWriteParams;
 use codex_app_server_protocol::ConfigWriteResponse;
@@ -105,13 +110,14 @@ use codex_app_server_protocol::McpServerStatusDetail;
 use codex_app_server_protocol::MergeStrategy;
 use codex_app_server_protocol::PluginInstallParams;
 use codex_app_server_protocol::PluginInstallResponse;
+use codex_app_server_protocol::PluginListMarketplaceKind;
 use codex_app_server_protocol::PluginListParams;
 use codex_app_server_protocol::PluginListResponse;
+use codex_app_server_protocol::PluginMarketplaceEntry;
 use codex_app_server_protocol::PluginReadParams;
 use codex_app_server_protocol::PluginReadResponse;
 use codex_app_server_protocol::PluginUninstallParams;
 use codex_app_server_protocol::PluginUninstallResponse;
-use codex_app_server_protocol::RateLimitSnapshot;
 use codex_app_server_protocol::SandboxMode as AppServerSandboxMode;
 use codex_app_server_protocol::SendAddCreditsNudgeEmailParams;
 use codex_app_server_protocol::ServerNotification;
@@ -122,14 +128,12 @@ use codex_app_server_protocol::SkillsListResponse;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadLoadedListParams;
 use codex_app_server_protocol::ThreadMemoryMode;
-use codex_app_server_protocol::ThreadRollbackResponse;
 use codex_app_server_protocol::ThreadStartSource;
 use codex_app_server_protocol::Turn;
 use codex_app_server_protocol::TurnError as AppServerTurnError;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::WriteStatus;
 use codex_config::CloudConfigBundleLoader;
-use codex_config::ConfigLayerStackOrdering;
 use codex_config::LoaderOverrides;
 use codex_config::types::ApprovalsReviewer;
 use codex_config::types::MemoriesToml;
@@ -144,6 +148,7 @@ use codex_model_provider_info::ModelProviderInfo;
 use codex_models_manager::model_presets::HIDE_GPT_5_1_CODEX_MAX_MIGRATION_PROMPT_CONFIG;
 use codex_models_manager::model_presets::HIDE_GPT5_1_MIGRATION_PROMPT_CONFIG;
 use codex_otel::SessionTelemetry;
+use codex_otel::TelemetryAuthMode;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::Personality;
 #[cfg(target_os = "windows")]
@@ -169,12 +174,14 @@ use crossterm::event::KeyEventKind;
 use crossterm::event::KeyModifiers;
 use ratatui::backend::Backend;
 use ratatui::layout::Rect;
+use ratatui::layout::Size;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Wrap;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::io::Write;
 use std::path::Path;
@@ -196,6 +203,7 @@ use toml::Value as TomlValue;
 use uuid::Uuid;
 mod agent_message_consolidation;
 mod agent_navigation;
+mod agent_picker;
 mod agent_status_feed;
 mod app_server_event_targets;
 mod app_server_events;
@@ -203,6 +211,7 @@ pub(crate) mod app_server_requests;
 mod background_requests;
 mod config_persistence;
 mod event_dispatch;
+mod history_pagination;
 mod history_ui;
 mod input;
 mod loaded_threads;
@@ -212,6 +221,7 @@ mod platform_actions;
 mod plugin_mentions;
 mod replay_filter;
 mod resize_reflow;
+mod safety_buffering;
 mod session_lifecycle;
 mod side;
 mod startup_prompts;
@@ -220,6 +230,7 @@ mod thread_goal_actions;
 mod thread_routing;
 mod thread_session_state;
 mod thread_settings;
+mod transcript_export;
 
 use self::agent_navigation::AgentNavigationDirection;
 use self::agent_navigation::AgentNavigationState;
@@ -496,6 +507,7 @@ struct SessionSummary {
 struct InitialHistoryReplayBuffer {
     retained_lines: VecDeque<crate::terminal_hyperlinks::HyperlinkLine>,
     render_from_transcript_tail: bool,
+    was_truncated: bool,
 }
 
 pub(crate) struct App {
@@ -506,6 +518,7 @@ pub(crate) struct App {
     workspace_command_runner: Option<WorkspaceCommandRunner>,
     /// Config is stored here so we can recreate ChatWidgets as needed.
     pub(crate) config: Config,
+    launch_cwd: PathBuf,
     pub(crate) state_db: Option<StateDbHandle>,
     cli_kv_overrides: Vec<(String, TomlValue)>,
     harness_overrides: ConfigOverrides,
@@ -524,9 +537,11 @@ pub(crate) struct App {
     has_emitted_history_lines: bool,
     transcript_reflow: TranscriptReflowState,
     initial_history_replay_buffer: Option<InitialHistoryReplayBuffer>,
+    pub(crate) scrollback_has_older_history: bool,
 
     pub(crate) enhanced_keys_supported: bool,
     pub(crate) keymap: RuntimeKeymap,
+    pub(crate) key_chord_matcher: KeyChordMatcher,
 
     /// Controls the animation thread that sends CommitTick events.
     pub(crate) commit_anim_running: Arc<AtomicBool>,
@@ -567,6 +582,7 @@ pub(crate) struct App {
     thread_event_listener_tasks: HashMap<ThreadId, JoinHandle<()>>,
     agent_navigation: AgentNavigationState,
     side_threads: HashMap<ThreadId, SideThreadState>,
+    abandoned_side_threads: HashSet<ThreadId>,
     active_thread_id: Option<ThreadId>,
     active_thread_rx: Option<mpsc::Receiver<ThreadBufferedEvent>>,
     primary_thread_id: Option<ThreadId>,
@@ -575,6 +591,8 @@ pub(crate) struct App {
     pending_primary_events: VecDeque<ThreadBufferedEvent>,
     pending_app_server_requests: PendingAppServerRequests,
     pending_startup_thread_start: bool,
+    /// Invalidates in-flight full rate-limit reads when a newer rolling hard stop arrives.
+    rate_limit_hard_stop_generation: u64,
     // Serialize plugin enablement writes per plugin so stale completions cannot
     // overwrite a newer toggle, even if the plugin is toggled from different
     // cwd contexts.
@@ -735,6 +753,7 @@ impl App {
             initial_user_message,
             enhanced_keys_supported: self.enhanced_keys_supported,
             has_chatgpt_account: self.chat_widget.has_chatgpt_account(),
+            has_codex_backend_auth: self.chat_widget.has_codex_backend_auth(),
             model_catalog: self.model_catalog.clone(),
             feedback: self.feedback.clone(),
             is_first_run: false,
@@ -757,6 +776,7 @@ impl App {
         tui: &mut tui::Tui,
         mut app_server: AppServerSession,
         mut config: Config,
+        launch_cwd: PathBuf,
         cli_kv_overrides: Vec<(String, TomlValue)>,
         harness_overrides: ConfigOverrides,
         loader_overrides: LoaderOverrides,
@@ -792,7 +812,18 @@ impl App {
             None => app_server.bootstrap(&config).await?,
         };
         let bootstrap_ms = bootstrap.duration.as_millis();
-        let mut model = bootstrap.default_model;
+        if matches!(
+            &session_selection,
+            SessionSelection::StartFresh | SessionSelection::Exit
+        ) {
+            apply_managed_new_thread_defaults(
+                &mut config,
+                app_server.managed_new_thread_defaults(),
+                &cli_kv_overrides,
+                &harness_overrides,
+            );
+        }
+        let mut model = config.model.clone().unwrap_or(bootstrap.default_model);
         let available_models = bootstrap.available_models;
         let remote_connection = crate::status::remote_connection::remote_connection_status_value(
             &app_server_target,
@@ -823,6 +854,7 @@ impl App {
         let feedback_audience = bootstrap.feedback_audience;
         let auth_mode = bootstrap.auth_mode;
         let has_chatgpt_account = bootstrap.has_chatgpt_account;
+        let has_codex_backend_auth = matches!(auth_mode, Some(TelemetryAuthMode::Chatgpt));
         let requires_openai_auth = bootstrap.requires_openai_auth;
         let status_account_display = bootstrap.status_account_display.clone();
         let initial_plan_type = bootstrap.plan_type;
@@ -891,6 +923,7 @@ impl App {
                     ),
                     enhanced_keys_supported,
                     has_chatgpt_account,
+                    has_codex_backend_auth,
                     model_catalog: model_catalog.clone(),
                     feedback: feedback.clone(),
                     is_first_run,
@@ -909,8 +942,12 @@ impl App {
                 (chat_widget, None)
             }
             SessionSelection::Resume(target_session) => {
+                let model_settings = config_persistence::resume_model_settings_for_overrides(
+                    &config,
+                    &harness_overrides,
+                );
                 let resumed = app_server
-                    .resume_thread(config.clone(), target_session.thread_id)
+                    .resume_thread(config.clone(), target_session.thread_id, model_settings)
                     .await
                     .map_err(|err| session_start_error("resume", &target_session, err))?;
                 let init = crate::chatwidget::ChatWidgetInit {
@@ -926,6 +963,7 @@ impl App {
                     ),
                     enhanced_keys_supported,
                     has_chatgpt_account,
+                    has_codex_backend_auth,
                     model_catalog: model_catalog.clone(),
                     feedback: feedback.clone(),
                     is_first_run,
@@ -964,6 +1002,7 @@ impl App {
                     ),
                     enhanced_keys_supported,
                     has_chatgpt_account,
+                    has_codex_backend_auth,
                     model_catalog: model_catalog.clone(),
                     feedback: feedback.clone(),
                     is_first_run,
@@ -980,6 +1019,7 @@ impl App {
                 (ChatWidget::new_with_app_event(init), Some(forked))
             }
         };
+        chat_widget.note_rendered_width(tui.terminal.last_known_screen_size.width);
         chat_widget.remote_connection = remote_connection;
         let thread_and_widget_ms = thread_and_widget_started_at.elapsed().as_millis();
         chat_widget
@@ -1003,6 +1043,7 @@ See the Codex keymap documentation for supported actions and examples."
             chat_widget,
             workspace_command_runner: Some(workspace_command_runner),
             config,
+            launch_cwd,
             state_db,
             cli_kv_overrides,
             harness_overrides,
@@ -1013,12 +1054,14 @@ See the Codex keymap documentation for supported actions and examples."
             file_search,
             enhanced_keys_supported,
             keymap: runtime_keymap,
+            key_chord_matcher: KeyChordMatcher::default(),
             transcript_cells: Vec::new(),
             overlay: None,
             deferred_history_lines: Vec::new(),
             has_emitted_history_lines: false,
             transcript_reflow: TranscriptReflowState::default(),
             initial_history_replay_buffer: None,
+            scrollback_has_older_history: false,
             commit_anim_running: Arc::new(AtomicBool::new(false)),
             status_line_invalid_items_warned: status_line_invalid_items_warned.clone(),
             terminal_title_invalid_items_warned: terminal_title_invalid_items_warned.clone(),
@@ -1036,6 +1079,7 @@ See the Codex keymap documentation for supported actions and examples."
             thread_event_listener_tasks: HashMap::new(),
             agent_navigation: AgentNavigationState::default(),
             side_threads: HashMap::new(),
+            abandoned_side_threads: HashSet::new(),
             active_thread_id: None,
             active_thread_rx: None,
             primary_thread_id: None,
@@ -1044,15 +1088,20 @@ See the Codex keymap documentation for supported actions and examples."
             pending_primary_events: VecDeque::new(),
             pending_app_server_requests: PendingAppServerRequests::default(),
             pending_startup_thread_start,
+            rate_limit_hard_stop_generation: 0,
             pending_plugin_enabled_writes: HashMap::new(),
             pending_hook_enabled_writes: HashMap::new(),
         };
         if let Some(entry) = startup_hooks_browser {
             app.chat_widget.open_hooks_browser(entry);
         }
+        app.update_visible_history_rows(tui.terminal.last_known_screen_size);
         let initial_session_started_at = Instant::now();
         if let Some(started) = initial_started_thread {
             let thread_id = started.session.thread_id;
+            if started.blocks_direct_input {
+                app.mark_primary_thread_parent_owned(thread_id);
+            }
             app.enqueue_primary_thread_session(started.session, started.turns)
                 .await?;
             if should_prompt_for_paused_goal_after_startup_resume {
@@ -1096,7 +1145,7 @@ See the Codex keymap documentation for supported actions and examples."
         let tui_events = tui.event_stream();
         tokio::pin!(tui_events);
 
-        tui.frame_requester().schedule_frame();
+        tui.schedule_screen_size_recheck(Duration::ZERO);
         tracing::info!(
             duration_ms = %(startup_elapsed_before_app + startup_started_at.elapsed()).as_millis(),
             bootstrap_ms = %bootstrap_ms,
@@ -1108,9 +1157,16 @@ See the Codex keymap documentation for supported actions and examples."
         );
         app.refresh_startup_skills(&app_server);
         // Kick off a non-blocking rate-limit prefetch so the first `/status`
-        // already has data, without delaying the initial frame render.
+        // already has data and available reset credits can be surfaced, without
+        // delaying the initial frame render.
         if requires_openai_auth && has_chatgpt_account {
-            app.refresh_rate_limits(&app_server, RateLimitRefreshOrigin::StartupPrefetch);
+            let reset_hint_request_id = app.chat_widget.start_rate_limit_reset_startup_check();
+            app.refresh_rate_limits(
+                &app_server,
+                RateLimitRefreshOrigin::StartupPrefetch {
+                    reset_hint_request_id,
+                },
+            );
         }
 
         let mut listen_for_app_server_events = true;
@@ -1243,18 +1299,25 @@ See the Codex keymap documentation for supported actions and examples."
         app_server: &mut AppServerSession,
         event: TuiEvent,
     ) -> Result<AppRunControl> {
-        let terminal_resize_reflow_enabled = self.terminal_resize_reflow_enabled();
-        if terminal_resize_reflow_enabled && matches!(event, TuiEvent::Draw | TuiEvent::Resize) {
-            self.handle_draw_pre_render(tui)?;
-        } else if matches!(event, TuiEvent::Draw | TuiEvent::Resize) {
-            let size = tui.terminal.size()?;
-            if size != tui.terminal.last_known_screen_size {
-                self.refresh_status_line();
-            }
+        let screen_size = tui.screen_size_for_event(&event)?;
+        if !matches!(&event, TuiEvent::Key(_) | TuiEvent::Paste(_)) {
+            self.expire_pending_key_chord();
+            self.handle_draw_pre_render(tui, screen_size)?;
         }
 
+        let event = if let TuiEvent::Key(key_event) = event {
+            let Some(key_event) = self.route_key_chord_event(tui, key_event) else {
+                return Ok(AppRunControl::Continue);
+            };
+            TuiEvent::Key(key_event)
+        } else {
+            event
+        };
+
         if self.overlay.is_some() {
-            let _ = self.handle_backtrack_overlay_event(tui, event).await?;
+            let _ = self
+                .handle_backtrack_overlay_event(tui, app_server, event)
+                .await?;
         } else {
             match event {
                 TuiEvent::Key(key_event) => {
@@ -1268,9 +1331,9 @@ See the Codex keymap documentation for supported actions and examples."
                     let pasted = pasted.replace("\r", "\n");
                     self.chat_widget.handle_paste(pasted);
                 }
-                TuiEvent::Draw | TuiEvent::Resize => {
+                TuiEvent::Draw | TuiEvent::Resume | TuiEvent::Resize(_) => {
                     if self.backtrack_render_pending {
-                        self.rebuild_transcript_after_backtrack(tui)?;
+                        self.rebuild_transcript_after_backtrack(tui, screen_size.into())?;
                         self.backtrack_render_pending = false;
                     }
                     self.chat_widget.maybe_post_pending_notification(tui);
@@ -1278,19 +1341,18 @@ See the Codex keymap documentation for supported actions and examples."
                         .chat_widget
                         .handle_paste_burst_tick(tui.frame_requester())
                     {
+                        tui.defer_screen_size(screen_size);
                         return Ok(AppRunControl::Continue);
                     }
                     // Allow widgets to process any pending timers before rendering.
                     self.chat_widget.pre_draw_tick();
-                    let rendered_area =
-                        self.render_chat_widget_frame(tui, terminal_resize_reflow_enabled)?;
+                    let rendered_area = self.render_chat_widget_frame(tui, screen_size)?;
                     if self.chat_widget.ambient_pet_image_enabled() {
-                        let terminal_size = tui.terminal.size()?;
                         let ambient_pet_area = Rect::new(
                             /*x*/ 0,
                             /*y*/ 0,
-                            terminal_size.width,
-                            terminal_size.height,
+                            screen_size.width,
+                            screen_size.height,
                         );
                         if let Err(err) = tui.draw_ambient_pet_image(
                             self.chat_widget
@@ -1322,44 +1384,37 @@ See the Codex keymap documentation for supported actions and examples."
     pub(super) fn show_shutdown_feedback(&mut self, tui: &mut tui::Tui) -> Result<()> {
         self.disable_ambient_pet_before_shutdown(tui)?;
         self.chat_widget.show_shutdown_in_progress();
-        let terminal_resize_reflow_enabled = self.terminal_resize_reflow_enabled();
-        if terminal_resize_reflow_enabled {
-            self.handle_draw_pre_render(tui)?;
-        }
+        let screen_size = tui.terminal.last_known_screen_size;
+        self.handle_draw_pre_render(tui, screen_size)?;
         self.chat_widget.pre_draw_tick();
-        self.render_chat_widget_frame(tui, terminal_resize_reflow_enabled)?;
+        self.render_chat_widget_frame(tui, screen_size)?;
         Ok(())
     }
 
-    fn render_chat_widget_frame(
-        &mut self,
-        tui: &mut tui::Tui,
-        terminal_resize_reflow_enabled: bool,
-    ) -> Result<Rect> {
-        let desired_height = self.chat_widget.desired_height(tui.terminal.size()?.width);
-        let mut rendered_area = Rect::default();
-        if terminal_resize_reflow_enabled {
-            tui.draw_with_resize_reflow(desired_height, |frame| {
+    fn render_chat_widget_frame(&mut self, tui: &mut tui::Tui, screen_size: Size) -> Result<Rect> {
+        self.with_chat_widget_frame(screen_size.width, |desired_height, chat_widget| {
+            let mut rendered_area = Rect::default();
+            tui.draw_with_resize_reflow(desired_height, screen_size, |frame| {
                 let area = frame.area();
                 rendered_area = area;
-                self.chat_widget.render(area, frame.buffer);
-                if let Some((x, y)) = self.chat_widget.cursor_pos(area) {
-                    frame.set_cursor_style(self.chat_widget.cursor_style(area));
+                chat_widget.render(area, frame.buffer);
+                self.chat_widget.note_rendered_width(area.width);
+                if let Some((x, y)) = chat_widget.cursor_pos(area) {
+                    frame.set_cursor_style(chat_widget.cursor_style(area));
                     frame.set_cursor_position((x, y));
                 }
             })?;
-        } else {
-            tui.draw(desired_height, |frame| {
-                let area = frame.area();
-                rendered_area = area;
-                self.chat_widget.render(area, frame.buffer);
-                if let Some((x, y)) = self.chat_widget.cursor_pos(area) {
-                    frame.set_cursor_style(self.chat_widget.cursor_style(area));
-                    frame.set_cursor_position((x, y));
-                }
-            })?;
-        }
-        Ok(rendered_area)
+            Ok(rendered_area)
+        })
+    }
+
+    fn with_chat_widget_frame<T>(
+        &self,
+        width: u16,
+        render: impl FnOnce(u16, &dyn Renderable) -> T,
+    ) -> T {
+        let chat_widget = self.chat_widget.as_renderable();
+        render(chat_widget.desired_height(width), &chat_widget)
     }
 }
 

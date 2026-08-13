@@ -7,6 +7,7 @@ use codex_app_server_protocol::RemoteControlClientsListParams;
 use codex_app_server_protocol::RemoteControlClientsListResponse;
 use codex_app_server_protocol::RemoteControlClientsRevokeParams;
 use codex_app_server_protocol::RemoteControlClientsRevokeResponse;
+use codex_login::AuthKeyringBackendKind;
 use pretty_assertions::assert_eq;
 
 fn client_management_handle(
@@ -21,6 +22,7 @@ fn client_management_handle(
         environment_id: None,
     });
     RemoteControlHandle {
+        policy: RemoteControlPolicy::Allowed,
         desired_state_tx: Arc::new(desired_state_tx),
         desired_state_rpc_lock: Arc::new(Semaphore::new(1)),
         desired_state_persistence_lock: Arc::new(Semaphore::new(1)),
@@ -58,8 +60,8 @@ async fn remote_control_handle_lists_clients_while_disabled() {
             Some(&"Bearer Access Token".to_string())
         );
         assert_eq!(
-            request.headers.get(REMOTE_CONTROL_ACCOUNT_ID_HEADER),
-            Some(&"account_id".to_string())
+            request.headers.get_all(REMOTE_CONTROL_ACCOUNT_ID_HEADER),
+            vec!["account_id"]
         );
         respond_with_json(
             request.stream,
@@ -125,6 +127,14 @@ async fn remote_control_handle_revokes_client_while_disabled() {
             request.request_line,
             "DELETE /backend-api/wham/remote/control/environments/env%20%2F%3F/clients/client%20%2F%3F HTTP/1.1"
         );
+        assert_eq!(
+            request.headers.get("authorization"),
+            Some(&"Bearer Access Token".to_string())
+        );
+        assert_eq!(
+            request.headers.get_all(REMOTE_CONTROL_ACCOUNT_ID_HEADER),
+            vec!["account_id"]
+        );
         respond_with_status(request.stream, "204 No Content", "").await;
     });
     let handle = client_management_handle(remote_control_url, remote_control_auth_manager());
@@ -153,12 +163,24 @@ async fn list_remote_control_clients_recovers_auth_after_unauthorized() {
             stale_request.headers.get("authorization"),
             Some(&"Bearer stale-token".to_string())
         );
+        assert_eq!(
+            stale_request
+                .headers
+                .get_all(REMOTE_CONTROL_ACCOUNT_ID_HEADER),
+            vec!["account_id"]
+        );
         respond_with_status(stale_request.stream, "401 Unauthorized", "").await;
 
         let recovered_request = accept_http_request(&listener).await;
         assert_eq!(
             recovered_request.headers.get("authorization"),
             Some(&"Bearer fresh-token".to_string())
+        );
+        assert_eq!(
+            recovered_request
+                .headers
+                .get_all(REMOTE_CONTROL_ACCOUNT_ID_HEADER),
+            vec!["account_id"]
         );
         respond_with_json(recovered_request.stream, empty_client_list()).await;
     });
@@ -173,13 +195,17 @@ async fn list_remote_control_clients_recovers_auth_after_unauthorized() {
         codex_home.path(),
         &stale_auth,
         AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::default(),
     )
     .expect("stale auth should save");
     let auth_manager = AuthManager::shared(
         codex_home.path().to_path_buf(),
         /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
+        /*forced_chatgpt_workspace_id*/ None,
         /*chatgpt_base_url*/ None,
+        AuthKeyringBackendKind::default(),
+        codex_login::test_support::transport_default_auth_route_config(),
     )
     .await;
     let mut fresh_auth = remote_control_auth_dot_json(Some("account_id"));
@@ -192,6 +218,7 @@ async fn list_remote_control_clients_recovers_auth_after_unauthorized() {
         codex_home.path(),
         &fresh_auth,
         AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::default(),
     )
     .expect("fresh auth should save");
 
@@ -228,12 +255,24 @@ async fn list_remote_control_clients_retries_unauthorized_only_once() {
             stale_request.headers.get("authorization"),
             Some(&"Bearer stale-token".to_string())
         );
+        assert_eq!(
+            stale_request
+                .headers
+                .get_all(REMOTE_CONTROL_ACCOUNT_ID_HEADER),
+            vec!["account_id"]
+        );
         respond_with_status(stale_request.stream, "401 Unauthorized", "").await;
 
         let recovered_request = accept_http_request(&listener).await;
         assert_eq!(
             recovered_request.headers.get("authorization"),
             Some(&"Bearer fresh-token".to_string())
+        );
+        assert_eq!(
+            recovered_request
+                .headers
+                .get_all(REMOTE_CONTROL_ACCOUNT_ID_HEADER),
+            vec!["account_id"]
         );
         respond_with_status(recovered_request.stream, "401 Unauthorized", "").await;
 
@@ -254,13 +293,17 @@ async fn list_remote_control_clients_retries_unauthorized_only_once() {
         codex_home.path(),
         &stale_auth,
         AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::default(),
     )
     .expect("stale auth should save");
     let auth_manager = AuthManager::shared(
         codex_home.path().to_path_buf(),
         /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
+        /*forced_chatgpt_workspace_id*/ None,
         /*chatgpt_base_url*/ None,
+        AuthKeyringBackendKind::default(),
+        codex_login::test_support::transport_default_auth_route_config(),
     )
     .await;
     let mut fresh_auth = remote_control_auth_dot_json(Some("account_id"));
@@ -273,6 +316,7 @@ async fn list_remote_control_clients_retries_unauthorized_only_once() {
         codex_home.path(),
         &fresh_auth,
         AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::default(),
     )
     .expect("fresh auth should save");
 
@@ -299,6 +343,14 @@ async fn revoke_remote_control_client_does_not_retry_forbidden() {
     let remote_control_url = remote_control_url_for_listener(&listener);
     let server_task = tokio::spawn(async move {
         let request = accept_http_request(&listener).await;
+        assert_eq!(
+            request.headers.get("authorization"),
+            Some(&"Bearer Access Token".to_string())
+        );
+        assert_eq!(
+            request.headers.get_all(REMOTE_CONTROL_ACCOUNT_ID_HEADER),
+            vec!["account_id"]
+        );
         respond_with_status_and_headers(
             request.stream,
             "403 Forbidden",

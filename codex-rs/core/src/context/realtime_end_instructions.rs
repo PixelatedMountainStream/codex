@@ -5,13 +5,17 @@ use codex_protocol::protocol::REALTIME_CONVERSATION_OPEN_TAG;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RealtimeEndInstructions {
-    reason: String,
+    instructions: Option<String>,
 }
 
 impl RealtimeEndInstructions {
-    pub(crate) fn new(reason: impl Into<String>) -> Self {
+    pub(crate) fn new() -> Self {
+        Self { instructions: None }
+    }
+
+    pub(crate) fn with_instructions(instructions: impl Into<String>) -> Self {
         Self {
-            reason: reason.into(),
+            instructions: Some(instructions.into()),
         }
     }
 }
@@ -33,6 +37,10 @@ impl ContextualUserFragment for RealtimeEndInstructions {
     }
 
     fn body(&self) -> String {
-        format!("\n{}\n\nReason: {}\n", END_INSTRUCTIONS.trim(), self.reason)
+        let instructions = self
+            .instructions
+            .as_deref()
+            .unwrap_or_else(|| END_INSTRUCTIONS.trim());
+        format!("\n{instructions}\n")
     }
 }

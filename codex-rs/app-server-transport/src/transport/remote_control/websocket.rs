@@ -23,12 +23,12 @@ use crate::transport::remote_control::auth::recover_remote_control_auth;
 use crate::transport::remote_control::client_tracker::ClientTracker;
 use crate::transport::remote_control::client_tracker::REMOTE_CONTROL_IDLE_SWEEP_INTERVAL;
 use crate::transport::remote_control::enroll::RemoteControlEnrollment;
-use crate::transport::remote_control::enroll::enroll_remote_control_server;
 use crate::transport::remote_control::enroll::format_headers;
 use crate::transport::remote_control::enroll::load_persisted_remote_control_enrollment;
 use crate::transport::remote_control::enroll::preview_remote_control_response_body;
-use crate::transport::remote_control::enroll::refresh_remote_control_server;
 use crate::transport::remote_control::enroll::update_persisted_remote_control_enrollment;
+use crate::transport::remote_control::server_api::enroll_remote_control_server;
+use crate::transport::remote_control::server_api::refresh_remote_control_server;
 use axum::http::HeaderValue;
 use base64::Engine;
 use codex_app_server_protocol::RemoteControlConnectionStatus;
@@ -1566,17 +1566,19 @@ async fn prepare_remote_control_enrollment(
                 )
                 .await?;
             }
-            Err(err)
-                if err.kind() == ErrorKind::PermissionDenied
-                    && recover_remote_control_auth(
-                        auth_context.auth_recovery,
-                        auth_context.auth_change_rx,
-                    )
-                    .await =>
-            {
-                return Err(io::Error::other(format!(
-                    "{err}; retrying after auth recovery"
-                )));
+            Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+                if recover_remote_control_auth(
+                    auth_context.auth_recovery,
+                    auth_context.auth_change_rx,
+                )
+                .await
+                {
+                    return Err(io::Error::other(format!(
+                        "{err}; retrying after auth recovery"
+                    )));
+                }
+                enrollment_ref.clear_server_token();
+                return Err(err);
             }
             Err(err) => return Err(err),
         }
@@ -1681,13 +1683,15 @@ async fn clear_remote_control_server_token_if_matches(
     enrollment: &RemoteControlEnrollment,
 ) -> io::Result<()> {
     let mut current_enrollment = current_enrollment.lock().await;
-    current_enrollment
+    let current_enrollment = current_enrollment
         .as_mut()
         .filter(|current| same_remote_control_enrollment(current, enrollment))
         .ok_or_else(|| {
             io::Error::other("missing remote control enrollment after websocket auth failure")
-        })?
-        .clear_server_token();
+        })?;
+    if current_enrollment.remote_control_token == enrollment.remote_control_token {
+        current_enrollment.clear_server_token();
+    }
     Ok(())
 }
 
@@ -1805,6 +1809,10 @@ fn format_remote_control_websocket_connect_error(
 }
 
 #[cfg(test)]
+#[path = "websocket_refresh_tests.rs"]
+mod refresh_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::outgoing_message::OutgoingMessage;
@@ -1813,19 +1821,22 @@ mod tests {
     use crate::transport::remote_control::protocol::StreamId;
     use crate::transport::remote_control::protocol::normalize_remote_control_url;
     use chrono::Utc;
-    use codex_app_server_protocol::AuthMode;
     use codex_app_server_protocol::ConfigWarningNotification;
     use codex_app_server_protocol::JSONRPCMessage;
     use codex_app_server_protocol::JSONRPCNotification;
     use codex_app_server_protocol::ServerNotification;
+    use codex_app_server_protocol::ServerNotificationEnvelope;
     use codex_config::types::AuthCredentialsStoreMode;
     use codex_core::test_support::auth_manager_from_auth;
     use codex_login::AuthDotJson;
+    use codex_login::AuthKeyringBackendKind;
     use codex_login::CodexAuth;
     use codex_login::save_auth;
     use codex_login::token_data::TokenData;
     use codex_login::token_data::parse_chatgpt_jwt_claims;
+    use codex_protocol::auth::AuthMode;
     use codex_state::StateRuntime;
+    use codex_utils_absolute_path::test_support::PathExt;
     use futures::StreamExt;
     use pretty_assertions::assert_eq;
     use std::sync::Arc;
@@ -1843,13 +1854,15 @@ mod tests {
     // Windows Bazel CI can take longer than a few seconds for the websocket
     // client connection attempt to reach the local test listener.
     #[cfg(windows)]
-    const TEST_HTTP_ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
+    pub(super) const TEST_HTTP_ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
     #[cfg(not(windows))]
-    const TEST_HTTP_ACCEPT_TIMEOUT: Duration = Duration::from_secs(5);
-    const TEST_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
-    const TEST_REMOTE_CONTROL_SERVER_TOKEN: &str = "Remote Control Token";
+    pub(super) const TEST_HTTP_ACCEPT_TIMEOUT: Duration = Duration::from_secs(5);
+    pub(super) const TEST_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
+    pub(super) const TEST_REMOTE_CONTROL_SERVER_TOKEN: &str = "Remote Control Token";
 
-    fn remote_control_enrollment(remote_control_token: Option<&str>) -> RemoteControlEnrollment {
+    pub(super) fn remote_control_enrollment(
+        remote_control_token: Option<&str>,
+    ) -> RemoteControlEnrollment {
         RemoteControlEnrollment {
             remote_control_target: normalize_remote_control_url("http://localhost/backend-api/")
                 .expect("target should normalize"),
@@ -1860,10 +1873,11 @@ mod tests {
             remote_control_token: remote_control_token.map(str::to_string),
             expires_at: remote_control_token
                 .map(|_| time::OffsetDateTime::now_utc() + time::Duration::hours(1)),
+            next_refresh_at: None,
         }
     }
 
-    fn test_current_enrollment(
+    pub(super) fn test_current_enrollment(
         enrollment: Option<RemoteControlEnrollment>,
     ) -> CurrentRemoteControlEnrollment {
         Arc::new(RemoteControlEnrollmentState::new(enrollment))
@@ -1929,7 +1943,7 @@ mod tests {
         ));
     }
 
-    fn remote_control_status_channel() -> (
+    pub(super) fn remote_control_status_channel() -> (
         RemoteControlStatusPublisher,
         watch::Receiver<RemoteControlStatusChangedNotification>,
     ) {
@@ -1942,7 +1956,7 @@ mod tests {
         (RemoteControlStatusPublisher::new(status_tx), status_rx)
     }
 
-    fn enabled_desired_state_sender() -> watch::Sender<RemoteControlDesiredState> {
+    pub(super) fn enabled_desired_state_sender() -> watch::Sender<RemoteControlDesiredState> {
         watch::channel(RemoteControlDesiredState::Enabled {
             persistence_preference: None,
         })
@@ -1980,17 +1994,20 @@ mod tests {
         );
     }
 
-    async fn remote_control_state_runtime(codex_home: &TempDir) -> Arc<StateRuntime> {
-        StateRuntime::init(codex_home.path().to_path_buf(), "test-provider".to_string())
-            .await
-            .expect("state runtime should initialize")
+    pub(super) async fn remote_control_state_runtime(codex_home: &TempDir) -> Arc<StateRuntime> {
+        StateRuntime::init(
+            codex_state::SqliteConfig::new_for_testing(codex_home.path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("state runtime should initialize")
     }
 
-    fn remote_control_auth_manager() -> Arc<AuthManager> {
+    pub(super) fn remote_control_auth_manager() -> Arc<AuthManager> {
         auth_manager_from_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
     }
 
-    fn remote_control_url_for_listener(listener: &TcpListener) -> String {
+    pub(super) fn remote_control_url_for_listener(listener: &TcpListener) -> String {
         let addr = listener
             .local_addr()
             .expect("listener should have a local addr");
@@ -2125,9 +2142,10 @@ mod tests {
         let auth_manager = remote_control_auth_manager();
         let mut auth_recovery = auth_manager.unauthorized_recovery();
         let mut auth_change_rx = auth_manager.auth_change_receiver();
-        let current_enrollment = test_current_enrollment(Some(remote_control_enrollment(Some(
-            TEST_REMOTE_CONTROL_SERVER_TOKEN,
-        ))));
+        let next_refresh_at = time::OffsetDateTime::now_utc() + time::Duration::minutes(2);
+        let mut enrollment = remote_control_enrollment(Some(TEST_REMOTE_CONTROL_SERVER_TOKEN));
+        enrollment.next_refresh_at = Some(next_refresh_at);
+        let current_enrollment = test_current_enrollment(Some(enrollment));
         let (status_publisher, status_rx) = remote_control_status_channel();
 
         let server_task = tokio::spawn(async move {
@@ -2177,6 +2195,7 @@ mod tests {
         );
         let mut expected_enrollment = remote_control_enrollment(/*remote_control_token*/ None);
         expected_enrollment.remote_control_target = remote_control_target;
+        expected_enrollment.next_refresh_at = Some(next_refresh_at);
         assert_eq!(*current_enrollment.lock().await, Some(expected_enrollment));
     }
 
@@ -2202,6 +2221,7 @@ mod tests {
             codex_home.path(),
             &remote_control_auth_dot_json("stale-token"),
             AuthCredentialsStoreMode::File,
+            AuthKeyringBackendKind::default(),
         )
         .expect("stale auth should save");
         let state_db = remote_control_state_runtime(&codex_home).await;
@@ -2209,7 +2229,10 @@ mod tests {
             codex_home.path().to_path_buf(),
             /*enable_codex_api_key_env*/ false,
             AuthCredentialsStoreMode::File,
+            /*forced_chatgpt_workspace_id*/ None,
             /*chatgpt_base_url*/ None,
+            AuthKeyringBackendKind::default(),
+            codex_login::test_support::transport_default_auth_route_config(),
         )
         .await;
         let mut auth_recovery = auth_manager.unauthorized_recovery();
@@ -2220,6 +2243,7 @@ mod tests {
             codex_home.path(),
             &remote_control_auth_dot_json("fresh-token"),
             AuthCredentialsStoreMode::File,
+            AuthKeyringBackendKind::default(),
         )
         .expect("fresh auth should save");
 
@@ -2296,6 +2320,7 @@ mod tests {
             codex_home.path(),
             &remote_control_auth_dot_json("stale-token"),
             AuthCredentialsStoreMode::File,
+            AuthKeyringBackendKind::default(),
         )
         .expect("stale auth should save");
         let state_db = remote_control_state_runtime(&codex_home).await;
@@ -2303,19 +2328,26 @@ mod tests {
             codex_home.path().to_path_buf(),
             /*enable_codex_api_key_env*/ false,
             AuthCredentialsStoreMode::File,
+            /*forced_chatgpt_workspace_id*/ None,
             /*chatgpt_base_url*/ None,
+            AuthKeyringBackendKind::default(),
+            codex_login::test_support::transport_default_auth_route_config(),
         )
         .await;
         let mut auth_recovery = auth_manager.unauthorized_recovery();
         let mut auth_change_rx = auth_manager.auth_change_receiver();
-        let current_enrollment = test_current_enrollment(Some(remote_control_enrollment(
-            /*remote_control_token*/ None,
-        )));
+        let mut expected_enrollment =
+            remote_control_enrollment(Some(TEST_REMOTE_CONTROL_SERVER_TOKEN));
+        expected_enrollment.remote_control_target = remote_control_target.clone();
+        expected_enrollment.expires_at =
+            Some(time::OffsetDateTime::now_utc() + time::Duration::minutes(4));
+        let current_enrollment = test_current_enrollment(Some(expected_enrollment.clone()));
         let (status_publisher, status_rx) = remote_control_status_channel();
         save_auth(
             codex_home.path(),
             &remote_control_auth_dot_json("fresh-token"),
             AuthCredentialsStoreMode::File,
+            AuthKeyringBackendKind::default(),
         )
         .expect("fresh auth should save");
 
@@ -2366,6 +2398,7 @@ mod tests {
                 .expect("token should be readable"),
             "fresh-token"
         );
+        assert_eq!(current_enrollment.snapshot(), Some(expected_enrollment));
         assert!(
             !auth_change_rx
                 .has_changed()
@@ -2423,7 +2456,10 @@ mod tests {
             codex_home.path().to_path_buf(),
             /*enable_codex_api_key_env*/ false,
             AuthCredentialsStoreMode::File,
+            /*forced_chatgpt_workspace_id*/ None,
             /*chatgpt_base_url*/ None,
+            AuthKeyringBackendKind::default(),
+            codex_login::test_support::transport_default_auth_route_config(),
         )
         .await;
         let mut auth_recovery = auth_manager.unauthorized_recovery();
@@ -3331,12 +3367,17 @@ mod tests {
         ServerEnvelope {
             event: ServerEvent::ServerMessage {
                 message: Box::new(OutgoingMessage::AppServerNotification(
-                    ServerNotification::ConfigWarning(ConfigWarningNotification {
-                        summary: summary.to_string(),
-                        details: None,
-                        path: None,
-                        range: None,
-                    }),
+                    ServerNotificationEnvelope {
+                        notification: ServerNotification::ConfigWarning(
+                            ConfigWarningNotification {
+                                summary: summary.to_string(),
+                                details: None,
+                                path: None,
+                                range: None,
+                            },
+                        ),
+                        emitted_at_ms: Some(1_234),
+                    },
                 )),
             },
             client_id: client_id.clone(),
@@ -3397,7 +3438,7 @@ mod tests {
         state.observe_client_message(envelope, wire_size_bytes)
     }
 
-    async fn accept_http_request(listener: &TcpListener) -> (TcpStream, String) {
+    pub(super) async fn accept_http_request(listener: &TcpListener) -> (TcpStream, String) {
         let (stream, _) = timeout(TEST_HTTP_ACCEPT_TIMEOUT, listener.accept())
             .await
             .expect("HTTP request should arrive in time")
@@ -3468,7 +3509,7 @@ mod tests {
         serde_json::from_str(text.as_ref()).expect("server event should deserialize")
     }
 
-    async fn respond_with_status_and_headers(
+    pub(super) async fn respond_with_status_and_headers(
         mut stream: TcpStream,
         status: &str,
         headers: &[(&str, &str)],

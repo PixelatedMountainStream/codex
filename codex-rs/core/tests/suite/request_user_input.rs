@@ -43,14 +43,10 @@ fn call_output(req: &ResponsesRequest, call_id: &str) -> String {
         Some(call_id),
         "mismatched call_id in function_call_output"
     );
-    let (content_opt, _success) = match req.function_call_output_content_and_success(call_id) {
-        Some(values) => values,
-        None => panic!("function_call_output present"),
-    };
-    match content_opt {
-        Some(content) => content,
-        None => panic!("function_call_output content present"),
-    }
+    let (content_opt, _success) = req
+        .function_call_output_content_and_success(call_id)
+        .expect("function_call_output present");
+    content_opt.expect("function_call_output content present")
 }
 
 fn call_output_content_and_success(
@@ -63,37 +59,24 @@ fn call_output_content_and_success(
         Some(call_id),
         "mismatched call_id in function_call_output"
     );
-    let (content_opt, success) = match req.function_call_output_content_and_success(call_id) {
-        Some(values) => values,
-        None => panic!("function_call_output present"),
-    };
-    let content = match content_opt {
-        Some(content) => content,
-        None => panic!("function_call_output content present"),
-    };
+    let (content_opt, success) = req
+        .function_call_output_content_and_success(call_id)
+        .expect("function_call_output present");
+    let content = content_opt.expect("function_call_output content present");
     (content, success)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn request_user_input_round_trip_resolves_pending() -> anyhow::Result<()> {
-    request_user_input_round_trip_for_mode(ModeKind::Plan, /*auto_resolution_ms*/ None).await
+    request_user_input_round_trip_for_mode(ModeKind::Plan).await
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn request_user_input_round_trip_emits_auto_resolution_ms() -> anyhow::Result<()> {
-    request_user_input_round_trip_for_mode(ModeKind::Plan, Some(60_000)).await
-}
-
-async fn request_user_input_round_trip_for_mode(
-    mode: ModeKind,
-    auto_resolution_ms: Option<u64>,
-) -> anyhow::Result<()> {
+async fn request_user_input_round_trip_for_mode(mode: ModeKind) -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
 
     let builder = test_codex();
-    #[allow(clippy::expect_used)]
     let TestCodex {
         codex,
         cwd,
@@ -112,7 +95,8 @@ async fn request_user_input_round_trip_for_mode(
         .await?;
 
     let call_id = "user-input-call";
-    let mut request_args = json!({
+    let expected_is_blocking = mode == ModeKind::Plan;
+    let request_args = json!({
         "questions": [{
             "id": "confirm_path",
             "header": "Confirm",
@@ -126,12 +110,6 @@ async fn request_user_input_round_trip_for_mode(
             }]
         }]
     });
-    if let Some(auto_resolution_ms) = auto_resolution_ms {
-        let Some(request_args) = request_args.as_object_mut() else {
-            panic!("request_user_input args should be a JSON object");
-        };
-        request_args.insert("autoResolutionMs".to_string(), json!(auto_resolution_ms));
-    }
     let request_args = request_args.to_string();
 
     let first_response = sse(vec![
@@ -185,15 +163,16 @@ async fn request_user_input_round_trip_for_mode(
     .await;
     assert_eq!(request.call_id, call_id);
     assert_eq!(request.questions.len(), 1);
-    assert_eq!(request.auto_resolution_ms, auto_resolution_ms);
+    assert_eq!(request.is_blocking, expected_is_blocking);
+    assert_eq!(request.auto_resolution_ms, None);
     assert_eq!(request.questions[0].is_other, true);
     assert!(
         timeout(Duration::from_millis(200), async {
             loop {
-                let event = match codex.next_event().await {
-                    Ok(event) => event,
-                    Err(err) => panic!("event stream should stay open: {err}"),
-                };
+                let event = codex
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
                 if matches!(event.msg, EventMsg::TokenCount(_)) {
                     return;
                 }
@@ -433,19 +412,6 @@ where
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn request_user_input_rejected_in_execute_mode_alias() -> anyhow::Result<()> {
-    assert_request_user_input_rejected("Execute", |model| CollaborationMode {
-        mode: ModeKind::Execute,
-        settings: Settings {
-            model,
-            reasoning_effort: None,
-            developer_instructions: None,
-        },
-    })
-    .await
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn request_user_input_rejected_in_default_mode_by_default() -> anyhow::Result<()> {
     assert_request_user_input_rejected("Default", |model| CollaborationMode {
         mode: ModeKind::Default,
@@ -460,18 +426,5 @@ async fn request_user_input_rejected_in_default_mode_by_default() -> anyhow::Res
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn request_user_input_round_trip_in_default_mode_with_feature() -> anyhow::Result<()> {
-    request_user_input_round_trip_for_mode(ModeKind::Default, /*auto_resolution_ms*/ None).await
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn request_user_input_rejected_in_pair_mode_alias() -> anyhow::Result<()> {
-    assert_request_user_input_rejected("Pair Programming", |model| CollaborationMode {
-        mode: ModeKind::PairProgramming,
-        settings: Settings {
-            model,
-            reasoning_effort: None,
-            developer_instructions: None,
-        },
-    })
-    .await
+    request_user_input_round_trip_for_mode(ModeKind::Default).await
 }

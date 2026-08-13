@@ -1,4 +1,6 @@
 use anyhow::Result;
+#[cfg(target_os = "macos")]
+use codex_core::shell::get_shell_by_model_provided_path;
 use codex_features::Feature;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
@@ -22,6 +24,8 @@ use core_test_support::wait_for_event_match;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::collections::HashMap;
+#[cfg(target_os = "macos")]
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use tokio::fs;
@@ -106,12 +110,10 @@ fn command_asserting_policy_after_snapshot() -> String {
     )
 }
 
-#[allow(clippy::expect_used)]
 async fn run_snapshot_command(command: &str) -> Result<SnapshotRun> {
     run_snapshot_command_with_options(command, SnapshotRunOptions::default()).await
 }
 
-#[allow(clippy::expect_used)]
 async fn run_snapshot_command_with_options(
     command: &str,
     options: SnapshotRunOptions,
@@ -211,12 +213,10 @@ async fn run_snapshot_command_with_options(
     })
 }
 
-#[allow(clippy::expect_used)]
 async fn run_shell_command_snapshot(command: &str) -> Result<SnapshotRun> {
     run_shell_command_snapshot_with_options(command, SnapshotRunOptions::default()).await
 }
 
-#[allow(clippy::expect_used)]
 async fn run_shell_command_snapshot_with_options(
     command: &str,
     options: SnapshotRunOptions,
@@ -311,7 +311,6 @@ async fn run_shell_command_snapshot_with_options(
     })
 }
 
-#[allow(clippy::expect_used)]
 async fn run_tool_turn_on_harness(
     harness: &TestCodexHarness,
     prompt: &str,
@@ -609,10 +608,6 @@ async fn shell_command_snapshot_still_intercepts_apply_patch() -> Result<()> {
         })
         .await?;
 
-    let snapshot_path = wait_for_snapshot(&codex_home).await?;
-    let snapshot_content = fs::read_to_string(&snapshot_path).await?;
-    assert_posix_snapshot_sections(&snapshot_content);
-
     let mut saw_patch_begin = false;
     let mut patch_end = None;
     wait_for_event(&codex, |ev| match ev {
@@ -628,6 +623,10 @@ async fn shell_command_snapshot_still_intercepts_apply_patch() -> Result<()> {
         _ => false,
     })
     .await;
+
+    let snapshot_path = wait_for_snapshot(&codex_home).await?;
+    let snapshot_content = fs::read_to_string(&snapshot_path).await?;
+    assert_posix_snapshot_sections(&snapshot_content);
 
     assert!(
         saw_patch_begin,
@@ -677,6 +676,74 @@ async fn shell_snapshot_deleted_after_shutdown_with_skills() -> Result<()> {
         false,
         "snapshot should be removed after shutdown"
     );
+
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn macos_shell_command_resolves_command_from_tied_path_snapshot() -> Result<()> {
+    let builder = test_codex()
+        .with_user_shell(get_shell_by_model_provided_path(&PathBuf::from("/bin/zsh")))
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::ShellSnapshot)
+                .expect("test config should allow feature update");
+        });
+    let harness = TestCodexHarness::with_builder(builder).await?;
+    let command_dir = harness
+        .test()
+        .config
+        .cwd
+        .join("path with spaces")
+        .join("bin");
+    fs::create_dir_all(&command_dir).await?;
+    let command_path = command_dir.join("snapshot-only-command");
+    fs::write(&command_path, "#!/bin/sh\nprintf tied-path-command").await?;
+    let mut permissions = fs::metadata(&command_path).await?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&command_path, permissions).await?;
+
+    run_tool_turn_on_harness(
+        &harness,
+        "warm up the tied PATH shell snapshot",
+        "shell-snapshot-tied-path-warmup",
+        "shell_command",
+        json!({
+            "command": "printf warmup",
+            "timeout_ms": 5_000,
+        }),
+    )
+    .await?;
+    let snapshot_path = wait_for_snapshot(harness.test().home.path()).await?;
+    fs::write(
+        &snapshot_path,
+        format!(
+            "# Snapshot file\nexport -UT PATH path=('{}' /usr/bin /bin)\n",
+            command_dir.display()
+        ),
+    )
+    .await?;
+
+    let end = run_tool_turn_on_harness(
+        &harness,
+        "resolve a command from the tied PATH snapshot",
+        "shell-snapshot-tied-path",
+        "shell_command",
+        json!({
+            "command": "snapshot-only-command",
+            "timeout_ms": 5_000,
+        }),
+    )
+    .await?;
+
+    assert_eq!(
+        end.exit_code, 0,
+        "tied-path command failed: stderr={:?}",
+        end.stderr
+    );
+    assert_eq!(normalize_newlines(&end.stdout).trim(), "tied-path-command");
 
     Ok(())
 }

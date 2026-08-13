@@ -1,7 +1,9 @@
 use super::*;
 use crate::agent::next_thread_spawn_depth;
+use crate::session::session::Session;
+use crate::session::turn_context::TurnContext;
+use crate::session::turn_context::TurnEnvironment;
 use crate::tools::handlers::multi_agents_spec::create_resume_agent_tool;
-use crate::turn_timing::now_unix_timestamp_ms;
 use codex_tools::ToolSpec;
 use std::sync::Arc;
 
@@ -34,6 +36,7 @@ async fn handle_resume_agent(
     let ToolInvocation {
         session,
         turn,
+        step_context,
         payload,
         call_id,
         ..
@@ -57,17 +60,24 @@ async fn handle_resume_agent(
     }
 
     session
-        .send_event(
+        .emit_turn_item_started(
             &turn,
-            CollabResumeBeginEvent {
-                call_id: call_id.clone(),
-                started_at_ms: now_unix_timestamp_ms(),
+            &TurnItem::CollabAgentToolCall(CollabAgentToolCallItem {
+                id: call_id.clone(),
+                tool: CollabAgentTool::ResumeAgent,
+                status: CollabAgentToolCallStatus::InProgress,
                 sender_thread_id: session.thread_id,
-                receiver_thread_id,
-                receiver_agent_nickname: receiver_agent.agent_nickname.clone(),
-                receiver_agent_role: receiver_agent.agent_role.clone(),
-            }
-            .into(),
+                receiver_thread_ids: vec![receiver_thread_id],
+                receiver_agents: vec![CollabAgentRef {
+                    thread_id: receiver_thread_id,
+                    agent_nickname: receiver_agent.agent_nickname.clone(),
+                    agent_role: receiver_agent.agent_role.clone(),
+                }],
+                prompt: None,
+                model: None,
+                reasoning_effort: None,
+                agents_states: Default::default(),
+            }),
         )
         .await;
 
@@ -80,6 +90,7 @@ async fn handle_resume_agent(
         match Box::pin(try_resume_closed_agent(
             &session,
             &turn,
+            step_context.environments.primary(),
             receiver_thread_id,
             child_depth,
         ))
@@ -113,18 +124,24 @@ async fn handle_resume_agent(
         (receiver_agent, None)
     };
     session
-        .send_event(
+        .emit_turn_item_completed(
             &turn,
-            CollabResumeEndEvent {
-                call_id,
-                completed_at_ms: now_unix_timestamp_ms(),
+            TurnItem::CollabAgentToolCall(CollabAgentToolCallItem {
+                id: call_id,
+                tool: CollabAgentTool::ResumeAgent,
+                status: collab_tool_call_status(&status, Some(receiver_thread_id)),
                 sender_thread_id: session.thread_id(),
-                receiver_thread_id,
-                receiver_agent_nickname: receiver_agent.agent_nickname,
-                receiver_agent_role: receiver_agent.agent_role,
-                status: status.clone(),
-            }
-            .into(),
+                receiver_thread_ids: vec![receiver_thread_id],
+                receiver_agents: vec![CollabAgentRef {
+                    thread_id: receiver_thread_id,
+                    agent_nickname: receiver_agent.agent_nickname,
+                    agent_role: receiver_agent.agent_role,
+                }],
+                prompt: None,
+                model: None,
+                reasoning_effort: None,
+                agents_states: [(receiver_thread_id, status.clone())].into_iter().collect(),
+            }),
         )
         .await;
 
@@ -174,10 +191,11 @@ impl ToolOutput for ResumeAgentResult {
 async fn try_resume_closed_agent(
     session: &Arc<Session>,
     turn: &Arc<TurnContext>,
+    environment: Option<&TurnEnvironment>,
     receiver_thread_id: ThreadId,
     child_depth: i32,
 ) -> Result<(), FunctionCallError> {
-    let config = build_agent_resume_config(turn.as_ref())?;
+    let config = build_agent_resume_config(turn.as_ref(), environment)?;
     Box::pin(session.services.agent_control.resume_agent_from_rollout(
         config,
         receiver_thread_id,

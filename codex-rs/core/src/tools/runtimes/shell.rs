@@ -8,14 +8,13 @@ builds sandbox transform inputs, and runs them under the current SandboxAttempt.
 pub(crate) mod unix_escalation;
 pub(crate) mod zsh_fork_backend;
 
-use crate::command_canonicalization::canonicalize_command_for_approval;
 use crate::exec::ExecCapturePolicy;
-use crate::guardian::GuardianApprovalRequest;
 use crate::guardian::GuardianNetworkAccessTrigger;
-use crate::guardian::review_approval_request;
+use crate::plugins::metrics::finish_and_track_measurements;
 use crate::sandboxing::ExecOptions;
 use crate::sandboxing::SandboxPermissions;
 use crate::sandboxing::execute_env;
+use crate::session::turn_context::TurnEnvironment;
 use crate::shell::ShellType;
 use crate::tools::flat_tool_name;
 use crate::tools::network_approval::NetworkApprovalMode;
@@ -28,9 +27,8 @@ use crate::tools::runtimes::disable_powershell_profile_for_elevated_windows_sand
 use crate::tools::runtimes::exec_env_for_sandbox_permissions;
 use crate::tools::runtimes::maybe_wrap_shell_lc_with_snapshot;
 use crate::tools::sandboxing::Approvable;
-use crate::tools::sandboxing::ApprovalCtx;
+use crate::tools::sandboxing::ApprovalAction;
 use crate::tools::sandboxing::ExecApprovalRequirement;
-use crate::tools::sandboxing::PermissionRequestPayload;
 use crate::tools::sandboxing::SandboxAttempt;
 use crate::tools::sandboxing::Sandboxable;
 use crate::tools::sandboxing::ToolCtx;
@@ -38,21 +36,22 @@ use crate::tools::sandboxing::ToolError;
 use crate::tools::sandboxing::ToolRuntime;
 use crate::tools::sandboxing::managed_network_for_sandbox_permissions;
 use crate::tools::sandboxing::sandbox_permissions_preserving_denied_reads;
-use crate::tools::sandboxing::with_cached_approval;
+use codex_core_plugins::PluginMetricsSidecar;
 use codex_network_proxy::NetworkProxy;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::models::AdditionalPermissionProfile;
-use codex_protocol::protocol::ReviewDecision;
 use codex_sandboxing::SandboxablePreference;
+use codex_sandboxing::policy_transforms::merge_permission_profiles;
 use codex_shell_command::powershell::prefix_powershell_script_with_utf8;
 use codex_utils_absolute_path::AbsolutePathBuf;
-use futures::future::BoxFuture;
+use codex_utils_path_uri::PathUri;
 use std::collections::HashMap;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Debug)]
 pub struct ShellRequest {
     pub command: Vec<String>,
+    pub turn_environment: TurnEnvironment,
     pub shell_type: Option<ShellType>,
     pub hook_command: String,
     pub cwd: AbsolutePathBuf,
@@ -91,10 +90,11 @@ pub struct ShellRuntime {
 
 #[derive(serde::Serialize, Clone, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct ApprovalKey {
-    command: Vec<String>,
-    cwd: AbsolutePathBuf,
-    sandbox_permissions: SandboxPermissions,
-    additional_permissions: Option<AdditionalPermissionProfile>,
+    pub(crate) environment_id: String,
+    pub(crate) command: Vec<String>,
+    pub(crate) cwd: PathUri,
+    pub(crate) sandbox_permissions: SandboxPermissions,
+    pub(crate) additional_permissions: Option<AdditionalPermissionProfile>,
 }
 
 impl ShellRuntime {
@@ -104,7 +104,7 @@ impl ShellRuntime {
 
     fn stdout_stream(ctx: &ToolCtx) -> Option<crate::exec::StdoutStream> {
         Some(crate::exec::StdoutStream {
-            sub_id: ctx.turn.sub_id.clone(),
+            sub_id: ctx.step_context.turn.sub_id.clone(),
             call_id: ctx.call_id.clone(),
             tx_event: ctx.session.get_tx_event(),
         })
@@ -121,81 +121,29 @@ impl Sandboxable for ShellRuntime {
 }
 
 impl Approvable<ShellRequest> for ShellRuntime {
-    type ApprovalKey = ApprovalKey;
-
-    fn approval_keys(&self, req: &ShellRequest) -> Vec<Self::ApprovalKey> {
-        vec![ApprovalKey {
-            command: canonicalize_command_for_approval(&req.command),
-            cwd: req.cwd.clone(),
+    fn approval_action(
+        &self,
+        req: &ShellRequest,
+        call_id: &str,
+    ) -> std::io::Result<ApprovalAction> {
+        Ok(ApprovalAction::Shell {
+            id: call_id.to_string(),
+            environment_id: req.turn_environment.environment_id.clone(),
+            command: req.command.clone(),
+            hook_command: req.hook_command.clone(),
+            cwd: PathUri::from_abs_path(&req.cwd),
             sandbox_permissions: req.sandbox_permissions,
             additional_permissions: req.additional_permissions.clone(),
-        }]
-    }
-
-    fn start_approval_async<'a>(
-        &'a mut self,
-        req: &'a ShellRequest,
-        ctx: ApprovalCtx<'a>,
-    ) -> BoxFuture<'a, ReviewDecision> {
-        let keys = self.approval_keys(req);
-        let command = req.command.clone();
-        let cwd = req.cwd.clone();
-        let retry_reason = ctx.retry_reason.clone();
-        let reason = retry_reason.clone().or_else(|| req.justification.clone());
-        let session = ctx.session;
-        let turn = ctx.turn;
-        let call_id = ctx.call_id.to_string();
-        let guardian_review_id = ctx.guardian_review_id.clone();
-        Box::pin(async move {
-            if let Some(review_id) = guardian_review_id {
-                return review_approval_request(
-                    session,
-                    turn,
-                    review_id,
-                    GuardianApprovalRequest::Shell {
-                        id: call_id,
-                        command,
-                        cwd: cwd.clone(),
-                        sandbox_permissions: req.sandbox_permissions,
-                        additional_permissions: req.additional_permissions.clone(),
-                        justification: req.justification.clone(),
-                    },
-                    retry_reason,
-                )
-                .await;
-            }
-            with_cached_approval(&session.services, "shell", keys, move || async move {
-                let available_decisions = None;
-                session
-                    .request_command_approval(
-                        turn,
-                        call_id,
-                        /*approval_id*/ None,
-                        command,
-                        cwd,
-                        reason,
-                        ctx.network_approval_context.clone(),
-                        req.exec_approval_requirement
-                            .proposed_execpolicy_amendment()
-                            .cloned(),
-                        req.additional_permissions.clone(),
-                        available_decisions,
-                    )
-                    .await
-            })
-            .await
+            justification: req.justification.clone(),
+            proposed_execpolicy_amendment: req
+                .exec_approval_requirement
+                .proposed_execpolicy_amendment()
+                .cloned(),
         })
     }
 
     fn exec_approval_requirement(&self, req: &ShellRequest) -> Option<ExecApprovalRequirement> {
         Some(req.exec_approval_requirement.clone())
-    }
-
-    fn permission_request_payload(&self, req: &ShellRequest) -> Option<PermissionRequestPayload> {
-        Some(PermissionRequestPayload::bash(
-            req.hook_command.clone(),
-            req.justification.clone(),
-        ))
     }
 
     fn sandbox_permissions(&self, req: &ShellRequest) -> SandboxPermissions {
@@ -204,12 +152,19 @@ impl Approvable<ShellRequest> for ShellRuntime {
 }
 
 impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
+    fn turn_environment<'a>(&self, req: &'a ShellRequest) -> &'a TurnEnvironment {
+        &req.turn_environment
+    }
+
     fn network_approval_spec(
         &self,
         req: &ShellRequest,
         ctx: &ToolCtx,
     ) -> Option<NetworkApprovalSpec> {
-        let file_system_sandbox_policy = ctx.turn.file_system_sandbox_policy();
+        let file_system_sandbox_policy = req
+            .turn_environment
+            .permission_profile()
+            .file_system_sandbox_policy();
         let sandbox_permissions = sandbox_permissions_preserving_denied_reads(
             req.sandbox_permissions,
             &file_system_sandbox_policy,
@@ -230,6 +185,8 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
                 tty: None,
             },
             command: req.hook_command.clone(),
+            environment_id: req.turn_environment.environment_id.clone(),
+            permission_profile: req.turn_environment.permission_profile().clone(),
         })
     }
 
@@ -240,6 +197,12 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
         ctx: &ToolCtx,
     ) -> Result<ExecToolCallOutput, ToolError> {
         let session_shell = ctx.session.user_shell();
+        let shell = req
+            .turn_environment
+            .shell
+            .as_ref()
+            .unwrap_or(session_shell.as_ref());
+        let shell_snapshot_location = req.turn_environment.shell_snapshot(&req.cwd);
         let (file_system_sandbox_policy, _) = attempt.permissions.to_runtime_permissions();
         let sandbox_permissions = sandbox_permissions_preserving_denied_reads(
             req.sandbox_permissions,
@@ -247,8 +210,20 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
         );
         let managed_network =
             managed_network_for_sandbox_permissions(req.network.as_ref(), sandbox_permissions);
-        let env = exec_env_for_sandbox_permissions(&req.env, sandbox_permissions);
+        let mut env = exec_env_for_sandbox_permissions(&req.env, sandbox_permissions);
         let explicit_env_overrides = req.explicit_env_overrides.clone();
+        let metrics_sidecar = (!req.turn_environment.environment.is_remote()
+            && ctx.session.services.analytics_events_client.is_enabled())
+        .then(|| {
+            ctx.step_context
+                .turn
+                .plugin_metrics_operation_for_command(&req.command, &req.cwd)
+        })
+        .flatten()
+        .and_then(PluginMetricsSidecar::create);
+        if let Some(sidecar) = metrics_sidecar.as_ref() {
+            sidecar.install_output_env(&mut env);
+        }
         #[cfg(unix)]
         let (env, runtime_path_prepends) = {
             let mut env = env;
@@ -268,8 +243,8 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
         let runtime_path_prepends = RuntimePathPrepends::default();
         let command = maybe_wrap_shell_lc_with_snapshot(
             &req.command,
-            session_shell.as_ref(),
-            &req.cwd,
+            shell,
+            shell_snapshot_location.as_ref(),
             &explicit_env_overrides,
             &env,
             &runtime_path_prepends,
@@ -277,43 +252,79 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
         let command = disable_powershell_profile_for_elevated_windows_sandbox(
             &command,
             req.shell_type.as_ref(),
-            attempt.sandbox,
+            attempt.sandbox_requested,
             attempt.windows_sandbox_level,
         );
-        let command = if matches!(session_shell.shell_type, ShellType::PowerShell) {
+        let command = if matches!(shell.shell_type, ShellType::PowerShell) {
             prefix_powershell_script_with_utf8(&command)
         } else {
             command
         };
 
-        if self.backend == ShellRuntimeBackend::ShellCommandZshFork {
-            match zsh_fork_backend::maybe_run_shell_command(req, attempt, ctx, &command).await? {
-                Some(out) => return Ok(out),
+        let zsh_fork_output = if self.backend == ShellRuntimeBackend::ShellCommandZshFork {
+            match zsh_fork_backend::maybe_run_shell_command(
+                req,
+                attempt,
+                ctx,
+                &command,
+                metrics_sidecar.as_ref(),
+            )
+            .await?
+            {
+                Some(out) => Some(out),
                 None => {
                     tracing::warn!(
                         "ZshFork backend specified, but conditions for using it were not met, falling back to normal execution",
                     );
+                    None
                 }
             }
-        }
-
-        let command =
-            build_sandbox_command(&command, &req.cwd, &env, req.additional_permissions.clone())?;
-        let mut expiration: crate::exec::ExecExpiration = req.timeout_ms.into();
-        expiration = expiration.with_cancellation(req.cancellation_token.clone());
-        if let Some(cancellation) = attempt.network_denial_cancellation_token.clone() {
-            expiration = expiration.with_cancellation(cancellation);
-        }
-        let options = ExecOptions {
-            expiration,
-            capture_policy: ExecCapturePolicy::ShellTool,
+        } else {
+            None
         };
-        let env = attempt
-            .env_for(command, options, managed_network)
-            .map_err(|err| ToolError::Codex(err.into()))?;
-        let out = execute_env(env, Self::stdout_stream(ctx))
-            .await
-            .map_err(ToolError::Codex)?;
+        let out = if let Some(out) = zsh_fork_output {
+            out
+        } else {
+            let sidecar_permissions = metrics_sidecar
+                .as_ref()
+                .map(PluginMetricsSidecar::additional_permissions);
+            let additional_permissions = merge_permission_profiles(
+                req.additional_permissions.as_ref(),
+                sidecar_permissions.as_ref(),
+            );
+            let command = build_sandbox_command(&command, &req.cwd, &env, additional_permissions)?;
+            let mut expiration: crate::exec::ExecExpiration = req.timeout_ms.into();
+            expiration = expiration.with_cancellation(req.cancellation_token.clone());
+            if let Some(cancellation) = attempt.network_denial_cancellation_token.clone() {
+                expiration = expiration.with_cancellation(cancellation);
+            }
+            let options = ExecOptions {
+                expiration,
+                capture_policy: ExecCapturePolicy::ShellTool,
+            };
+            let env = attempt
+                .env_for(
+                    command,
+                    options,
+                    managed_network,
+                    Some(&req.turn_environment.environment_id),
+                )
+                .map_err(ToolError::Codex)?;
+            execute_env(env, Self::stdout_stream(ctx))
+                .await
+                .map_err(ToolError::Codex)?
+        };
+        finish_and_track_measurements(
+            metrics_sidecar,
+            out.exit_code,
+            &ctx.session,
+            &ctx.step_context.turn,
+            &ctx.call_id,
+        );
         Ok(out)
     }
 }
+
+#[cfg(test)]
+#[path = "shell_tests.rs"]
+mod tests;
