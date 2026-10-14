@@ -1,5 +1,17 @@
 # Upstream paths the fork is allowed to modify.
-allowlist = ["codex-rs/Cargo.toml", "codex-rs/cli/src/main.rs", "codex-rs/cli/build.rs", "codex-rs/core/src/tools/router.rs", "codex-rs/core/src/tools/router_tests.rs", "codex-rs/model-provider/src/provider.rs", "codex-rs/model-provider/src/lib.rs"]
+allowlist = [
+    "codex-rs/Cargo.toml",
+    "codex-rs/cli/src/main.rs",
+    "codex-rs/cli/build.rs",
+    "codex-rs/core/src/tools/router.rs",
+    "codex-rs/core/src/tools/router_tests.rs",
+    "codex-rs/model-provider/src/provider.rs",
+    "codex-rs/model-provider/src/lib.rs",
+    "codex-rs/core/src/lib.rs",
+    "codex-rs/core/src/session/mod.rs",
+    "codex-rs/tui/src/lib.rs",
+    "codex-rs/tui/src/resume_picker.rs",
+]
 generated = ["codex-rs/Cargo.lock"]
 
 [budget]

@@ -3871,6 +3871,7 @@ dependencies = [
  "codex-http-client",
  "codex-install-context",
  "codex-local-models",
+ "codex-local-resume",
  "codex-login",
  "codex-mcp",
  "codex-memories-write",
