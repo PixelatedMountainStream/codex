@@ -3870,6 +3870,7 @@ dependencies = [
  "codex-home",
  "codex-http-client",
  "codex-install-context",
+ "codex-local-models",
  "codex-login",
  "codex-mcp",
  "codex-memories-write",
@@ -3928,6 +3929,7 @@ name = "codex-local-models"
 version = "0.162.1"
 dependencies = [
  "codex-http-client",
+ "codex-login",
  "codex-model-provider",
  "codex-model-provider-info",
  "codex-models-manager",

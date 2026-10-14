@@ -23,6 +23,7 @@ test = false
 
 [dependencies]
 codex-cli = { path = "../../cli" }
+codex-local-models = { path = "../models" }
 dirs = { workspace = true }
 toml_edit = { workspace = true }
 codex-utils-process = { workspace = true }
