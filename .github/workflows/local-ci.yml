@@ -1,0 +1,93 @@
+# Fork-only CI for codex-local. The inherited upstream workflows are disabled.
+# The stack lands piecewise, so steps whose script/crate is missing are skipped.
+name: local-ci
+
+on:
+  pull_request:
+    branches: [codex-local/main, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: local-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  surface:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch pinned upstream tag
+        run: |
+          set -euo pipefail
+          tag="$(tr -d '[:space:]' < local/UPSTREAM_VERSION)"
+          git fetch --no-tags https://github.com/openai/codex.git "refs/tags/${tag}:refs/tags/${tag}"
+      - name: Check fork surface
+        if: hashFiles('local/scripts/check_fork_surface.py') != ''
+        run: python3 local/scripts/check_fork_surface.py
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: unittest discover
+        if: hashFiles('local/tests/**/*.py') != ''
+        run: python3 -m unittest discover -s local/tests
+      - name: test_check_fork_surface
+        if: hashFiles('local/scripts/test_check_fork_surface.py') != ''
+        run: python3 local/scripts/test_check_fork_surface.py
+
+  rust:
+    name: rust (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    defaults:
+      run:
+        shell: bash
+        working-directory: codex-rs
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install toolchain from rust-toolchain.toml
+        run: |
+          set -euo pipefail
+          channel="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "${channel}" --profile minimal --target "${{ matrix.target }}"
+          rustup default "${channel}"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: codex-rs
+      - name: Local crate tests
+        run: cargo test -p codex-local-cli -p codex-local-models -p codex-local-resume
+      - name: Hook test, tool-name unflatten
+        run: cargo test -p codex-core --lib unflatten_tool_name
+      - name: Hook test, model provider factory
+        run: cargo test -p codex-model-provider local_models_factory
+      - name: Build codex-local
+        run: cargo build --bin codex-local -p codex-local-cli
+      - name: verify_install --quick
+        if: hashFiles('local/scripts/verify_install.py') != ''
+        working-directory: .
+        run: |
+          set -euo pipefail
+          exe="codex-rs/target/debug/codex-local"
+          if [ "${RUNNER_OS}" = "Windows" ]; then exe="${exe}.exe"; fi
+          python3 local/scripts/verify_install.py --quick --binary "${exe}"
