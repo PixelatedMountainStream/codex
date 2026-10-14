@@ -46,6 +46,9 @@ jobs:
         with:
           ref: codex-local/main
           fetch-depth: 0
+          # No persisted GITHUB_TOKEN auth header: it would override the
+          # UPSTREAM_SYNC_TOKEN credentials used by the push step below.
+          persist-credentials: false
 
       - name: Configure git and upstream remote
         run: |

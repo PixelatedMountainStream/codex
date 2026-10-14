@@ -11,6 +11,14 @@
 | H7 | TODO | TODO | TODO |
 | H8 | `codex-rs/core/src/tools/router.rs` | `ToolRouter::unflatten_tool_name` (+1 call in `dispatch_tool_call_with_code_mode_result_inner`): when a call has no/default namespace, its dotted name misses the registry, and the split at the first dot hits, dispatch under the split `(namespace, name)`. Works around Ollama flattening Responses `namespace` into the name (`multi_agent_v1.spawn_agent`). Unconditional: OpenAI names match `^[a-zA-Z0-9_-]+$`, so stock behaviour is unchanged. History keeps the model's original item. 16 upstream lines in router.rs (tests in router_tests.rs). Re-apply: add the method and call it on `tool_name` right after destructuring `call`. | done |
 
+## Hook tests
+
+One line per hook, read by `local/scripts/sync_upstream.py check` and the rust job in `local-ci.yml`. H1 and H4 have no dedicated test.
+
+- Tests: `cargo test -p codex-model-provider local_models_factory` (H2)
+- Tests: `cargo test -p codex-local-resume` (H3)
+- Tests: `cargo test -p codex-core --lib unflatten_tool_name` (H8)
+
 ## H1 re-apply recipe
 
 1. In `codex-rs/cli/src/main.rs`: add `#[cfg(not(codex_local))]` above `fn main`; change `cli_main` to take a leading `argv: Vec<std::ffi::OsString>`; replace `MultitoolCli::parse()` with `MultitoolCli::parse_from(argv)`; pass `std::env::args_os().collect()` from `main`.

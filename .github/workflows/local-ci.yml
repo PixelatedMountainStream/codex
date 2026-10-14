@@ -77,10 +77,12 @@ jobs:
           workspaces: codex-rs
       - name: Local crate tests
         run: cargo test -p codex-local-cli -p codex-local-models -p codex-local-resume
-      - name: Hook test, tool-name unflatten
-        run: cargo test -p codex-core --lib unflatten_tool_name
-      - name: Hook test, model provider factory
-        run: cargo test -p codex-model-provider local_models_factory
+      - name: Hook tests (Tests lines in local/FORK_SURFACE.md)
+        run: |
+          set -euo pipefail
+          grep -E '^[^A-Za-z0-9]*Tests?:' ../local/FORK_SURFACE.md \
+            | sed -E 's/.*`(cargo test [^`]+)`.*/\1/' \
+            | while read -r cmd; do echo "+ ${cmd}"; ${cmd}; done
       - name: Build codex-local
         run: cargo build --bin codex-local -p codex-local-cli
       - name: verify_install --quick
