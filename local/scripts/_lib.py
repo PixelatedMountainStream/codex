@@ -123,11 +123,12 @@ def stock_codex() -> str | None:
 
 
 def ollama_root(env=None, local_cfg: Path | None = None) -> str:
-    """Resolve the Ollama root: env CODEX_LOCAL_OLLAMA_URL, OLLAMA_HOST, config.toml, default."""
+    """Resolve the Ollama root: env CODEX_LOCAL_OLLAMA_URL, OLLAMA_HOST, then `base_url` of
+    [model_providers.codex-local] in config.toml (codex-local keeps no `ollama_url` key), default."""
     env = os.environ if env is None else env
     raw = env.get("CODEX_LOCAL_OLLAMA_URL") or env.get("OLLAMA_HOST")
     if not raw and local_cfg and local_cfg.is_file():
-        m = re.search(r'^\s*ollama_(?:url|base_url)\s*=\s*"([^"]+)"',
+        m = re.search(r'^\s*base_url\s*=\s*"([^"]+)"',
                       local_cfg.read_text(encoding="utf-8", errors="replace"), re.M)
         raw = m.group(1) if m else None
     raw = (raw or DEFAULT_OLLAMA_URL).strip()

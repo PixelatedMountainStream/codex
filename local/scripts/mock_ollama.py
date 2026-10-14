@@ -6,7 +6,7 @@ Serves: GET /api/tags, /api/version, /v1/models; POST /api/show; POST /v1/respon
 
 Scope: the minimum event sequence for a single text reply (created, output_item.added,
 output_text.delta, output_item.done, completed with usage). No tool calls, no chat
-completions. Not validated against a real codex-local build yet.
+completions. Validated against a real codex-local build (verify_install --quick).
 """
 
 from __future__ import annotations
