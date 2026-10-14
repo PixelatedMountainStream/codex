@@ -156,6 +156,7 @@ members = [
     "codex-experimental-api-macros",
     "plugin",
     "model-provider",
+    "local/*",
 ]
 resolver = "2"
 
