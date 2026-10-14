@@ -344,6 +344,21 @@ impl ToolRouter {
         .await
     }
 
+    /// codex-local H8: some backends (Ollama) flatten `namespace` into the name
+    /// as `ns.tool`. Split only when the literal name misses but the split hits.
+    pub(crate) fn unflatten_tool_name(&self, name: ToolName) -> ToolName {
+        match name.name.split_once('.') {
+            Some((ns, n))
+                if name.is_default_namespace()
+                    && self.registry.tool(&name).is_none()
+                    && self.registry.tool(&ToolName::namespaced(ns, n)).is_some() =>
+            {
+                ToolName::namespaced(ns, n)
+            }
+            _ => name,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn dispatch_tool_call_with_code_mode_result_inner(
         &self,
@@ -361,6 +376,7 @@ impl ToolRouter {
             payload,
             ..
         } = call;
+        let tool_name = self.unflatten_tool_name(tool_name);
 
         // Keep the legacy ToolInvocation.turn field tied to the same request state until handlers migrate.
         let turn = Arc::clone(&step_context.turn);
