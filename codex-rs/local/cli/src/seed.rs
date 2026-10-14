@@ -37,7 +37,11 @@ pub(crate) fn seed_toml(root: &str, stock_home: &str) -> Result<String> {
     );
     t.insert(
         "features".into(),
-        table([("multi_agent", Value::Boolean(true))]),
+        table([
+            ("multi_agent", Value::Boolean(true)),
+            // Gates the startup chatgpt.com featured/recommended-plugins fetches.
+            ("plugins", Value::Boolean(false)),
+        ]),
     );
     t.insert("agents".into(), table([("max_threads", Value::Integer(4))]));
     t.insert(
