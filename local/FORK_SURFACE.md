@@ -9,7 +9,7 @@
 | H5 | TODO | TODO | TODO |
 | H6 | TODO | TODO | TODO |
 | H7 | TODO | TODO | TODO |
-| H8 | `codex-rs/core/src/tools/router.rs` | `ToolRouter::unflatten_tool_name` (+1 call in `dispatch_tool_call_with_code_mode_result_inner`): when a call has no/default namespace, its dotted name misses the registry, and the split at the first dot hits, dispatch under the split `(namespace, name)`. Works around Ollama flattening Responses `namespace` into the name (`multi_agent_v1.spawn_agent`). Unconditional: OpenAI names match `^[a-zA-Z0-9_-]+$`, so stock behaviour is unchanged. History keeps the model's original item. 15 upstream lines in router.rs (tests in router_tests.rs). Re-apply: add the method and call it on `tool_name` right after destructuring `call`. | done |
+| H8 | `codex-rs/core/src/tools/router.rs` | `ToolRouter::unflatten_tool_name` (+1 call in `dispatch_tool_call_with_code_mode_result_inner`): when a call has no/default namespace, its dotted name misses the registry, and the split at the first dot hits, dispatch under the split `(namespace, name)`. Works around Ollama flattening Responses `namespace` into the name (`multi_agent_v1.spawn_agent`). Unconditional: OpenAI names match `^[a-zA-Z0-9_-]+$`, so stock behaviour is unchanged. History keeps the model's original item. 16 upstream lines in router.rs (tests in router_tests.rs). Re-apply: add the method and call it on `tool_name` right after destructuring `call`. | done |
 
 ## H1 re-apply recipe
 
