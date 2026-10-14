@@ -38,6 +38,7 @@ allow = [
 generated = ["codex-rs/Cargo.lock"]
 
 [budget]
-# Spike-pass budget plus H8.
-max_lines = 91
-max_files = 8
+# Measured 122 lines / 11 files across H1-H4 and H8 (Cargo.toml 1, H1 14, H2 36, H3 19, H4 18,
+# H8 34 incl. tests) plus ~10% headroom.
+max_lines = 135
+max_files = 12
