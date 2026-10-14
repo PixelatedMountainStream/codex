@@ -1028,17 +1028,26 @@ fn stage_str(stage: Stage) -> &'static str {
     }
 }
 
+// codex-local: `codex-local-cli` includes this file as its crate root and calls
+// `cli_main` with its own argv; see local/FORK_SURFACE.md (H1).
+#[cfg(not(codex_local))]
 fn main() -> anyhow::Result<()> {
     codex_build_info::initialize!();
     let remote_control_disabled = codex_app_server::take_remote_control_disabled_env();
     arg0_dispatch_or_else(move |arg0_paths: Arg0DispatchPaths| async move {
         // Keep the CLI dispatcher off the runtime's stack while the TUI rebuilds a thread.
-        Box::pin(cli_main(arg0_paths, remote_control_disabled)).await?;
+        Box::pin(cli_main(
+            std::env::args_os().collect(),
+            arg0_paths,
+            remote_control_disabled,
+        ))
+        .await?;
         Ok(())
     })
 }
 
 async fn cli_main(
+    argv: Vec<std::ffi::OsString>,
     arg0_paths: Arg0DispatchPaths,
     remote_control_disabled: bool,
 ) -> anyhow::Result<()> {
@@ -1048,7 +1057,7 @@ async fn cli_main(
         remote,
         mut interactive,
         subcommand,
-    } = MultitoolCli::parse();
+    } = MultitoolCli::parse_from(argv);
     // Retain the launch target through TUI exit, even if a launcher changes selection.
     let daemon_cli_executable = arg0_paths
         .codex_self_exe

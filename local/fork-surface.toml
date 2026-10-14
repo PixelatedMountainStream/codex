@@ -1,5 +1,5 @@
 # Upstream paths the fork is allowed to modify.
-allowlist = ["codex-rs/Cargo.toml"]
+allowlist = ["codex-rs/Cargo.toml", "codex-rs/cli/src/main.rs", "codex-rs/cli/build.rs"]
 generated = ["codex-rs/Cargo.lock"]
 
 [budget]
