@@ -9,3 +9,12 @@ workspace = true
 
 [lib]
 doctest = false
+
+[dependencies]
+codex-core = { workspace = true }
+codex-protocol = { workspace = true }
+codex-tui = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

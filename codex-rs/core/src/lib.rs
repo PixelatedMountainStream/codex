@@ -19,6 +19,7 @@ pub use responses_headers::CodexResponsesHeaders;
 mod responses_metadata;
 mod responses_retry;
 pub(crate) mod session;
+pub use session::RESUME_HISTORY_TRANSFORM;
 pub use codex_protocol::turn_input::NotSubmittedReason;
 pub use codex_protocol::turn_input::RecoverTurnRequest;
 pub use codex_protocol::turn_input::StartIfIdleSubmission;

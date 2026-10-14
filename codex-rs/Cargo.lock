@@ -3943,6 +3943,13 @@ dependencies = [
 [[package]]
 name = "codex-local-resume"
 version = "0.162.1"
+dependencies = [
+ "codex-core",
+ "codex-protocol",
+ "codex-tui",
+ "serde_json",
+ "tracing",
+]
 
 [[package]]
 name = "codex-login"

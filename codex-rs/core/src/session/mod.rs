@@ -7,9 +7,14 @@ use std::collections::HashSet;
 use std::fmt::Debug;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicU64;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
+
+/// codex-local hook (H3): resume/fork history transform.
+pub static RESUME_HISTORY_TRANSFORM: OnceLock<fn(Vec<ResponseItem>) -> Vec<ResponseItem>> =
+    OnceLock::new();
 
 use crate::agent::AgentStatus;
 use crate::agent::agent_status_from_event;
@@ -1776,6 +1781,19 @@ impl Session {
         } = self
             .reconstruct_history_from_rollout(turn_context, rollout_items)
             .await;
+        if let Some(transform) = RESUME_HISTORY_TRANSFORM.get() {
+            history = history
+                .into_iter()
+                .flat_map(|e| {
+                    transform(vec![e.item])
+                        .into_iter()
+                        .map(move |item| ResponseItemEnvelope {
+                            item,
+                            metadata: e.metadata.clone(),
+                        })
+                })
+                .collect();
+        }
         // Keep the recorded rollout unchanged. Prepare its reconstructed history before
         // installing it, so legacy media is processed once for this resume or fork and
         // will be processed again if the rollout is reconstructed in a future session.
