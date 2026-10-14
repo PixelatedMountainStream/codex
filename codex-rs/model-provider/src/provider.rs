@@ -357,6 +357,18 @@ pub fn create_model_provider(
     ))
 }
 
+/// codex-local hook H2: factory registered by `codex-local-cli`, used only for `codex-local`.
+pub type LocalModelsFactory = fn(&ModelProviderInfo) -> SharedModelsManager;
+static LOCAL_MODELS_FACTORY: std::sync::OnceLock<LocalModelsFactory> = std::sync::OnceLock::new();
+
+pub fn register_local_models_factory(factory: LocalModelsFactory) {
+    let _ = LOCAL_MODELS_FACTORY.set(factory);
+}
+
+fn local_models_manager(info: &ModelProviderInfo) -> Option<SharedModelsManager> {
+    (info.name == "codex-local").then(|| LOCAL_MODELS_FACTORY.get().map(|f| f(info)))?
+}
+
 /// Runtime model provider that orchestrates primary and gateway credentials.
 #[derive(Clone, Debug)]
 struct ConfiguredModelProvider {
@@ -395,6 +407,9 @@ impl ConfiguredModelProvider {
                 self.auth_manager.clone(),
                 model_catalog,
             ));
+        }
+        if let Some(manager) = local_models_manager(&self.info) {
+            return manager;
         }
         let endpoint = Arc::new(OpenAiModelsEndpoint::new(
             self.info.clone(),
@@ -1402,5 +1417,24 @@ printf '%s\n' '{"AccessKeyId":"exported","SecretAccessKey":"secret"}'
                 );
             }
         }
+    }
+
+    #[test]
+    fn local_models_factory_is_consulted_only_for_codex_local() {
+        static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        fn factory(_: &ModelProviderInfo) -> SharedModelsManager {
+            CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Arc::new(StaticModelsManager::new(None, ModelsResponse::default()))
+        }
+        let named = |name: &str| ModelProviderInfo {
+            name: name.to_string(),
+            ..Default::default()
+        };
+        assert!(local_models_manager(&named("codex-local")).is_none());
+        register_local_models_factory(factory);
+        assert!(local_models_manager(&named("openai")).is_none());
+        assert_eq!(CALLS.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(local_models_manager(&named("codex-local")).is_some());
+        assert_eq!(CALLS.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }
