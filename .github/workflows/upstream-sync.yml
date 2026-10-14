@@ -1,0 +1,192 @@
+# upstream-sync: merges the newest upstream rust-v* release into codex-local/main via PR.
+#
+# Secret UPSTREAM_SYNC_TOKEN (optional but needed for some merges): a PAT or GitHub App token
+# with `contents`, `pull requests` and `workflows` scope. Used to push the sync branch and open
+# the PR. GITHUB_TOKEN cannot push changes to .github/workflows/**, so when the upstream range
+# touches workflow files and this secret is unset, the run fails early with a clear message.
+# When the upstream range does not touch workflows, GITHUB_TOKEN is used as a fallback.
+name: upstream-sync
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream tag to sync (default: newest stable rust-v*)"
+        required: false
+        type: string
+      force:
+        description: "Sync even if the tag is not newer than local/UPSTREAM_VERSION"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+env:
+  BASE: codex-local/main
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex-local/main
+          fetch-depth: 0
+
+      - name: Configure git and upstream remote
+        run: |
+          git config user.name "codex-local upstream-sync"
+          git config user.email "upstream-sync@users.noreply.github.com"
+          git remote add upstream https://github.com/openai/codex.git
+          git fetch upstream --tags --quiet
+
+      - name: Status
+        id: status
+        env:
+          TAG_INPUT: ${{ inputs.tag }}
+          FORCE_INPUT: ${{ inputs.force }}
+        run: |
+          set -o pipefail
+          args=()
+          [ -n "$TAG_INPUT" ] && args+=(--tag "$TAG_INPUT")
+          [ "$FORCE_INPUT" = "true" ] && args+=(--force)
+          python3 local/scripts/sync_upstream.py status "${args[@]}" | tee status.json
+          echo "new=$(jq -r .new_release status.json)" >> "$GITHUB_OUTPUT"
+          echo "tag=$(jq -r .latest status.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Require UPSTREAM_SYNC_TOKEN when workflows change
+        if: steps.status.outputs.new == 'true'
+        env:
+          SYNC_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+          TAG: ${{ steps.status.outputs.tag }}
+        run: |
+          changed="$(git diff --name-only "$(git merge-base HEAD "$TAG")" "$TAG" -- .github/workflows)"
+          if [ -n "$changed" ] && [ -z "$SYNC_TOKEN" ]; then
+            echo "::error title=UPSTREAM_SYNC_TOKEN required::Upstream $TAG changes .github/workflows/** but secret UPSTREAM_SYNC_TOKEN (PAT or App token with workflows scope) is not set; GITHUB_TOKEN cannot push workflow changes. Add the secret and re-run."
+            printf 'Workflow files changed upstream:\n%s\n' "$changed"
+            exit 1
+          fi
+
+      - name: Install Rust toolchain
+        if: steps.status.outputs.new == 'true'
+        run: |
+          channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' codex-rs/rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal -c clippy -c rustfmt
+          rustup default "$channel"
+
+      - uses: Swatinem/rust-cache@v2
+        if: steps.status.outputs.new == 'true'
+        with:
+          workspaces: codex-rs
+
+      - name: Merge
+        id: merge
+        if: steps.status.outputs.new == 'true'
+        continue-on-error: true
+        env:
+          TAG: ${{ steps.status.outputs.tag }}
+        run: |
+          set +e
+          python3 local/scripts/sync_upstream.py merge "$TAG" | tee merge.json
+          echo "code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Check
+        id: check
+        if: steps.status.outputs.new == 'true' && steps.merge.outputs.code == '0'
+        run: |
+          set +e
+          python3 local/scripts/sync_upstream.py check --repo "$GITHUB_REPOSITORY" | tee check.json
+          echo "code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Report
+        id: report
+        if: steps.status.outputs.new == 'true'
+        env:
+          TAG: ${{ steps.status.outputs.tag }}
+          MERGE_CODE: ${{ steps.merge.outputs.code }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # merge.json is the report input when the merge itself failed.
+          src=check.json; [ "$MERGE_CODE" = "0" ] || src=merge.json
+          if [ "$MERGE_CODE" != "0" ]; then
+            # conflicts left in the index: record them, abort the half-done merge
+            git merge --abort 2>/dev/null || true
+            git checkout -q "$BASE" 2>/dev/null || true
+          fi
+          python3 - "$src" <<'PY'
+          import json, os, sys
+          d = json.load(open(sys.argv[1]))
+          lines = [f"## Upstream sync: {os.environ['TAG']}", "",
+                   f"Result: {'PASS' if d['ok'] else 'FAIL'} (step {d['step']})", ""]
+          for k in ("conflicts", "build_errors", "test_failures", "surface_violations"):
+              lines += [f"### {k}"] + ([f"- `{x}`" for x in d[k]] or ["- none"]) + [""]
+          lines += [f"Next action: {d['next_action']}", "",
+                    f"Run: {os.environ['RUN_URL']}"]
+          open("report.md", "w").write("\n".join(lines) + "\n")
+          PY
+
+      - name: Open PR (success)
+        if: steps.status.outputs.new == 'true' && steps.merge.outputs.code == '0' && steps.check.outputs.code == '0'
+        env:
+          TAG: ${{ steps.status.outputs.tag }}
+          SYNC_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+        run: |
+          tag="$TAG"
+          branch="upstream-sync/$tag"
+          # PAT/App token (workflows scope) when set, else GITHUB_TOKEN.
+          token="${SYNC_TOKEN:-$GH_TOKEN}"
+          export GH_TOKEN="$token"
+          git push "https://x-access-token:${token}@github.com/${GITHUB_REPOSITORY}.git" "$branch"
+          # Supersede older sync PRs.
+          gh pr list --state open --json number,headRefName \
+            --jq ".[] | select(.headRefName | startswith(\"upstream-sync/\")) | select(.headRefName != \"$branch\") | .number" |
+            while read -r n; do
+              gh pr close "$n" --delete-branch --comment "Superseded by $tag."
+            done
+          gh pr create --base "$BASE" --head "$branch" \
+            --title "Upstream sync: $tag" --body-file report.md
+
+      - name: Open or update issue (failure)
+        if: steps.status.outputs.new == 'true' && (steps.merge.outputs.code != '0' || steps.check.outputs.code != '0')
+        env:
+          TAG: ${{ steps.status.outputs.tag }}
+          MERGE_CODE: ${{ steps.merge.outputs.code }}
+          SYNC_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+        run: |
+          tag="$TAG"
+          branch="upstream-sync/$tag"
+          token="${SYNC_TOKEN:-$GH_TOKEN}"
+          export GH_TOKEN="$token"
+          # Keep the repair branch only when the merge itself completed.
+          if [ "$MERGE_CODE" = "0" ]; then
+            git push --force "https://x-access-token:${token}@github.com/${GITHUB_REPOSITORY}.git" "$branch"
+          fi
+          gh pr list --state open --json number,headRefName \
+            --jq ".[] | select(.headRefName | startswith(\"upstream-sync/\")) | select(.headRefName != \"$branch\") | .number" |
+            while read -r n; do
+              gh pr close "$n" --delete-branch --comment "Superseded by $tag."
+            done
+          gh label create upstream-sync --color 0e8a16 --description "Upstream sync tracking" 2>/dev/null || true
+          n=$(gh issue list --label upstream-sync --state open --json number --jq '.[0].number')
+          if [ -n "$n" ]; then
+            gh issue edit "$n" --title "Upstream sync needs repair: $tag"
+            gh issue comment "$n" --body-file report.md
+          else
+            gh issue create --label upstream-sync --title "Upstream sync needs repair: $tag" --body-file report.md
+          fi
