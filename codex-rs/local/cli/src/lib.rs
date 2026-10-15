@@ -4,6 +4,7 @@
 mod homes;
 mod links;
 mod overrides;
+mod preflight;
 mod seed;
 mod sync;
 mod url;
@@ -18,6 +19,8 @@ pub use homes::resolve_homes;
 pub use links::ensure_home;
 pub use links::refresh_skills;
 pub use overrides::apply_overrides;
+pub use preflight::check as preflight_check;
+pub use preflight::failure_message as preflight_failure_message;
 pub use seed::seed_config;
 pub use sync::sync_config;
 pub use url::resolve_ollama_root;
@@ -56,6 +59,8 @@ pub enum Action {
     Run {
         argv: Vec<OsString>,
         codex_home: PathBuf,
+        /// Ollama root to probe before delegating; `None` skips the preflight.
+        preflight_root: Option<String>,
     },
 }
 
@@ -74,11 +79,37 @@ pub fn prepare(args: Vec<OsString>, env: EnvFn, user_home: Option<PathBuf>) -> R
         sync_config(&homes)?;
         return Ok(Action::SyncConfig);
     }
+    let want_preflight = preflight::needs_preflight(&args, env);
     let argv = apply_overrides(args, env)?;
+    let preflight_root = want_preflight.then(|| effective_root(&argv, &homes, &root));
     Ok(Action::Run {
         argv,
         codex_home: homes.local,
+        preflight_root,
     })
+}
+
+/// Root that upstream will end up using: the injected base_url override, else the
+/// seeded config's base_url, else the env/built-in root.
+fn effective_root(argv: &[OsString], homes: &Homes, fallback: &str) -> String {
+    let key = format!("model_providers.{PROVIDER_ID}.base_url=");
+    let strip = |u: &str| u.trim_end_matches('/').trim_end_matches("/v1").to_string();
+    for w in argv.windows(2) {
+        if w[0] == "-c"
+            && let Some(v) = w[1].to_string_lossy().strip_prefix(&key)
+        {
+            return strip(v.trim_matches('"'));
+        }
+    }
+    let cfg = std::fs::read_to_string(homes.local.join("config.toml"))
+        .ok()
+        .and_then(|t| t.parse::<toml::Table>().ok());
+    cfg.and_then(|c| {
+        c["model_providers"][PROVIDER_ID]["base_url"]
+            .as_str()
+            .map(strip)
+    })
+    .unwrap_or_else(|| fallback.to_string())
 }
 
 pub(crate) fn env_ollama_root(env: EnvFn) -> Result<Option<String>> {

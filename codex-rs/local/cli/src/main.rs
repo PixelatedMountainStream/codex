@@ -9,15 +9,29 @@ include!("../../../cli/src/main.rs");
 fn main() -> anyhow::Result<()> {
     codex_build_info::initialize!();
     let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
-    let action = codex_local_cli::prepare(args, &codex_local_cli::process_env, codex_local_cli::user_home_dir())?;
-    let (argv, codex_home) = match action {
+    let action = codex_local_cli::prepare(
+        args,
+        &codex_local_cli::process_env,
+        codex_local_cli::user_home_dir(),
+    )?;
+    let (argv, codex_home, preflight_root) = match action {
         codex_local_cli::Action::Version(v) => {
             println!("{v}");
             return Ok(());
         }
         codex_local_cli::Action::SyncConfig => return Ok(()),
-        codex_local_cli::Action::Run { argv, codex_home } => (argv, codex_home),
+        codex_local_cli::Action::Run {
+            argv,
+            codex_home,
+            preflight_root,
+        } => (argv, codex_home, preflight_root),
     };
+    if let Some(root) = preflight_root
+        && let Err(e) = codex_local_cli::preflight_check(&root)
+    {
+        eprintln!("{}", codex_local_cli::preflight_failure_message(&root, &e));
+        std::process::exit(1);
+    }
     // SAFETY: still single-threaded; no runtime or worker threads exist yet.
     unsafe { std::env::set_var("CODEX_HOME", &codex_home) };
     codex_local_models::register();

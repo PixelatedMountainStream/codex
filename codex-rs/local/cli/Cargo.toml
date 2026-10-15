@@ -27,6 +27,7 @@ codex-local-models = { path = "../models" }
 codex-local-resume = { path = "../resume" }
 dirs = { workspace = true }
 toml_edit = { workspace = true }
+reqwest = { workspace = true }
 codex-utils-process = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }

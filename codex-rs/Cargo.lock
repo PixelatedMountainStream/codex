@@ -3907,6 +3907,7 @@ dependencies = [
  "os_info",
  "owo-colors",
  "regex-lite",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "supports-color 3.0.2",
@@ -3938,6 +3939,7 @@ dependencies = [
  "reqwest 0.12.28",
  "serde_json",
  "tokio",
+ "tracing",
  "wiremock",
 ]
 

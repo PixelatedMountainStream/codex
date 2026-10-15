@@ -25,6 +25,8 @@ pub(crate) fn seed_toml(root: &str, stock_home: &str) -> Result<String> {
         ("base_url", s(&format!("{root}/v1"))),
         ("wire_api", s("responses")),
         ("requires_openai_auth", Value::Boolean(false)),
+        ("request_max_retries", Value::Integer(2)),
+        ("stream_max_retries", Value::Integer(2)),
     ]);
     let mut t = Table::new();
     t.insert("model".into(), s(DEFAULT_MODEL));

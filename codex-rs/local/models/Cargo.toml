@@ -19,6 +19,7 @@ codex-models-manager = { workspace = true }
 codex-protocol = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 serde_json = { workspace = true }
+tracing = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "sync"] }
 
 [dev-dependencies]

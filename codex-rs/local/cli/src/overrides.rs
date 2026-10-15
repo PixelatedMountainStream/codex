@@ -8,6 +8,8 @@ use crate::PROVIDER_ID;
 use crate::env_ollama_root;
 use crate::resolve_ollama_root;
 
+pub(crate) const MAX_RETRIES: u64 = 2;
+
 /// Strip `--ollama-url` (ours, unknown to upstream) and inject `-c` overrides right
 /// after argv[0] (root-level, so they reach every subcommand).
 ///
@@ -63,6 +65,14 @@ pub fn apply_overrides(args: Vec<OsString>, env: EnvFn) -> Result<Vec<OsString>>
         let v = toml::Value::String(format!("{root}/v1"));
         push_c(format!("model_providers.{PROVIDER_ID}.base_url={v}"));
     }
+    // Bound upstream's retry loops so an outage ends in an error, not an endless
+    // "Reconnecting..." (config seeding only covers new homes).
+    push_c(format!(
+        "model_providers.{PROVIDER_ID}.request_max_retries={MAX_RETRIES}"
+    ));
+    push_c(format!(
+        "model_providers.{PROVIDER_ID}.stream_max_retries={MAX_RETRIES}"
+    ));
     out.extend(rest);
     Ok(out)
 }
@@ -85,11 +95,22 @@ mod tests {
             .collect()
     }
 
+    const RQ: &str = "model_providers.codex-local.request_max_retries=2";
+    const ST: &str = "model_providers.codex-local.stream_max_retries=2";
     const URL_KEY: &str = "model_providers.codex-local.base_url";
 
     #[test]
     fn nothing_set_changes_nothing() {
-        assert_eq!(run(&["x", "exec", "hi"], &[]), ["x", "exec", "hi"]);
+        let want = [
+            "x",
+            "-c",
+            "model_providers.codex-local.request_max_retries=2",
+            "-c",
+            "model_providers.codex-local.stream_max_retries=2",
+            "exec",
+            "hi",
+        ];
+        assert_eq!(run(&["x", "exec", "hi"], &[]), want);
     }
 
     #[test]
@@ -98,7 +119,7 @@ mod tests {
         let want = |u: &str| format!("{URL_KEY}=\"{u}/v1\"");
         assert_eq!(
             run(&["x", "--ollama-url", "http://f:3", "exec"], &env),
-            ["x", "-c", &want("http://f:3"), "exec"]
+            ["x", "-c", &want("http://f:3"), "-c", RQ, "-c", ST, "exec"]
         );
         assert_eq!(run(&["x", "exec"], &env)[2], want("http://h1:1"));
         assert_eq!(
@@ -113,11 +134,30 @@ mod tests {
         assert_eq!(run(&["x", "exec"], &env)[2], "model=\"envm\"");
         assert_eq!(
             run(&["x", "-m", "flagm", "exec"], &env),
-            ["x", "-m", "flagm", "exec"]
+            [
+                "x",
+                "-c",
+                "model_providers.codex-local.request_max_retries=2",
+                "-c",
+                "model_providers.codex-local.stream_max_retries=2",
+                "-m",
+                "flagm",
+                "exec"
+            ]
         );
         assert_eq!(
             run(&["x", "exec", "--", "--ollama-url", "-m"], &[]),
-            ["x", "exec", "--", "--ollama-url", "-m"]
+            [
+                "x",
+                "-c",
+                "model_providers.codex-local.request_max_retries=2",
+                "-c",
+                "model_providers.codex-local.stream_max_retries=2",
+                "exec",
+                "--",
+                "--ollama-url",
+                "-m"
+            ]
         );
     }
 }

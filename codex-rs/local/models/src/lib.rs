@@ -43,6 +43,14 @@ pub struct OllamaModelsEndpoint {
     client: reqwest::Client,
 }
 
+/// Upstream logs every refresh failure at error level; log ours once per process.
+fn warn_once(e: &dyn fmt::Display) {
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!("codex-local: Ollama model list unavailable: {e}");
+    }
+}
+
 impl OllamaModelsEndpoint {
     /// `root` is the Ollama root (no `/v1`). `freeform_apply_patch` defaults to off.
     pub fn new(root: impl Into<String>, freeform_apply_patch: bool) -> Self {
@@ -81,7 +89,10 @@ impl OllamaModelsEndpoint {
             .send()
             .await
             .and_then(reqwest::Response::error_for_status)
-            .map_err(|e| invalid(&e))?
+            .map_err(|e| {
+                warn_once(&e);
+                invalid(&e)
+            })?
             .json()
             .await
             .map_err(|e| invalid(&e))?;
@@ -338,9 +349,7 @@ mod tests {
         };
         let manager = factory(&info);
         let factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
-        let presets = manager
-            .list_models(RefreshStrategy::Online, factory)
-            .await;
+        let presets = manager.list_models(RefreshStrategy::Online, factory).await;
         let mut ids: Vec<_> = presets.iter().map(|p| p.model.clone()).collect();
         ids.sort();
         assert_eq!(ids, vec!["a:1", "b:2", "c:3"]);
