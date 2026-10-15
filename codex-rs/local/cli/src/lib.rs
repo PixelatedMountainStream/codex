@@ -196,6 +196,10 @@ mod tests {
             .unwrap();
         assert_eq!(cfg["mcp_servers"]["a"]["command"].as_str(), Some("x"));
         assert_eq!(
+            cfg["mcp_servers"]["web-search"]["command"].as_str(),
+            Some("uvx")
+        );
+        assert_eq!(
             cfg["projects"]["/p"]["trust_level"].as_str(),
             Some("trusted")
         );

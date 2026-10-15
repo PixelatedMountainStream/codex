@@ -365,6 +365,9 @@ def main(argv=None) -> int:
           "    WARN: stock `codex` not found on PATH; codex-local works without it, "
           "but cross-resume needs it (npm i -g @openai/codex)")
 
+    if _lib.web_search_runner_missing():
+        print(f"    WARN: {_lib.WEB_SEARCH_HINT}")
+
     print(f"==> Release ({a.repo}, asset {name})")
     if a.release_dir:
         d = Path(a.release_dir)

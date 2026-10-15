@@ -28,6 +28,15 @@ def releases():
     ]
 
 
+class WebSearchRunner(unittest.TestCase):
+    def test_missing_runner_detected(self):
+        from unittest import mock
+        with mock.patch.object(_lib.shutil, "which", return_value=None):
+            self.assertTrue(_lib.web_search_runner_missing())
+        with mock.patch.object(_lib.shutil, "which", return_value="/x/uvx"):
+            self.assertFalse(_lib.web_search_runner_missing())
+
+
 class Selection(unittest.TestCase):
     def test_newest_local_ignores_rust_and_drafts(self):
         self.assertEqual(install.select_release(releases())["tag_name"], "local-v0.2.0")

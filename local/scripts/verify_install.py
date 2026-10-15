@@ -169,6 +169,8 @@ def full(rep, exe, sums) -> None:
     else:
         rc, sver, raw = _lib.probe_version(sexe)
         (rep.ok if rc == 0 and sver else rep.fail)("stock codex", f"{sexe} -> {raw[:80]}")
+    if _lib.web_search_runner_missing():
+        rep.warn("web search", _lib.WEB_SEARCH_HINT)
     cfg = stock / "config.toml"
     if cfg.is_file():
         try:

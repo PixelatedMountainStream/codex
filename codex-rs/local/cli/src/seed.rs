@@ -9,6 +9,10 @@ use crate::DEFAULT_MODEL;
 use crate::Homes;
 use crate::PROVIDER_ID;
 
+pub(crate) const WEB_SEARCH_ID: &str = "web-search";
+/// Pinned DuckDuckGo MCP server (tools: search, fetch_content); needs no API key.
+pub(crate) const WEB_SEARCH_PKG: &str = "duckduckgo-mcp-server==0.7.0";
+
 fn table(entries: impl IntoIterator<Item = (&'static str, Value)>) -> Value {
     Value::Table(
         entries
@@ -16,6 +20,17 @@ fn table(entries: impl IntoIterator<Item = (&'static str, Value)>) -> Value {
             .map(|(k, v)| (k.to_string(), v))
             .collect(),
     )
+}
+
+/// The `[mcp_servers.web-search]` entry. Both tools are read-only, so approve them
+/// (otherwise `approval_policy = never` runs reject every call).
+pub(crate) fn web_search_server() -> Value {
+    let s = |v: &str| Value::String(v.to_string());
+    table([
+        ("command", s("uvx")),
+        ("args", Value::Array(vec![s(WEB_SEARCH_PKG)])),
+        ("default_tools_approval_mode", s("approve")),
+    ])
 }
 
 pub(crate) fn seed_toml(root: &str, stock_home: &str) -> Result<String> {
@@ -45,6 +60,12 @@ pub(crate) fn seed_toml(root: &str, stock_home: &str) -> Result<String> {
             ("plugins", Value::Boolean(false)),
         ]),
     );
+    // Ollama can't run the server-side `web_search` tool; use the local MCP server.
+    t.insert("web_search".into(), s("disabled"));
+    t.insert(
+        "mcp_servers".into(),
+        table([(WEB_SEARCH_ID, web_search_server())]),
+    );
     t.insert("agents".into(), table([("max_threads", Value::Integer(6))]));
     t.insert(
         "shell_environment_policy".into(),
@@ -71,5 +92,10 @@ mod tests {
         let body = super::seed_toml("http://127.0.0.1:11434", "/h").unwrap();
         let v: toml::Value = toml::from_str(&body).unwrap();
         assert_eq!(v["agents"]["max_threads"].as_integer(), Some(6));
+        assert_eq!(v["web_search"].as_str(), Some("disabled"));
+        let ws = &v["mcp_servers"]["web-search"];
+        assert_eq!(ws["command"].as_str(), Some("uvx"));
+        assert_eq!(ws["default_tools_approval_mode"].as_str(), Some("approve"));
+        assert_eq!(ws["args"][0].as_str(), Some(super::WEB_SEARCH_PKG));
     }
 }

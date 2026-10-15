@@ -18,6 +18,16 @@ IS_WINDOWS = os.name == "nt"
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
 
 
+WEB_SEARCH_RUNNER = "uvx"
+WEB_SEARCH_HINT = ("web search needs `uvx` (not found on PATH); install uv: "
+                   "curl -LsSf https://astral.sh/uv/install.sh | sh "
+                   "(Windows: powershell -c \"irm https://astral.sh/uv/install.ps1 | iex\")")
+
+
+def web_search_runner_missing() -> bool:
+    return shutil.which(WEB_SEARCH_RUNNER) is None
+
+
 def make_output_safe() -> None:
     """Windows consoles default to cp1252; never let a stray glyph kill the run.
 

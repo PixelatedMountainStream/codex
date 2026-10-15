@@ -73,6 +73,8 @@ pub fn apply_overrides(args: Vec<OsString>, env: EnvFn) -> Result<Vec<OsString>>
     push_c(format!(
         "model_providers.{PROVIDER_ID}.stream_max_retries={MAX_RETRIES}"
     ));
+    // Ollama fails the built-in server-side web_search tool; also covers old installs.
+    push_c("web_search=\"disabled\"".to_string());
     // `CODEX_LOCAL_MAX_AGENTS` beats the seeded `[agents] max_threads` in config.toml.
     if let Some(raw) = env("CODEX_LOCAL_MAX_AGENTS") {
         match raw.trim().parse::<u64>() {
@@ -104,6 +106,7 @@ mod tests {
 
     const RQ: &str = "model_providers.codex-local.request_max_retries=2";
     const ST: &str = "model_providers.codex-local.stream_max_retries=2";
+    const WS: &str = "web_search=\"disabled\"";
     const URL_KEY: &str = "model_providers.codex-local.base_url";
 
     #[test]
@@ -114,6 +117,8 @@ mod tests {
             "model_providers.codex-local.request_max_retries=2",
             "-c",
             "model_providers.codex-local.stream_max_retries=2",
+            "-c",
+            "web_search=\"disabled\"",
             "exec",
             "hi",
         ];
@@ -124,12 +129,12 @@ mod tests {
     fn max_agents_env_valid_invalid_unset() {
         let k = "CODEX_LOCAL_MAX_AGENTS";
         let ma = "agents.max_threads=8";
-        assert_eq!(run(&["x", "exec"], &[(k, "8")])[6], ma);
-        assert_eq!(run(&["x", "exec"], &[(k, "8")]).len(), 8);
+        assert_eq!(run(&["x", "exec"], &[(k, "8")])[8], ma);
+        assert_eq!(run(&["x", "exec"], &[(k, "8")]).len(), 10);
         for bad in ["0", "-1", "abc", ""] {
-            assert_eq!(run(&["x", "exec"], &[(k, bad)]).len(), 6);
+            assert_eq!(run(&["x", "exec"], &[(k, bad)]).len(), 8);
         }
-        assert_eq!(run(&["x", "exec"], &[]).len(), 6);
+        assert_eq!(run(&["x", "exec"], &[]).len(), 8);
     }
 
     #[test]
@@ -138,7 +143,18 @@ mod tests {
         let want = |u: &str| format!("{URL_KEY}=\"{u}/v1\"");
         assert_eq!(
             run(&["x", "--ollama-url", "http://f:3", "exec"], &env),
-            ["x", "-c", &want("http://f:3"), "-c", RQ, "-c", ST, "exec"]
+            [
+                "x",
+                "-c",
+                &want("http://f:3"),
+                "-c",
+                RQ,
+                "-c",
+                ST,
+                "-c",
+                WS,
+                "exec"
+            ]
         );
         assert_eq!(run(&["x", "exec"], &env)[2], want("http://h1:1"));
         assert_eq!(
@@ -159,6 +175,8 @@ mod tests {
                 "model_providers.codex-local.request_max_retries=2",
                 "-c",
                 "model_providers.codex-local.stream_max_retries=2",
+                "-c",
+                "web_search=\"disabled\"",
                 "-m",
                 "flagm",
                 "exec"
@@ -172,6 +190,8 @@ mod tests {
                 "model_providers.codex-local.request_max_retries=2",
                 "-c",
                 "model_providers.codex-local.stream_max_retries=2",
+                "-c",
+                "web_search=\"disabled\"",
                 "exec",
                 "--",
                 "--ollama-url",
