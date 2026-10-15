@@ -73,6 +73,13 @@ pub fn apply_overrides(args: Vec<OsString>, env: EnvFn) -> Result<Vec<OsString>>
     push_c(format!(
         "model_providers.{PROVIDER_ID}.stream_max_retries={MAX_RETRIES}"
     ));
+    // `CODEX_LOCAL_MAX_AGENTS` beats the seeded `[agents] max_threads` in config.toml.
+    if let Some(raw) = env("CODEX_LOCAL_MAX_AGENTS") {
+        match raw.trim().parse::<u64>() {
+            Ok(n) if n > 0 => push_c(format!("agents.max_threads={n}")),
+            _ => eprintln!("codex-local: ignoring invalid CODEX_LOCAL_MAX_AGENTS={raw:?}"),
+        }
+    }
     out.extend(rest);
     Ok(out)
 }
@@ -111,6 +118,18 @@ mod tests {
             "hi",
         ];
         assert_eq!(run(&["x", "exec", "hi"], &[]), want);
+    }
+
+    #[test]
+    fn max_agents_env_valid_invalid_unset() {
+        let k = "CODEX_LOCAL_MAX_AGENTS";
+        let ma = "agents.max_threads=8";
+        assert_eq!(run(&["x", "exec"], &[(k, "8")])[6], ma);
+        assert_eq!(run(&["x", "exec"], &[(k, "8")]).len(), 8);
+        for bad in ["0", "-1", "abc", ""] {
+            assert_eq!(run(&["x", "exec"], &[(k, bad)]).len(), 6);
+        }
+        assert_eq!(run(&["x", "exec"], &[]).len(), 6);
     }
 
     #[test]

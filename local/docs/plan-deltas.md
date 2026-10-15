@@ -11,4 +11,5 @@ Where the build differs from the approved plan.
 - **Plugins:** `features.plugins=false` is set to stop the chatgpt.com plugin warm-up. This also disables plugin-bundled skills.
 - **Session affinity and the mid-history fix:** live in PAIR (Phase 9), not in codex-local.
 - **Models catalog:** `codex-local-models` builds its manager with `.with_provider_catalog()`, so Ollama's catalog is authoritative and no bundled gpt-* models are merged in; `ensure_loaded` lazily fetches because the initial list is empty.
+- **Agent threads:** seeded `[agents] max_threads` is now 6 (existing configs keep 4, never rewritten); override with `CODEX_LOCAL_MAX_AGENTS=<n>` (positive int, beats config.toml, invalid warns and is ignored) or the `agents.max_threads` config key.
 - **UPSTREAM_SYNC_TOKEN:** the upstream-sync workflow needs this secret (PAT or App token with workflows scope) to push and open the PR whenever the merge touches `.github/workflows/**`; without it that run fails early, otherwise it falls back to GITHUB_TOKEN.

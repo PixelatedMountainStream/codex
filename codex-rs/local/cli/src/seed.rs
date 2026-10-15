@@ -45,7 +45,7 @@ pub(crate) fn seed_toml(root: &str, stock_home: &str) -> Result<String> {
             ("plugins", Value::Boolean(false)),
         ]),
     );
-    t.insert("agents".into(), table([("max_threads", Value::Integer(4))]));
+    t.insert("agents".into(), table([("max_threads", Value::Integer(6))]));
     t.insert(
         "shell_environment_policy".into(),
         table([("set", table([("CODEX_HOME", s(stock_home))]))]),
@@ -62,4 +62,14 @@ pub fn seed_config(h: &Homes, root: &str) -> Result<bool> {
     let body = seed_toml(root, &h.stock.to_string_lossy())?;
     fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn seeds_six_agent_threads() {
+        let body = super::seed_toml("http://127.0.0.1:11434", "/h").unwrap();
+        let v: toml::Value = toml::from_str(&body).unwrap();
+        assert_eq!(v["agents"]["max_threads"].as_integer(), Some(6));
+    }
 }
