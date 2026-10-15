@@ -76,7 +76,12 @@ jobs:
         with:
           workspaces: codex-rs
       - name: Local crate tests
-        run: cargo test -p codex-local-cli -p codex-local-models -p codex-local-resume
+        # --lib: the codex-local bin include!s upstream cli/main.rs, so its bin
+        # target also compiles upstream's own cli tests (snapshots keyed to `codex`).
+        # Run only our bin test (the --no-daemon injection table) from it.
+        run: |
+          cargo test -p codex-local-cli -p codex-local-models -p codex-local-resume --lib
+          cargo test -p codex-local-cli --bin codex-local no_daemon
       - name: Hook tests (Tests lines in local/FORK_SURFACE.md)
         run: |
           set -euo pipefail
