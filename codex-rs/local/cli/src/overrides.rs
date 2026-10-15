@@ -75,6 +75,8 @@ pub fn apply_overrides(args: Vec<OsString>, env: EnvFn) -> Result<Vec<OsString>>
     ));
     // Ollama fails the built-in server-side web_search tool; also covers old installs.
     push_c("web_search=\"disabled\"".to_string());
+    // No app-server daemon (needs a package we don't ship; also skips our in-process hooks).
+    push_c("features.daemon_auto_start=false".to_string());
     // `CODEX_LOCAL_MAX_AGENTS` beats the seeded `[agents] max_threads` in config.toml.
     if let Some(raw) = env("CODEX_LOCAL_MAX_AGENTS") {
         match raw.trim().parse::<u64>() {
@@ -107,6 +109,7 @@ mod tests {
     const RQ: &str = "model_providers.codex-local.request_max_retries=2";
     const ST: &str = "model_providers.codex-local.stream_max_retries=2";
     const WS: &str = "web_search=\"disabled\"";
+    const DA: &str = "features.daemon_auto_start=false";
     const URL_KEY: &str = "model_providers.codex-local.base_url";
 
     #[test]
@@ -119,6 +122,8 @@ mod tests {
             "model_providers.codex-local.stream_max_retries=2",
             "-c",
             "web_search=\"disabled\"",
+            "-c",
+            "features.daemon_auto_start=false",
             "exec",
             "hi",
         ];
@@ -129,12 +134,12 @@ mod tests {
     fn max_agents_env_valid_invalid_unset() {
         let k = "CODEX_LOCAL_MAX_AGENTS";
         let ma = "agents.max_threads=8";
-        assert_eq!(run(&["x", "exec"], &[(k, "8")])[8], ma);
-        assert_eq!(run(&["x", "exec"], &[(k, "8")]).len(), 10);
+        assert_eq!(run(&["x", "exec"], &[(k, "8")])[10], ma);
+        assert_eq!(run(&["x", "exec"], &[(k, "8")]).len(), 12);
         for bad in ["0", "-1", "abc", ""] {
-            assert_eq!(run(&["x", "exec"], &[(k, bad)]).len(), 8);
+            assert_eq!(run(&["x", "exec"], &[(k, bad)]).len(), 10);
         }
-        assert_eq!(run(&["x", "exec"], &[]).len(), 8);
+        assert_eq!(run(&["x", "exec"], &[]).len(), 10);
     }
 
     #[test]
@@ -153,6 +158,8 @@ mod tests {
                 ST,
                 "-c",
                 WS,
+                "-c",
+                DA,
                 "exec"
             ]
         );
@@ -177,6 +184,8 @@ mod tests {
                 "model_providers.codex-local.stream_max_retries=2",
                 "-c",
                 "web_search=\"disabled\"",
+                "-c",
+                "features.daemon_auto_start=false",
                 "-m",
                 "flagm",
                 "exec"
@@ -192,6 +201,8 @@ mod tests {
                 "model_providers.codex-local.stream_max_retries=2",
                 "-c",
                 "web_search=\"disabled\"",
+                "-c",
+                "features.daemon_auto_start=false",
                 "exec",
                 "--",
                 "--ollama-url",

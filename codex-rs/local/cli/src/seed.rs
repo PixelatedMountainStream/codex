@@ -58,6 +58,8 @@ pub(crate) fn seed_toml(root: &str, stock_home: &str) -> Result<String> {
             ("multi_agent", Value::Boolean(true)),
             // Gates the startup chatgpt.com featured/recommended-plugins fetches.
             ("plugins", Value::Boolean(false)),
+            // Run in-process; upstream's daemon needs a package codex-local lacks.
+            ("daemon_auto_start", Value::Boolean(false)),
         ]),
     );
     // Ollama can't run the server-side `web_search` tool; use the local MCP server.
@@ -93,6 +95,7 @@ mod tests {
         let v: toml::Value = toml::from_str(&body).unwrap();
         assert_eq!(v["agents"]["max_threads"].as_integer(), Some(6));
         assert_eq!(v["web_search"].as_str(), Some("disabled"));
+        assert_eq!(v["features"]["daemon_auto_start"].as_bool(), Some(false));
         let ws = &v["mcp_servers"]["web-search"];
         assert_eq!(ws["command"].as_str(), Some("uvx"));
         assert_eq!(ws["default_tools_approval_mode"].as_str(), Some("approve"));

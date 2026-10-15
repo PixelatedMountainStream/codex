@@ -18,8 +18,8 @@ doctest = false
 [[bin]]
 name = "codex-local"
 path = "src/main.rs"
-# Upstream's in-file unit tests already run in the `codex-cli` package.
-test = false
+# Upstream's in-file unit tests already run in the `codex-cli` package; only run
+# ours here (`cargo test -p codex-local-cli --bin codex-local no_daemon`).
 
 [dependencies]
 codex-cli = { path = "../../cli" }
@@ -127,3 +127,19 @@ windows-sys = { workspace = true, features = [
 
 [dev-dependencies]
 tempfile = { workspace = true }
+assert_matches = { workspace = true }
+codex-app-server-client = { workspace = true }
+codex-utils-cargo-bin = { workspace = true }
+codex-utils-pty = { workspace = true }
+flate2 = { workspace = true }
+insta = { workspace = true }
+jsonwebtoken = { workspace = true }
+predicates = { workspace = true }
+pretty_assertions = { workspace = true }
+sha2 = { workspace = true }
+sqlx = { workspace = true }
+tar = { workspace = true }
+tokio-tungstenite = { workspace = true }
+vt100 = { workspace = true }
+wiremock = { workspace = true }
+zstd = { workspace = true }
