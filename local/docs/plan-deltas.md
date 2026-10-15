@@ -15,3 +15,8 @@ Where the build differs from the approved plan.
 - **UPSTREAM_SYNC_TOKEN:** the upstream-sync workflow needs this secret (PAT or App token with workflows scope) to push and open the PR whenever the merge touches `.github/workflows/**`; without it that run fails early, otherwise it falls back to GITHUB_TOKEN.
 - **Local web search:** Ollama fails the built-in server-side `web_search` tool, so config seeds `web_search = "disabled"` (also forced via `-c` on every run) and `[mcp_servers.web-search]` runs `uvx duckduckgo-mcp-server==0.7.0` (search + fetch_content, no key); `sync-config` keeps that entry; install/verify warn if `uvx` is missing.
 - **No app-server daemon:** upstream auto-starts/discovers a daemon for the TUI that needs a full `codex-package.json` package (a bare binary fails with "no complete local package") and would bypass in-process registrations; codex-local injects `--no-daemon` (plain TUI/resume/fork, unless `--remote`) plus `-c features.daemon_auto_start=false`, and seeds that feature off; stock is untouched.
+
+## Cross-resume
+
+- Stock resumes a codex-local session with `codex resume <id> -c model_provider=openai`; `codex exec resume <id>` needs no flag.
+- codex-local always continues on its own provider and model: it injects `-c model_provider="codex-local"` and `-c model=<CODEX_LOCAL_MODEL or configured model>` (unless `-m` is given), because upstream only overrides a resumed rollout's provider/model when a CLI layer sets them.

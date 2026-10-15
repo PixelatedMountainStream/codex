@@ -16,8 +16,15 @@ pub(crate) const MAX_RETRIES: u64 = 2;
 /// Precedence: flags (`-m`, `--ollama-url`) > `CODEX_LOCAL_MODEL` >
 /// `CODEX_LOCAL_OLLAMA_URL` > `OLLAMA_HOST` > config.toml > built-ins. `-m` is left to
 /// upstream (it already wins), so the env model is injected only when no model flag is
-/// present; config and built-ins need no injection.
-pub fn apply_overrides(args: Vec<OsString>, env: EnvFn) -> Result<Vec<OsString>> {
+/// present, else the configured model. Both the provider and the model are always
+/// injected: upstream's TUI only overrides a resumed session's rollout provider/model
+/// (e.g. a stock `openai`/`gpt-*` session) when a CLI layer sets them, and codex-local
+/// must always continue on its own provider and model.
+pub fn apply_overrides(
+    args: Vec<OsString>,
+    env: EnvFn,
+    config_model: Option<String>,
+) -> Result<Vec<OsString>> {
     let mut rest = Vec::with_capacity(args.len());
     let mut flag_url: Option<String> = None;
     let mut has_model_flag = false;
@@ -58,7 +65,8 @@ pub fn apply_overrides(args: Vec<OsString>, env: EnvFn) -> Result<Vec<OsString>>
         out.push("-c".into());
         out.push(kv.into());
     };
-    if !has_model_flag && let Some(m) = env("CODEX_LOCAL_MODEL") {
+    push_c(format!("model_provider=\"{PROVIDER_ID}\""));
+    if !has_model_flag && let Some(m) = env("CODEX_LOCAL_MODEL").or(config_model) {
         push_c(format!("model={}", toml::Value::String(m)));
     }
     if let Some(root) = root {
@@ -99,7 +107,7 @@ mod tests {
                 .map(|(_, v)| v.to_string())
         };
         let a = args.iter().map(OsString::from).collect();
-        apply_overrides(a, &f)
+        apply_overrides(a, &f, Some("cfgm".to_string()))
             .unwrap()
             .iter()
             .map(|s| s.to_string_lossy().into_owned())
@@ -109,6 +117,8 @@ mod tests {
     const RQ: &str = "model_providers.codex-local.request_max_retries=2";
     const ST: &str = "model_providers.codex-local.stream_max_retries=2";
     const WS: &str = "web_search=\"disabled\"";
+    const MP: &str = "model_provider=\"codex-local\"";
+    const MD: &str = "model=\"cfgm\"";
     const DA: &str = "features.daemon_auto_start=false";
     const URL_KEY: &str = "model_providers.codex-local.base_url";
 
@@ -116,6 +126,10 @@ mod tests {
     fn nothing_set_changes_nothing() {
         let want = [
             "x",
+            "-c",
+            MP,
+            "-c",
+            MD,
             "-c",
             "model_providers.codex-local.request_max_retries=2",
             "-c",
@@ -134,12 +148,12 @@ mod tests {
     fn max_agents_env_valid_invalid_unset() {
         let k = "CODEX_LOCAL_MAX_AGENTS";
         let ma = "agents.max_threads=8";
-        assert_eq!(run(&["x", "exec"], &[(k, "8")])[10], ma);
-        assert_eq!(run(&["x", "exec"], &[(k, "8")]).len(), 12);
+        assert_eq!(run(&["x", "exec"], &[(k, "8")])[14], ma);
+        assert_eq!(run(&["x", "exec"], &[(k, "8")]).len(), 16);
         for bad in ["0", "-1", "abc", ""] {
-            assert_eq!(run(&["x", "exec"], &[(k, bad)]).len(), 10);
+            assert_eq!(run(&["x", "exec"], &[(k, bad)]).len(), 14);
         }
-        assert_eq!(run(&["x", "exec"], &[]).len(), 10);
+        assert_eq!(run(&["x", "exec"], &[]).len(), 14);
     }
 
     #[test]
@@ -150,6 +164,10 @@ mod tests {
             run(&["x", "--ollama-url", "http://f:3", "exec"], &env),
             [
                 "x",
+                "-c",
+                MP,
+                "-c",
+                MD,
                 "-c",
                 &want("http://f:3"),
                 "-c",
@@ -163,9 +181,9 @@ mod tests {
                 "exec"
             ]
         );
-        assert_eq!(run(&["x", "exec"], &env)[2], want("http://h1:1"));
+        assert_eq!(run(&["x", "exec"], &env)[6], want("http://h1:1"));
         assert_eq!(
-            run(&["x", "exec"], &[("OLLAMA_HOST", "0.0.0.0")])[2],
+            run(&["x", "exec"], &[("OLLAMA_HOST", "0.0.0.0")])[6],
             want("http://127.0.0.1:11434")
         );
     }
@@ -173,11 +191,15 @@ mod tests {
     #[test]
     fn model_flag_beats_env_and_dd_is_respected() {
         let env = [("CODEX_LOCAL_MODEL", "envm")];
-        assert_eq!(run(&["x", "exec"], &env)[2], "model=\"envm\"");
+        assert_eq!(run(&["x", "exec"], &env)[2], MP);
+        assert_eq!(run(&["x", "exec"], &env)[4], "model=\"envm\"");
+        assert_eq!(run(&["x", "exec"], &[])[4], "model=\"cfgm\"");
         assert_eq!(
             run(&["x", "-m", "flagm", "exec"], &env),
             [
                 "x",
+                "-c",
+                MP,
                 "-c",
                 "model_providers.codex-local.request_max_retries=2",
                 "-c",
@@ -195,6 +217,10 @@ mod tests {
             run(&["x", "exec", "--", "--ollama-url", "-m"], &[]),
             [
                 "x",
+                "-c",
+                MP,
+                "-c",
+                MD,
                 "-c",
                 "model_providers.codex-local.request_max_retries=2",
                 "-c",

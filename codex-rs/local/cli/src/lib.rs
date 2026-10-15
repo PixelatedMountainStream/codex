@@ -80,7 +80,12 @@ pub fn prepare(args: Vec<OsString>, env: EnvFn, user_home: Option<PathBuf>) -> R
         return Ok(Action::SyncConfig);
     }
     let want_preflight = preflight::needs_preflight(&args, env);
-    let argv = apply_overrides(args, env)?;
+    let config_model = std::fs::read_to_string(homes.local.join("config.toml"))
+        .ok()
+        .and_then(|t| t.parse::<toml::Table>().ok())
+        .and_then(|c| c.get("model").and_then(|m| m.as_str()).map(str::to_string))
+        .or_else(|| Some(DEFAULT_MODEL.to_string()));
+    let argv = apply_overrides(args, env, config_model)?;
     let preflight_root = want_preflight.then(|| effective_root(&argv, &homes, &root));
     Ok(Action::Run {
         argv,
