@@ -9,3 +9,19 @@ workspace = true
 
 [lib]
 doctest = false
+
+[dependencies]
+codex-http-client = { workspace = true }
+codex-login = { workspace = true }
+codex-model-provider = { workspace = true }
+codex-model-provider-info = { workspace = true }
+codex-models-manager = { workspace = true }
+codex-protocol = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+serde_json = { workspace = true, features = ["raw_value"] }
+sha2 = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros", "sync"] }
+
+[dev-dependencies]
+wiremock = { workspace = true }

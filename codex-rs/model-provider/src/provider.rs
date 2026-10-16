@@ -20,6 +20,7 @@ use codex_models_manager::manager::SharedModelsManager;
 use codex_models_manager::manager::StaticModelsManager;
 use codex_protocol::account::ProviderAccount;
 use codex_protocol::error::CodexErr;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelsResponse;
 
 use crate::ProviderCapabilities;
@@ -357,6 +358,41 @@ pub fn create_model_provider(
     ))
 }
 
+/// codex-local hook H2: factory registered by `codex-local-cli`, used only for `codex-local`.
+pub type LocalModelsFactory = fn(&ModelProviderInfo) -> SharedModelsManager;
+static LOCAL_MODELS_FACTORY: std::sync::OnceLock<LocalModelsFactory> = std::sync::OnceLock::new();
+
+pub fn register_local_models_factory(factory: LocalModelsFactory) {
+    let _ = LOCAL_MODELS_FACTORY.set(factory);
+}
+
+fn local_models_manager(info: &ModelProviderInfo) -> Option<SharedModelsManager> {
+    (info.name == "codex-local").then(|| LOCAL_MODELS_FACTORY.get().map(|f| f(info)))?
+}
+
+/// codex-local hook H9: wire codec registered by `codex-local-cli`; no-ops when unregistered.
+pub type CodecTools = Option<Arc<serde_json::value::RawValue>>;
+pub struct LocalWireCodec {
+    pub outbound: fn(&mut CodecTools, &mut Vec<ResponseItem>) -> serde_json::Result<()>,
+    pub inbound: fn(ResponseItem) -> ResponseItem,
+}
+static LOCAL_CODEC: std::sync::OnceLock<LocalWireCodec> = std::sync::OnceLock::new();
+
+pub fn register_local_codec(codec: LocalWireCodec) {
+    let _ = LOCAL_CODEC.set(codec);
+}
+
+pub fn codec_outbound(t: &mut CodecTools, i: &mut Vec<ResponseItem>) -> serde_json::Result<()> {
+    LOCAL_CODEC.get().map_or(Ok(()), |c| (c.outbound)(t, i))
+}
+
+pub fn codec_inbound(item: ResponseItem) -> ResponseItem {
+    match LOCAL_CODEC.get() {
+        Some(c) => (c.inbound)(item),
+        None => item,
+    }
+}
+
 /// Runtime model provider that orchestrates primary and gateway credentials.
 #[derive(Clone, Debug)]
 struct ConfiguredModelProvider {
@@ -395,6 +431,9 @@ impl ConfiguredModelProvider {
                 self.auth_manager.clone(),
                 model_catalog,
             ));
+        }
+        if let Some(manager) = local_models_manager(&self.info) {
+            return manager;
         }
         let endpoint = Arc::new(OpenAiModelsEndpoint::new(
             self.info.clone(),
@@ -1402,5 +1441,33 @@ printf '%s\n' '{"AccessKeyId":"exported","SecretAccessKey":"secret"}'
                 );
             }
         }
+    }
+
+    #[test]
+    fn local_models_factory_is_consulted_only_for_codex_local() {
+        static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        fn factory(_: &ModelProviderInfo) -> SharedModelsManager {
+            CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Arc::new(StaticModelsManager::new(None, ModelsResponse::default()))
+        }
+        let named = |name: &str| ModelProviderInfo {
+            name: name.to_string(),
+            ..Default::default()
+        };
+        assert!(local_models_manager(&named("codex-local")).is_none());
+        register_local_models_factory(factory);
+        assert!(local_models_manager(&named("openai")).is_none());
+        assert_eq!(CALLS.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(local_models_manager(&named("codex-local")).is_some());
+        assert_eq!(CALLS.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn local_codec_is_identity_when_unregistered() {
+        let mut input = vec![ResponseItem::Other];
+        let mut tools = None;
+        codec_outbound(&mut tools, &mut input).unwrap();
+        assert!(tools.is_none() && input == vec![ResponseItem::Other]);
+        assert_eq!(codec_inbound(ResponseItem::Other), ResponseItem::Other);
     }
 }

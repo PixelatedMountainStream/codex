@@ -1,0 +1,142 @@
+# Fork-only release pipeline for codex-local.
+# codex-local/main is the fork's working base for now; `main` is included for
+# when the fork tracks it directly.
+name: local-release
+
+on:
+  push:
+    branches: [codex-local/main, main]
+    paths:
+      - "codex-rs/**"
+      - "local/**"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: local-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.best_effort }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-14, target: aarch64-apple-darwin, best_effort: false }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, best_effort: false }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, best_effort: true }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, best_effort: true }
+    defaults:
+      run:
+        shell: bash
+        working-directory: codex-rs
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install toolchain from rust-toolchain.toml
+        run: |
+          set -euo pipefail
+          channel="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "${channel}" --profile minimal --target "${{ matrix.target }}"
+          rustup default "${channel}"
+      # musl setup borrowed from upstream rust-release.yml
+      - if: ${{ endsWith(matrix.target, '-linux-musl') }}
+        name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.0
+          use-cache: false
+      - if: ${{ endsWith(matrix.target, '-linux-musl') }}
+        name: Install musl build tools
+        working-directory: .
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          bash .github/scripts/install-musl-build-tools.sh
+          echo "AWS_LC_SYS_NO_JITTER_ENTROPY=1" >> "$GITHUB_ENV"
+          t="AWS_LC_SYS_NO_JITTER_ENTROPY_${TARGET//-/_}"
+          echo "${t}=1" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: codex-rs
+          key: release-${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --bin codex-local -p codex-local-cli --target ${{ matrix.target }}
+      # install.py requires these two helpers beside codex-local on Windows.
+      - name: Build Windows sandbox helpers
+        if: ${{ runner.os == 'Windows' }}
+        run: cargo build --release -p codex-windows-sandbox --bin codex-windows-sandbox-setup --bin codex-command-runner --target ${{ matrix.target }}
+      - name: Stage asset
+        run: |
+          set -euo pipefail
+          ext=""
+          if [ "${RUNNER_OS}" = "Windows" ]; then ext=".exe"; fi
+          mkdir -p ../dist
+          cp "target/${{ matrix.target }}/release/codex-local${ext}" "../dist/codex-local-${{ matrix.target }}${ext}"
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            for h in codex-windows-sandbox-setup codex-command-runner; do
+              cp "target/${{ matrix.target }}/release/${h}.exe" "../dist/${h}-${{ matrix.target }}.exe"
+            done
+          fi
+      - name: Ad-hoc codesign
+        if: ${{ runner.os == 'macOS' }}
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          codesign -s - --force "codex-local-${{ matrix.target }}"
+          codesign -v "codex-local-${{ matrix.target }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: codex-local-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    # Publish even if best-effort targets failed, but not if a required one did.
+    if: ${{ !cancelled() && needs.build.result != 'failure' && needs.build.result != 'cancelled' }}
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: codex-local-*
+          merge-multiple: true
+      - name: Require the mandatory assets
+        run: |
+          set -euo pipefail
+          ls -l dist
+          test -f dist/codex-local-aarch64-apple-darwin
+          test -f dist/codex-local-x86_64-pc-windows-msvc.exe
+          test -f dist/codex-windows-sandbox-setup-x86_64-pc-windows-msvc.exe
+          test -f dist/codex-command-runner-x86_64-pc-windows-msvc.exe
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum codex-local-* codex-windows-sandbox-setup-* codex-command-runner-* > SHA256SUMS && cat SHA256SUMS
+      - name: Create release
+        run: |
+          set -euo pipefail
+          upstream="$(tr -d '[:space:]' < local/UPSTREAM_VERSION)"
+          upstream="${upstream#rust-v}"
+          count="$(gh release list --limit 1000 --json tagName --jq "[.[] | select(.tagName | startswith(\"local-v${upstream}-\"))] | length")"
+          tag="local-v${upstream}-$((count + 1))"
+          echo "Releasing ${tag}"
+          gh release create "${tag}" dist/* \
+            --target "${GITHUB_SHA}" \
+            --title "${tag}" \
+            --notes "codex-local build of upstream rust-v${upstream} at ${GITHUB_SHA}."

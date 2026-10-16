@@ -1,8 +1,46 @@
-# Upstream paths the fork is allowed to modify.
-allowlist = ["codex-rs/Cargo.toml"]
+# Fork-surface policy, enforced by local/scripts/check_fork_surface.py.
+#
+# The check diffs HEAD against the upstream tag in local/UPSTREAM_VERSION
+# (`git diff --numstat <tag>...HEAD`) and fails when a touched path is neither
+# fork-owned nor allowed, or when the upstream edits exceed the budget.
+#
+# Schema:
+#   allow     list of globs   Upstream paths the fork may edit (the hook files).
+#                             `allowlist` is accepted as an alias.
+#   generated list of globs   Upstream paths that are allowed but excluded from
+#                             the budget (e.g. Cargo.lock; verify by regeneration).
+#   ignore    list of globs   OPTIONAL extra fork-owned globs, appended to the
+#                             built-in set, which is always ignored: local/**,
+#                             codex-rs/local/**, boundaries/**,
+#                             codex-rs/boundaries/**, codex-rs/sc-lint.toml, .claude/**,
+#                             .codex/skills/**, .github/workflows/local-*.yml,
+#                             .github/workflows/upstream-sync.yml
+#   [budget]
+#     max_lines integer       Max added+removed lines over non-ignored,
+#                             non-generated files.
+#     max_files integer       Max count of those files.
+#
+# Globs use `*` (within one path segment), `**` (across segments), `?`.
+# Paths are repo-relative with forward slashes.
+
+allow = [
+    "codex-rs/Cargo.toml",
+    "codex-rs/cli/src/main.rs",
+    "codex-rs/cli/build.rs",
+    "codex-rs/core/src/client.rs",
+    "codex-rs/core/src/stream_events_utils.rs",
+    "codex-rs/core/src/session/turn.rs",
+    "codex-rs/model-provider/src/provider.rs",
+    "codex-rs/model-provider/src/lib.rs",
+    "codex-rs/core/src/lib.rs",
+    "codex-rs/core/src/session/mod.rs",
+    "codex-rs/tui/src/lib.rs",
+    "codex-rs/tui/src/resume_picker.rs",
+]
 generated = ["codex-rs/Cargo.lock"]
 
 [budget]
-# Spike-pass budget plus H8.
-max_lines = 91
-max_files = 8
+# Measured across H1-H4 and H9 (Cargo.toml 1, H1 14, H2 36, H3 19, H4 18, H9 see FORK_SURFACE.md,
+# H8 retired) plus headroom.
+max_lines = 135
+max_files = 12

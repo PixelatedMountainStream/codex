@@ -467,7 +467,7 @@ async fn run_resume_picker_with_launch_context(
             codex_home: local_settings.codex_home.to_path_buf(),
         }),
         keymap: runtime_keymap,
-        initial_page_mode: if uses_remote_workspace {
+        initial_page_mode: if uses_remote_workspace || crate::resume_all_providers() {
             PageLoadMode::StoreDefault
         } else {
             PageLoadMode::StateDbOnly
@@ -528,7 +528,7 @@ pub async fn run_fork_picker_with_app_server(
             codex_home: local_settings.codex_home.to_path_buf(),
         }),
         keymap: runtime_keymap,
-        initial_page_mode: if uses_remote_workspace {
+        initial_page_mode: if uses_remote_workspace || crate::resume_all_providers() {
             PageLoadMode::StoreDefault
         } else {
             PageLoadMode::StateDbOnly
@@ -670,6 +670,9 @@ async fn picker_provider_filter(
     config: &Config,
     app_server: &AppServerSession,
 ) -> Result<ProviderFilter> {
+    if crate::resume_all_providers() {
+        return Ok(ProviderFilter::Any);
+    }
     Ok(app_server
         .history_model_provider(config)
         .await?

@@ -317,6 +317,7 @@ pub(crate) async fn handle_output_item_done(
     item: ResponseItem,
     previously_active_item: Option<TurnItem>,
 ) -> Result<OutputItemResult> {
+    let item = codex_model_provider::codec_inbound(item);
     let mut output = OutputItemResult::default();
     let plan_mode = ctx.step_context.turn.mode() == ModeKind::Plan;
 

@@ -2809,6 +2809,7 @@ async fn try_run_sampling_request(
                 }
             }
             ResponseEvent::OutputItemAdded(mut item) => {
+                item = codex_model_provider::codec_inbound(item);
                 assign_missing_streamed_response_item_id(&mut item, /*active_item*/ None);
                 sess.reserve_assistant_message_order(&turn_context, &item)
                     .await;

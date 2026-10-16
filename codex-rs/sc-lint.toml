@@ -1,0 +1,9 @@
+# Fork-owned. Enforces crate/feature independence between codex-rs/local/* and
+# upstream crates (see boundaries/). Only the dependency rules run, so
+# upstream manifests are not linted.
+[tool.sc-lint]
+minimum_version = "0.4.0"
+
+[[tool.sc-lint.lint]]
+name = "fork-boundary"
+command = ["sc-lint", "lint", "sc-boundary", "--rule-filter", "dependencies"]

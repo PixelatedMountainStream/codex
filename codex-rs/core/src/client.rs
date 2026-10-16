@@ -912,7 +912,7 @@ impl ModelClient {
             self.state.thread_id.to_string().as_bytes(),
         );
         let mut prefix = Vec::new();
-        let tools = if model_info.use_responses_lite {
+        let mut tools = if model_info.use_responses_lite {
             if !prompt.tools.is_empty() {
                 let tools = create_tools_json_for_responses_lite(&prompt.tools)?;
                 prefix.push(ResponseItem::AdditionalTools {
@@ -926,7 +926,7 @@ impl ModelClient {
             }
             None
         } else {
-            Some(create_tools_raw_json_for_responses_api(&prompt.tools)?.into())
+            Some(create_tools_raw_json_for_responses_api(&prompt.tools)?)
         };
         if !prompt.base_instructions.text.is_empty() {
             let mut instructions = ContextualUserFragment::into(BaseInstructionsFragment(
@@ -950,6 +950,7 @@ impl ModelClient {
                     *encrypted_function_args = None;
                 }
             }
+            codex_model_provider::codec_outbound(&mut tools, &mut input)?;
         }
         let reasoning = self.build_reasoning(model_info, effort, summary);
         let stream_options = (self.state.concurrent_reasoning_summaries_enabled
@@ -996,7 +997,7 @@ impl ModelClient {
         let request = ResponsesApiRequest {
             model: model_info.slug.clone(),
             input,
-            tools,
+            tools: tools.map(Into::into),
             tool_choice: "auto".to_string(),
             parallel_tool_calls: prompt.parallel_tool_calls && !model_info.use_responses_lite,
             reasoning: Some(reasoning),

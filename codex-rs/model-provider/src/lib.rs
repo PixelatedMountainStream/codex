@@ -31,7 +31,9 @@ pub use codex_model_provider_info::AMAZON_BEDROCK_RUNTIME_PROVIDER_ID;
 pub use codex_model_provider_info::CHATGPT_CODEX_BASE_URL;
 pub use codex_model_provider_info::RemoteCompactionSupport;
 pub use codex_protocol::account::ProviderAccount;
+pub use provider::LocalModelsFactory;
 pub use provider::ModelProvider;
+pub use provider::register_local_models_factory;
 pub use provider::ModelProviderFuture;
 pub use provider::ProviderAccountError;
 pub use provider::ProviderAccountResult;
@@ -39,6 +41,7 @@ pub use provider::ProviderAccountState;
 pub use provider::ProviderAuthRecoveryMessages;
 pub use provider::ProviderUnauthorizedRecovery;
 pub use provider::SharedModelProvider;
+pub use provider::{CodecTools, LocalWireCodec, codec_inbound, codec_outbound, register_local_codec};
 pub use provider::create_model_provider;
 
 #[cfg(test)]

@@ -812,6 +812,7 @@ async fn lookup_session_target_with_app_server(
     }
 
     let model_provider = app_server.history_model_provider(config).await?;
+    let model_provider = model_provider.filter(|_| !crate::resume_all_providers());
     Ok(named_session_lookup::lookup(
         app_server,
         config.codex_home.as_path(),
@@ -833,10 +834,14 @@ async fn lookup_latest_session_target_with_app_server(
 ) -> color_eyre::Result<Option<resume_picker::SessionTarget>> {
     let uses_remote_workspace = app_server.uses_remote_workspace();
     let model_provider = app_server.history_model_provider(config).await?;
+    let model_provider = model_provider.filter(|_| !resume_all_providers());
     for lookup_mode in [
         LatestSessionLookupMode::StateDbOnly,
         LatestSessionLookupMode::ScanAndRepair,
     ] {
+        if resume_all_providers() && lookup_mode == LatestSessionLookupMode::StateDbOnly {
+            continue;
+        }
         let response = app_server
             .thread_list(latest_session_lookup_params(
                 uses_remote_filesystem,
@@ -862,6 +867,12 @@ async fn lookup_latest_session_target_with_app_server(
         }
     }
     Ok(None)
+}
+
+/// codex-local hook (H4): all-providers, filesystem-first resume lookups.
+pub static RESUME_ALL_PROVIDERS: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+pub(crate) fn resume_all_providers() -> bool {
+    RESUME_ALL_PROVIDERS.get().is_some()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
