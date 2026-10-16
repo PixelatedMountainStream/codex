@@ -20,6 +20,7 @@ use codex_models_manager::manager::SharedModelsManager;
 use codex_models_manager::manager::StaticModelsManager;
 use codex_protocol::account::ProviderAccount;
 use codex_protocol::error::CodexErr;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelsResponse;
 
 use crate::ProviderCapabilities;
@@ -367,6 +368,29 @@ pub fn register_local_models_factory(factory: LocalModelsFactory) {
 
 fn local_models_manager(info: &ModelProviderInfo) -> Option<SharedModelsManager> {
     (info.name == "codex-local").then(|| LOCAL_MODELS_FACTORY.get().map(|f| f(info)))?
+}
+
+/// codex-local hook H9: wire codec registered by `codex-local-cli`; no-ops when unregistered.
+pub type CodecTools = Option<Arc<serde_json::value::RawValue>>;
+pub struct LocalWireCodec {
+    pub outbound: fn(&mut CodecTools, &mut Vec<ResponseItem>) -> serde_json::Result<()>,
+    pub inbound: fn(ResponseItem) -> ResponseItem,
+}
+static LOCAL_CODEC: std::sync::OnceLock<LocalWireCodec> = std::sync::OnceLock::new();
+
+pub fn register_local_codec(codec: LocalWireCodec) {
+    let _ = LOCAL_CODEC.set(codec);
+}
+
+pub fn codec_outbound(t: &mut CodecTools, i: &mut Vec<ResponseItem>) -> serde_json::Result<()> {
+    LOCAL_CODEC.get().map_or(Ok(()), |c| (c.outbound)(t, i))
+}
+
+pub fn codec_inbound(item: ResponseItem) -> ResponseItem {
+    match LOCAL_CODEC.get() {
+        Some(c) => (c.inbound)(item),
+        None => item,
+    }
 }
 
 /// Runtime model provider that orchestrates primary and gateway credentials.
@@ -1436,5 +1460,14 @@ printf '%s\n' '{"AccessKeyId":"exported","SecretAccessKey":"secret"}'
         assert_eq!(CALLS.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(local_models_manager(&named("codex-local")).is_some());
         assert_eq!(CALLS.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn local_codec_is_identity_when_unregistered() {
+        let mut input = vec![ResponseItem::Other];
+        let mut tools = None;
+        codec_outbound(&mut tools, &mut input).unwrap();
+        assert!(tools.is_none() && input == vec![ResponseItem::Other]);
+        assert_eq!(codec_inbound(ResponseItem::Other), ResponseItem::Other);
     }
 }

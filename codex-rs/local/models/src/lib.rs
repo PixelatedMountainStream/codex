@@ -12,6 +12,8 @@ pub use engine::resolve_engine;
 pub use v1::V1Model;
 pub use v1::list_v1_models;
 
+pub mod codec;
+
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;

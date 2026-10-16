@@ -9,7 +9,7 @@
 | H5 | TODO | TODO | TODO |
 | H6 | TODO | TODO | TODO |
 | H7 | TODO | TODO | TODO |
-| H8 | `codex-rs/core/src/tools/router.rs` | `ToolRouter::unflatten_tool_name` (+1 call in `dispatch_tool_call_with_code_mode_result_inner`): when a call has no/default namespace, its dotted name misses the registry, and the split at the first dot hits, dispatch under the split `(namespace, name)`. Works around Ollama flattening Responses `namespace` into the name (`multi_agent_v1.spawn_agent`). Unconditional: OpenAI names match `^[a-zA-Z0-9_-]+$`, so stock behaviour is unchanged. History keeps the model's original item. 16 upstream lines in router.rs (tests in router_tests.rs). Re-apply: add the method and call it on `tool_name` right after destructuring `call`. | done |
+| H9 | `codex-rs/model-provider/src/provider.rs` (+ 1 `pub use` line in `lib.rs`), `codex-rs/core/src/client.rs`, `codex-rs/core/src/stream_events_utils.rs` | Local wire codec (replaces retired H8). `OnceLock` `LOCAL_CODEC` (`LocalWireCodec{outbound,inbound}`) + `register_local_codec`, `codec_outbound`, `codec_inbound`; both wrappers return immediately when unregistered. client.rs: `codec_outbound(&mut tools, &mut input)?` after the `!is_openai` input loop (`tools` is now `Option<Arc<RawValue>>` until the request struct, `tools.map(Into::into)`). stream_events_utils.rs: `let item = codec_inbound(item);` at the top of `handle_output_item_done`. Logic in `codex-rs/local/models/src/codec.rs` (`Mode::{Flatten, DottedInbound}`), registered by `codex-local-cli`. Re-apply: add the static/wrappers + identity test in provider.rs and the re-export in lib.rs; make the 4 client.rs edits (`let mut tools`, drop `.into()`, hook, `tools.map(Into::into)`); add the 1 line in stream_events_utils.rs. | done |
 
 ## Hook tests
 
@@ -17,7 +17,7 @@ One line per hook, read by `local/scripts/sync_upstream.py check` and the rust j
 
 - Tests: `cargo test -p codex-model-provider local_models_factory` (H2)
 - Tests: `cargo test -p codex-local-resume` (H3)
-- Tests: `cargo test -p codex-core --lib unflatten_tool_name` (H8)
+- Tests: `cargo test -p codex-model-provider local_codec` and `cargo test -p codex-local-models codec` (H9)
 
 ## H1 re-apply recipe
 

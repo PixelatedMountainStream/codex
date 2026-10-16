@@ -80,6 +80,7 @@ fn main() -> anyhow::Result<()> {
     // SAFETY: still single-threaded; no runtime or worker threads exist yet.
     unsafe { std::env::set_var("CODEX_HOME", &codex_home) };
     codex_local_models::register();
+    codex_local_models::codec::register(codex_local_models::codec::Mode::DottedInbound);
     codex_local_resume::register();
     let remote_control_disabled = codex_app_server::take_remote_control_disabled_env();
     arg0_dispatch_or_else(move |arg0_paths: Arg0DispatchPaths| async move {

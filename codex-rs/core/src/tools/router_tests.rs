@@ -649,21 +649,3 @@ fn namespace_function_names(specs: &[ToolSpec], namespace_name: &str) -> Vec<Str
         })
         .unwrap_or_default()
 }
-
-#[tokio::test]
-async fn unflatten_tool_name_splits_only_registered_dotted_names() {
-    let (_, turn) = make_session_and_context().await;
-    let turn = Arc::new(turn);
-    let step_context = StepContext::for_test(Arc::clone(&turn));
-    let router = test_tool_router(
-        step_context.as_ref(),
-        Vec::new(),
-        Vec::new(),
-        &turn.dynamic_tools,
-    );
-
-    let split = router.unflatten_tool_name(ToolName::plain("functions.exec_command"));
-    assert_eq!(split, ToolName::namespaced("functions", "exec_command"));
-    let unknown = ToolName::plain("nope.exec_command");
-    assert_eq!(router.unflatten_tool_name(unknown.clone()), unknown);
-}

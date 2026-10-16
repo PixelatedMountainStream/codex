@@ -41,6 +41,7 @@ pub use provider::ProviderAccountState;
 pub use provider::ProviderAuthRecoveryMessages;
 pub use provider::ProviderUnauthorizedRecovery;
 pub use provider::SharedModelProvider;
+pub use provider::{CodecTools, LocalWireCodec, codec_inbound, codec_outbound, register_local_codec};
 pub use provider::create_model_provider;
 
 #[cfg(test)]

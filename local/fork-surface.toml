@@ -26,8 +26,8 @@ allow = [
     "codex-rs/Cargo.toml",
     "codex-rs/cli/src/main.rs",
     "codex-rs/cli/build.rs",
-    "codex-rs/core/src/tools/router.rs",
-    "codex-rs/core/src/tools/router_tests.rs",
+    "codex-rs/core/src/client.rs",
+    "codex-rs/core/src/stream_events_utils.rs",
     "codex-rs/model-provider/src/provider.rs",
     "codex-rs/model-provider/src/lib.rs",
     "codex-rs/core/src/lib.rs",
@@ -38,7 +38,7 @@ allow = [
 generated = ["codex-rs/Cargo.lock"]
 
 [budget]
-# Measured 122 lines / 11 files across H1-H4 and H8 (Cargo.toml 1, H1 14, H2 36, H3 19, H4 18,
-# H8 34 incl. tests) plus ~10% headroom.
+# Measured across H1-H4 and H9 (Cargo.toml 1, H1 14, H2 36, H3 19, H4 18, H9 see FORK_SURFACE.md,
+# H8 retired) plus headroom.
 max_lines = 135
 max_files = 12
