@@ -3,8 +3,13 @@
 use std::fmt;
 use std::str::FromStr;
 
-/// Placeholder default model for LM Studio (the default engine); change it here only.
-pub const LMSTUDIO_DEFAULT_MODEL: &str = "qwen3.8-27b-mlx";
+/// Default model for LM Studio (the default engine): the 4-bit MLX build
+/// `lmstudio-community/Qwen3.8-27B-MLX-4bit`. The 8-bit build stays usable with
+/// `-m qwen3.8-27b-mlx`. Change it here only.
+pub const LMSTUDIO_DEFAULT_MODEL: &str = "qwen/qwen3.8-27b";
+
+/// Earlier LM Studio default (the 8-bit build). Homes seeded with it are treated as unset.
+pub const LMSTUDIO_LEGACY_DEFAULT_MODEL: &str = "qwen3.8-27b-mlx";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Engine {
@@ -49,7 +54,8 @@ impl Engine {
 
     /// Whether `model` is the built-in default model of some engine (a seed, not a choice).
     pub fn is_default_model(model: &str) -> bool {
-        Engine::ALL.iter().any(|e| e.default_model() == Some(model))
+        model == LMSTUDIO_LEGACY_DEFAULT_MODEL
+            || Engine::ALL.iter().any(|e| e.default_model() == Some(model))
     }
 
     /// `None` for llama.cpp: it serves whatever it loaded (first `/v1/models` id).
@@ -103,6 +109,14 @@ pub fn resolve_engine(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_and_new_lmstudio_defaults_both_read_as_seeds() {
+        assert!(Engine::is_default_model("qwen3.8-27b-mlx"));
+        assert!(Engine::is_default_model(LMSTUDIO_DEFAULT_MODEL));
+        assert_eq!(LMSTUDIO_DEFAULT_MODEL, "qwen/qwen3.8-27b");
+        assert!(!Engine::is_default_model("something-else"));
+    }
 
     #[test]
     fn parse_and_precedence() {

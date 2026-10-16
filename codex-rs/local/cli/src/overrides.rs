@@ -293,7 +293,7 @@ mod tests {
             &a,
             "model_providers.codex-local.base_url=\"http://127.0.0.1:1234/v1\""
         ));
-        assert!(has(&a, "model=\"qwen3.8-27b-mlx\""));
+        assert!(has(&a, "model=\"qwen/qwen3.8-27b\""));
         assert!(!a.url_explicit);
         let a = applied(
             &["x", "--engine=lmstudio", "--base-url", "h:9", "exec"],

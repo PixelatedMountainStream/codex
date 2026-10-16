@@ -20,7 +20,7 @@ reliable ONLY on narrow, fully-specified, single-shot units paired with a cheap 
 ## Setup (zero-config)
 
 `codex-local` is installed beside stock `codex` (`local/scripts/install.py`). It defaults to
-engine LM Studio, model `qwen3.8-27b-mlx` (placeholder) on `http://127.0.0.1:1234` (PAIR's LM Studio facade). Ollama (`qwen3.8:27b`, port 11434) and llama.cpp are one flag away. Overrides:
+engine LM Studio, model `qwen/qwen3.8-27b` (4-bit MLX; the 8-bit build is `-m qwen3.8-27b-mlx`) on `http://127.0.0.1:1234` (PAIR's LM Studio facade). Ollama (`qwen3.8:27b`, port 11434) and llama.cpp are one flag away. Overrides:
 `-m MODEL`, `--base-url URL` (alias `--ollama-url`), `--engine ollama|lmstudio|llamacpp`, env
 `CODEX_LOCAL_MODEL` / `CODEX_LOCAL_URL` / `CODEX_LOCAL_OLLAMA_URL` / `OLLAMA_HOST` /
 `CODEX_LOCAL_ENGINE`. The engine can also be set in codex-local's config.toml
