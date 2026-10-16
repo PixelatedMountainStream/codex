@@ -50,6 +50,8 @@ pub fn apply_overrides(
 ) -> Result<Applied> {
     let mut rest = Vec::with_capacity(args.len());
     let mut flag_url: Option<String> = None;
+    // `--ollama-url` is an alias of `--base-url`, but only it implies the Ollama engine.
+    let mut flag_url_is_ollama = false;
     let mut flag_engine: Option<String> = None;
     let mut has_model_flag = false;
     let mut flag_model: Option<String> = None;
@@ -65,6 +67,7 @@ pub fn apply_overrides(
         if s == "--" {
             after_dd = true;
         } else if s == "--ollama-url" || s == "--base-url" {
+            flag_url_is_ollama = s == "--ollama-url";
             match it.next() {
                 Some(v) => flag_url = Some(v.to_string_lossy().into_owned()),
                 None => bail!("{s} requires a value"),
@@ -74,6 +77,7 @@ pub fn apply_overrides(
             .strip_prefix("--ollama-url=")
             .or_else(|| s.strip_prefix("--base-url="))
         {
+            flag_url_is_ollama = s.starts_with("--ollama-url=");
             flag_url = Some(v.to_string());
             continue;
         } else if s == "--engine" {
@@ -105,12 +109,22 @@ pub fn apply_overrides(
         rest.push(a);
     }
 
-    let (engine, engine_explicit) = resolve_engine(
+    let (mut engine, mut engine_explicit) = resolve_engine(
         flag_engine.as_deref(),
         env("CODEX_LOCAL_ENGINE").as_deref(),
         config_engine.as_deref(),
     )
     .map_err(anyhow::Error::msg)?;
+    // An Ollama-specific URL input implies Ollama unless an engine was set explicitly
+    // (the generic `--base-url`/`CODEX_LOCAL_URL` imply nothing).
+    if !engine_explicit
+        && (flag_url_is_ollama
+            || env("CODEX_LOCAL_OLLAMA_URL").is_some()
+            || env("OLLAMA_HOST").is_some())
+    {
+        engine = Engine::Ollama;
+        engine_explicit = true;
+    }
     let explicit_root = match flag_url {
         Some(u) => Some(resolve_ollama_root(&u)?),
         None => env_ollama_root(env)?,
@@ -227,6 +241,23 @@ mod tests {
 
     fn has(a: &Applied, kv: &str) -> bool {
         a.argv.iter().any(|s| s == kv)
+    }
+
+    #[test]
+    fn ollama_url_inputs_imply_ollama_engine() {
+        let a = applied(&["x", "--ollama-url", "h:1"], &[], None);
+        assert_eq!(a.engine, Engine::Ollama);
+        assert!(has(&a, "model=\"qwen3.8:27b\""));
+        let a = applied(&["x"], &[("OLLAMA_HOST", "h:1")], None);
+        assert_eq!(a.engine, Engine::Ollama);
+        let a = applied(
+            &["x", "--engine", "lmstudio", "--ollama-url", "h:1"],
+            &[],
+            None,
+        );
+        assert_eq!(a.engine, Engine::LmStudio);
+        let a = applied(&["x", "--base-url", "h:1"], &[], None);
+        assert_eq!(a.engine, Engine::LmStudio);
     }
 
     #[test]
