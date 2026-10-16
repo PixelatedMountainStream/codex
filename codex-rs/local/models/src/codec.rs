@@ -7,7 +7,8 @@
 //! Known limits (documented, not fixed): aliases appear in telemetry and raw-capture
 //! because those observers run before inbound canonicalisation; one engine per
 //! codex-local process (no mixed-engine threads); the per-request literal set is
-//! process-wide, so concurrent sub-agents with different tool sets can race on it;
+//! process-wide and grow-only (if a literal first appears after a plain alias with the
+//! same text was sent, the literal wins);
 //! `AdditionalTools`/`ToolSearchOutput` are only produced for OpenAI-hosted paths
 //! (responses-lite, hosted tool_search) and never reach local engines, so they are not
 //! translated; streamed argument deltas of flattened custom calls arrive as function
@@ -45,7 +46,7 @@ type Pair = (Option<String>, String);
 #[derive(Default)]
 struct Codec {
     rev: HashMap<String, (Pair, Kind)>,
-    /// Literal top-level function names of the latest request; never reverse-mapped.
+    /// Every literal top-level function name ever sent (grow-only); never reverse-mapped.
     literals: HashSet<String>,
 }
 
@@ -97,7 +98,7 @@ fn naive(ns: Option<&str>, name: &str) -> String {
     }
 }
 
-/// Hashed alias: `trunc54(naive) + "_" + hex8(sha256(tag ns \0 name [\0 salt]))`.
+/// Hashed alias: `trunc54(naive) + "_h" + hex8(sha256(tag ns \0 name [\0 salt]))`.
 /// `tag` separates `None` from `Some("")`; `salt == 0` hashes no salt.
 fn hashed(ns: Option<&str>, name: &str, salt: u32) -> String {
     let mut h = Sha256::new();
@@ -116,32 +117,44 @@ fn hashed(ns: Option<&str>, name: &str, salt: u32) -> String {
         .map(|b| format!("{b:02x}"))
         .collect();
     let head: String = naive(ns, name).chars().take(54).collect();
-    format!("{head}_{hex}")
+    format!("{head}_h{hex}")
+}
+
+/// True when `s` ends in `_h` + 8 lowercase hex characters (the hashed alias space).
+fn in_hashed_space(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() >= 10
+        && b[b.len() - 10..b.len() - 8] == *b"_h"
+        && b[b.len() - 8..]
+            .iter()
+            .all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Pure, deterministic alias of `(ns, name)` (depends on nothing else).
 ///
-/// Plain form `P(ns, name)`: `name` when `ns` is `None`, else `ns + "__" + name`. It is
-/// used only when `ns`/`name` are unchanged by `sanitize`, `len(P) <= 64`, and:
-///   * `ns == None`: `name` contains no `"__"`;
-///   * `ns == Some`: `name` contains no `"__"` and does not start with `'_'`
-///     (`ns` is unrestricted, so MCP namespaces `mcp__server__` work; they yield
-///     `mcp__server____tool`).
-/// Injectivity: a plain `None` alias never contains `"__"`, a plain `Some` alias
-/// always does, so the two never collide. For `Some`, the last `"__"` in `P` starts
-/// exactly at `len(ns)`: an occurrence starting later would lie inside `name` (barred)
-/// or straddle the separator and `name[0]` (barred by the no-leading-`'_'` rule), and
-/// `P` has no later separator. So `ns = P[..i]`, `name = P[i+2..]` with `i` the last
-/// `"__"` index recovers the pair uniquely. Otherwise the hashed form is used
-/// (`salt` 0), which is deterministic too; `salt > 0` is only for literal conflicts.
+/// Two disjoint alias spaces. Hashed aliases always end in `_h` + 8 lowercase hex.
+/// A plain alias `P(ns, name)` (`name` when `ns` is `None`, else `ns + "__" + name`) is
+/// used only when `ns`/`name` are unchanged by `sanitize`, `len(P) <= 64`, `name`
+/// contains no `"__"` and does not start with `'_'`, and `P` is NOT in the hashed
+/// space. Otherwise (or when `salt > 0`, used only for literal conflicts) the hashed
+/// form is used.
+///  1. plain vs plain: a plain `None` alias has no `"__"` (name has none, no leading
+///     `'_'`), a plain `Some` alias has one; so the kinds never collide. For `Some`,
+///     the last `"__"` in `P` starts exactly at `len(ns)`: a later occurrence would
+///     lie inside `name` (barred) or straddle the separator and `name[0]` (barred), so
+///     splitting at the last `"__"` recovers `(ns, name)` uniquely. `ns` is otherwise
+///     unrestricted, so MCP namespaces `mcp__server__` work.
+///  2. plain vs hashed: disjoint by construction (plain never matches `_h[0-9a-f]{8}$`).
+///  3. hashed vs hashed: equal only on a 32-bit sha256 prefix collision, which
+///     `Codec::remember` detects in the reverse map and turns into an outbound error.
 fn alias_of(ns: Option<&str>, name: &str, salt: u32) -> String {
     let clean = ns.is_none_or(|n| sanitize(n) == n)
         && sanitize(name) == name
         && !name.contains("__")
-        && (ns.is_none() || !name.starts_with('_'));
+        && !name.starts_with('_');
     if salt == 0 && clean {
         let plain = naive(ns, name);
-        if plain.len() <= 64 {
+        if plain.len() <= 64 && !in_hashed_space(&plain) {
             return plain;
         }
     }
@@ -185,36 +198,40 @@ impl Codec {
             let list: Vec<Value> = serde_json::from_str(raw.get())?;
             match mode {
                 Mode::Flatten => {
-                    let flat = self.flatten_tools(list);
+                    let flat = self.flatten_tools(list)?;
                     *tools = Some(Arc::from(serde_json::value::to_raw_value(&flat)?));
                 }
-                Mode::DottedInbound => self.index_dotted(&list),
+                Mode::DottedInbound => self.index_dotted(&list)?,
             }
         }
         if mode == Mode::Flatten {
             for item in input.iter_mut() {
                 let taken = std::mem::replace(item, ResponseItem::Other);
-                *item = self.out_item(taken);
+                *item = self.out_item(taken)?;
             }
         }
         Ok(())
     }
 
     /// Dotted names are looked up as `ns.tool` through the same exact map.
-    fn index_dotted(&mut self, list: &[Value]) {
+    fn index_dotted(&mut self, list: &[Value]) -> serde_json::Result<()> {
+        for t in list.iter().filter(|t| t["type"] == "function") {
+            self.literals
+                .insert(t["name"].as_str().unwrap_or_default().to_string());
+        }
         for t in list.iter().filter(|t| t["type"] == "namespace") {
             let ns = t["name"].as_str().unwrap_or_default();
             for inner in t["tools"].as_array().into_iter().flatten() {
                 let name = inner["name"].as_str().unwrap_or_default();
                 let pair = (Some(ns.to_string()), name.to_string());
-                self.remember(&format!("{ns}.{name}"), pair, kind_of(inner), true);
+                self.remember(&format!("{ns}.{name}"), pair, kind_of(inner), true)?;
             }
         }
+        Ok(())
     }
 
-    fn flatten_tools(&mut self, list: Vec<Value>) -> Vec<Value> {
+    fn flatten_tools(&mut self, list: Vec<Value>) -> serde_json::Result<Vec<Value>> {
         // Pass 1: collect (ns, name, tool) to translate, and literal top-level names.
-        let mut literals: HashSet<String> = HashSet::new();
         let mut entries: Vec<(Pair, Value)> = Vec::new();
         let mut slots: Vec<Result<Value, usize>> = Vec::new();
         for t in list {
@@ -229,12 +246,11 @@ impl Codec {
                 slots.push(Err(entries.len()));
                 entries.push(((None, name), t));
             } else {
-                literals.insert(name);
+                self.literals.insert(name);
                 slots.push(Ok(t));
             }
         }
-        // Aliases are pure; only a literal-name conflict in this request forces a salt.
-        self.literals = literals;
+        // Aliases are pure; only a conflict with a literal ever sent forces a salt.
         let mut out = Vec::new();
         for slot in slots {
             match slot {
@@ -242,17 +258,23 @@ impl Codec {
                 Err(i) => {
                     let (pair, tool) = &entries[i];
                     let kind = kind_of(tool);
-                    let alias = self.alias(pair.0.as_deref(), &pair.1, kind, true);
+                    let alias = self.alias(pair.0.as_deref(), &pair.1, kind, true)?;
                     out.push(as_function(tool.clone(), &alias));
                 }
             }
         }
-        out
+        Ok(out)
     }
 
-    /// Records `alias -> pair`. The mapping is injective, so a different pair under the
-    /// same alias is a bug (or a 32-bit hash collision): log it and keep the first.
-    fn remember(&mut self, alias: &str, pair: Pair, kind: Kind, authoritative: bool) {
+    /// Records `alias -> pair`. A different pair under the same alias can only be a
+    /// 32-bit hash collision: fail the request rather than send an ambiguous alias.
+    fn remember(
+        &mut self,
+        alias: &str,
+        pair: Pair,
+        kind: Kind,
+        authoritative: bool,
+    ) -> serde_json::Result<()> {
         match self.rev.get_mut(alias) {
             Some((p, k)) if *p == pair => {
                 if authoritative {
@@ -261,17 +283,26 @@ impl Codec {
             }
             Some((p, _)) => {
                 tracing::error!(alias, existing = ?p, new = ?pair, "codec alias conflict");
-                debug_assert!(false, "codec alias conflict for {alias}");
+                return Err(serde_json::Error::io(std::io::Error::other(format!(
+                    "codec alias conflict for {alias}: {p:?} vs {pair:?}"
+                ))));
             }
             None => {
                 self.rev.insert(alias.to_string(), (pair, kind));
             }
         }
+        Ok(())
     }
 
-    /// Alias for tool definitions and history alike: the pure alias, salted only while it
-    /// equals a literal top-level function name of the current request.
-    fn alias(&mut self, ns: Option<&str>, name: &str, kind: Kind, tool_def: bool) -> String {
+    /// Alias for tool definitions and history alike: the pure alias, salted (still in
+    /// hashed space) while it equals any literal top-level function name ever sent.
+    fn alias(
+        &mut self,
+        ns: Option<&str>,
+        name: &str,
+        kind: Kind,
+        tool_def: bool,
+    ) -> serde_json::Result<String> {
         let mut salt = 0;
         let mut a = alias_of(ns, name, salt);
         while self.literals.contains(&a) {
@@ -279,12 +310,12 @@ impl Codec {
             a = alias_of(ns, name, salt);
         }
         let pair = (ns.map(str::to_string), name.to_string());
-        self.remember(&a, pair, kind, tool_def);
-        a
+        self.remember(&a, pair, kind, tool_def)?;
+        Ok(a)
     }
 
-    fn out_item(&mut self, item: ResponseItem) -> ResponseItem {
-        match item {
+    fn out_item(&mut self, item: ResponseItem) -> serde_json::Result<ResponseItem> {
+        Ok(match item {
             ResponseItem::FunctionCall {
                 namespace: Some(ns),
                 name,
@@ -294,7 +325,7 @@ impl Codec {
                 call_id,
                 internal_chat_message_metadata_passthrough,
             } => {
-                let name = self.alias(Some(&ns), &name, Kind::Function, false);
+                let name = self.alias(Some(&ns), &name, Kind::Function, false)?;
                 ResponseItem::FunctionCall {
                     id,
                     name,
@@ -313,7 +344,9 @@ impl Codec {
                 output,
                 internal_chat_message_metadata_passthrough,
             } => {
-                let name = name.map(|n| self.alias(Some(&ns), &n, Kind::Function, false));
+                let name = name
+                    .map(|n| self.alias(Some(&ns), &n, Kind::Function, false))
+                    .transpose()?;
                 ResponseItem::FunctionCallOutput {
                     id,
                     call_id,
@@ -332,7 +365,7 @@ impl Codec {
                 internal_chat_message_metadata_passthrough,
                 ..
             } => {
-                let name = self.alias(namespace.as_deref(), &name, Kind::Custom, false);
+                let name = self.alias(namespace.as_deref(), &name, Kind::Custom, false)?;
                 ResponseItem::FunctionCall {
                     id,
                     name,
@@ -358,7 +391,7 @@ impl Codec {
                 internal_chat_message_metadata_passthrough,
             },
             other => other,
-        }
+        })
     }
 
     fn inbound(&self, _mode: Mode, item: ResponseItem) -> ResponseItem {
@@ -370,7 +403,7 @@ impl Codec {
         else {
             return item;
         };
-        // A literal function name of this request is never redirected.
+        // A literal function name ever sent is never redirected.
         if self.literals.contains(name) {
             return item;
         }
@@ -470,10 +503,10 @@ mod tests {
     }
 
     #[test]
-    fn colliding_pairs_get_distinct_stable_aliases_across_requests() {
+    fn review_case1_pairs_get_distinct_aliases() {
         let mut c = Codec::default();
         let r1 = flatten(&mut c, json!([ns_tool("a", &["b__c"])]));
-        let r2 = flatten(&mut c, json!([ns_tool("a__b", &["c"])]));
+        let r2 = flatten(&mut c, json!([ns_tool("a__b", &["c_4bf34dff"])]));
         let (a, b) = (
             r1[0]["name"].as_str().unwrap(),
             r2[0]["name"].as_str().unwrap(),
@@ -485,10 +518,40 @@ mod tests {
         );
         assert_eq!(
             c.inbound(Mode::Flatten, call(None, b)),
-            call(Some("a__b"), "c")
+            call(Some("a__b"), "c_4bf34dff")
         );
-        let again = flatten(&mut c, json!([ns_tool("a", &["b__c"])]));
-        assert_eq!(again[0]["name"], a);
+    }
+
+    #[test]
+    fn salted_literal_case_gets_distinct_aliases() {
+        let mut c = Codec::default();
+        let lit = json!({"type": "function", "name": "a__b", "parameters": {"type": "object"}});
+        let out = flatten(&mut c, json!([lit, ns_tool("a", &["b", "b_94fa8649"])]));
+        let (x, y) = (
+            out[1]["name"].as_str().unwrap(),
+            out[2]["name"].as_str().unwrap(),
+        );
+        assert_ne!(x, y);
+        assert_ne!(x, "a__b");
+        assert!(in_hashed_space(x));
+        assert_eq!(
+            c.inbound(Mode::Flatten, call(None, x)),
+            call(Some("a"), "b")
+        );
+        assert_eq!(
+            c.inbound(Mode::Flatten, call(None, y)),
+            call(Some("a"), "b_94fa8649")
+        );
+    }
+
+    #[test]
+    fn literal_from_earlier_request_is_never_reverse_mapped() {
+        let mut c = Codec::default();
+        let lit = json!({"type": "function", "name": "a__b", "parameters": {"type": "object"}});
+        flatten(&mut c, json!([lit, ns_tool("a.b", &["x"])]));
+        flatten(&mut c, json!([ns_tool("a", &["b"])]));
+        let l = call(None, "a__b");
+        assert_eq!(c.inbound(Mode::Flatten, l.clone()), l);
     }
 
     #[test]
