@@ -115,20 +115,25 @@ pub fn apply_overrides(
         config_engine.as_deref(),
     )
     .map_err(anyhow::Error::msg)?;
-    // An Ollama-specific URL input implies Ollama unless an engine was set explicitly
-    // (the generic `--base-url`/`CODEX_LOCAL_URL` imply nothing).
-    if !engine_explicit
-        && (flag_url_is_ollama
-            || env("CODEX_LOCAL_OLLAMA_URL").is_some()
-            || env("OLLAMA_HOST").is_some())
-    {
+    // The effective (winning) URL input and whether it is Ollama-specific. Only a winning
+    // Ollama-specific input (`--ollama-url`, `CODEX_LOCAL_OLLAMA_URL`, `OLLAMA_HOST`) implies
+    // Ollama; the generic `--base-url`/`CODEX_LOCAL_URL` imply nothing.
+    let (explicit_root, url_is_ollama) = match flag_url {
+        Some(u) => (Some(resolve_ollama_root(&u)?), flag_url_is_ollama),
+        None => {
+            let won = ["CODEX_LOCAL_URL", "CODEX_LOCAL_OLLAMA_URL", "OLLAMA_HOST"]
+                .into_iter()
+                .find(|k| env(k).is_some());
+            (
+                env_ollama_root(env)?,
+                won.is_some_and(|k| k != "CODEX_LOCAL_URL"),
+            )
+        }
+    };
+    if !engine_explicit && url_is_ollama {
         engine = Engine::Ollama;
         engine_explicit = true;
     }
-    let explicit_root = match flag_url {
-        Some(u) => Some(resolve_ollama_root(&u)?),
-        None => env_ollama_root(env)?,
-    };
     // Explicit URLs (flag, env, non-default config provider URL) beat engine default ports.
     let url_explicit = explicit_root.is_some() || config_root.is_some();
     let root = explicit_root.or_else(|| config_root.is_none().then(|| engine.default_root()));
@@ -257,6 +262,20 @@ mod tests {
         );
         assert_eq!(a.engine, Engine::LmStudio);
         let a = applied(&["x", "--base-url", "h:1"], &[], None);
+        assert_eq!(a.engine, Engine::LmStudio);
+        // A winning generic URL keeps the default engine despite an Ollama variable.
+        let a = applied(
+            &["x", "--base-url", "http://localhost:1234"],
+            &[("OLLAMA_HOST", "localhost:11434")],
+            None,
+        );
+        assert_eq!(a.engine, Engine::LmStudio);
+        assert!(has(&a, "model=\"qwen/qwen3.8-27b\""));
+        let a = applied(
+            &["x"],
+            &[("OLLAMA_HOST", "h:1"), ("CODEX_LOCAL_URL", "h:2")],
+            None,
+        );
         assert_eq!(a.engine, Engine::LmStudio);
     }
 
