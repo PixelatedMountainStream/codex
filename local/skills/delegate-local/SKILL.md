@@ -21,8 +21,10 @@ reliable ONLY on narrow, fully-specified, single-shot units paired with a cheap 
 
 `codex-local` is installed beside stock `codex` (`local/scripts/install.py`). It defaults to
 model `qwen3.8:27b` on `http://localhost:11434` (plain Ollama or a PAIR proxy). Overrides:
-`-m MODEL`, `--ollama-url URL`, env `CODEX_LOCAL_MODEL` / `CODEX_LOCAL_OLLAMA_URL` /
-`OLLAMA_HOST`. No profiles, tunnels, fleet files or node locks. Check with
+`-m MODEL`, `--base-url URL` (alias `--ollama-url`), `--engine ollama|lmstudio|llamacpp`, env
+`CODEX_LOCAL_MODEL` / `CODEX_LOCAL_URL` / `CODEX_LOCAL_OLLAMA_URL` / `OLLAMA_HOST` /
+`CODEX_LOCAL_ENGINE`. The engine can also be set in codex-local's config.toml
+(`[local]` table, `engine = "lmstudio"`); precedence is flag > env > config > `ollama`. No profiles, tunnels, fleet files or node locks. Check with
 `verify_install.py` (full) if a unit fails oddly.
 
 ## Green / Yellow / Red decisioning

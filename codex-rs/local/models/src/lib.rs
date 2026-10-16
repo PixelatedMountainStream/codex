@@ -1,7 +1,15 @@
 //! Ollama-backed model catalog for `codex-local` (`/model` picker, req 8).
 //!
-//! Lists models via `GET <root>/api/tags` (PAIR merges the cluster's models) and reads each
-//! context window via `POST <root>/api/show`.
+//! Lists models via `GET <root>/v1/models` (every engine serves it). The context window comes
+//! from the entry's `context_length`, else (Ollama-shaped bodies only) `POST <root>/api/show`.
+
+mod engine;
+mod v1;
+
+pub use engine::Engine;
+pub use engine::resolve_engine;
+pub use v1::V1Model;
+pub use v1::list_v1_models;
 
 use std::fmt;
 use std::sync::Arc;
@@ -33,8 +41,8 @@ use serde_json::Value;
 use tokio::sync::TryLockError;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-/// Matches upstream's fallback metadata when `/api/show` gives no context length.
-const FALLBACK_CONTEXT_WINDOW: i64 = 272_000;
+/// Used when neither `/v1/models` nor `/api/show` gives a context length.
+const FALLBACK_CONTEXT_WINDOW: i64 = 32_768;
 
 #[derive(Debug)]
 pub struct OllamaModelsEndpoint {
@@ -47,7 +55,7 @@ pub struct OllamaModelsEndpoint {
 fn warn_once(e: &dyn fmt::Display) {
     static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        tracing::warn!("codex-local: Ollama model list unavailable: {e}");
+        tracing::warn!("codex-local: model list unavailable: {e}");
     }
 }
 
@@ -81,40 +89,28 @@ impl OllamaModelsEndpoint {
     }
 
     async fn fetch(&self) -> CoreResult<Vec<ModelInfo>> {
-        let invalid = |e: &dyn fmt::Display| CodexErr::InvalidRequest(format!("ollama: {e}"));
-        let body: Value = self
-            .client
-            .get(format!("{}/api/tags", self.root))
-            .timeout(REQUEST_TIMEOUT)
-            .send()
+        let invalid = |e: &dyn fmt::Display| CodexErr::InvalidRequest(format!("local engine: {e}"));
+        let listed = list_v1_models(&self.client, &self.root, REQUEST_TIMEOUT)
             .await
-            .and_then(reqwest::Response::error_for_status)
             .map_err(|e| {
                 warn_once(&e);
                 invalid(&e)
-            })?
-            .json()
-            .await
-            .map_err(|e| invalid(&e))?;
-        let mut names: Vec<String> = Vec::new();
-        for m in body["models"].as_array().into_iter().flatten() {
-            if let Some(n) = m["name"].as_str().or_else(|| m["model"].as_str())
-                && !names.iter().any(|x| x == n)
-            {
-                names.push(n.to_string());
+            })?;
+        let mut set = tokio::task::JoinSet::new();
+        for (i, m) in listed.iter().enumerate() {
+            // Only Ollama-shaped answers need `/api/show`; others report the length inline.
+            if m.context_length.is_none() {
+                let (this, n) = (self.clone_light(), m.id.clone());
+                set.spawn(async move { (i, this.context_window(&n).await) });
             }
         }
-        let mut set = tokio::task::JoinSet::new();
-        for (i, n) in names.iter().enumerate() {
-            let (this, n) = (self.clone_light(), n.clone());
-            set.spawn(async move { (i, this.context_window(&n).await) });
-        }
-        let mut windows = vec![None; names.len()];
+        let mut windows: Vec<Option<i64>> = listed.iter().map(|m| m.context_length).collect();
         while let Some(Ok((i, w))) = set.join_next().await {
             windows[i] = w;
         }
-        Ok(names
+        Ok(listed
             .into_iter()
+            .map(|m| m.id)
             .zip(windows)
             .enumerate()
             .map(|(i, (name, w))| self.model_info(&name, w, i))
@@ -300,9 +296,10 @@ mod tests {
     async fn lists_tags_with_context_windows() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/api/tags"))
+            .and(path("/v1/models"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "models": [{"name": "a:1"}, {"name": "b:2"}, {"name": "c:3"}, {"name": "a:1"}]
+                "object": "list",
+                "data": [{"id": "a:1"}, {"id": "b:2"}, {"id": "c:3"}, {"id": "a:1"}]
             })))
             .mount(&server)
             .await;
@@ -330,9 +327,9 @@ mod tests {
     async fn catalog_is_ollama_only_without_bundled_models() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/api/tags"))
+            .and(path("/v1/models"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "models": [{"name": "a:1"}, {"name": "b:2"}, {"name": "c:3"}]
+                "data": [{"id": "a:1"}, {"id": "b:2"}, {"id": "c:3"}]
             })))
             .mount(&server)
             .await;
@@ -354,5 +351,46 @@ mod tests {
         ids.sort();
         assert_eq!(ids, vec!["a:1", "b:2", "c:3"]);
         assert!(ids.iter().all(|i| !i.starts_with("gpt-")));
+    }
+
+    /// LM Studio / PAIR shape: `/v1/models` only (with `context_length`); an LM Studio-shaped
+    /// `/api/tags` is ignored and `/api/show` is never called.
+    #[tokio::test]
+    async fn v1_models_only_uses_context_length_and_ignores_api_tags() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "m1", "context_length": 65536}, {"id": "m2"}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"models": [{"key": "bogus", "type": "llm"}]}),
+                ),
+            )
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/show"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let got = OllamaModelsEndpoint::new(server.uri(), false)
+            .fetch()
+            .await
+            .unwrap();
+        let got: Vec<_> = got
+            .iter()
+            .map(|m| (m.slug.as_str(), m.context_window))
+            .collect();
+        assert_eq!(
+            got,
+            vec![("m1", Some(65536)), ("m2", Some(FALLBACK_CONTEXT_WINDOW))]
+        );
     }
 }

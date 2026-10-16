@@ -14,19 +14,21 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
+pub use codex_local_models::Engine;
 pub use homes::Homes;
 pub use homes::resolve_homes;
 pub use links::ensure_home;
 pub use links::refresh_skills;
+pub use overrides::Applied;
 pub use overrides::apply_overrides;
 pub use preflight::check as preflight_check;
+pub use preflight::engine_hint;
 pub use preflight::failure_message as preflight_failure_message;
 pub use seed::seed_config;
 pub use sync::sync_config;
 pub use url::resolve_ollama_root;
 
 pub const DEFAULT_MODEL: &str = "qwen3.8:27b";
-pub const DEFAULT_OLLAMA_ROOT: &str = "http://localhost:11434";
 pub const PROVIDER_ID: &str = "codex-local";
 
 /// `<upstream-version>+local.<sha7>`; the sha comes from `build.rs`.
@@ -61,6 +63,9 @@ pub enum Action {
         codex_home: PathBuf,
         /// Ollama root to probe before delegating; `None` skips the preflight.
         preflight_root: Option<String>,
+        /// Model to look for on the other engines' default ports when the engine was
+        /// never chosen explicitly; `None` skips the probe.
+        probe_model: Option<String>,
     },
 }
 
@@ -72,25 +77,50 @@ pub fn prepare(args: Vec<OsString>, env: EnvFn, user_home: Option<PathBuf>) -> R
     }
     let homes = resolve_homes(env, user_home)?;
     ensure_home(&homes)?;
-    // Seed from env/built-ins only; a one-off --ollama-url flag must not persist.
-    let root = env_ollama_root(env)?.unwrap_or_else(|| DEFAULT_OLLAMA_ROOT.to_string());
-    seed_config(&homes, &root)?;
+    // Seed from env/built-ins only; a one-off --ollama-url/--engine flag must not persist.
+    let seed_engine = env("CODEX_LOCAL_ENGINE")
+        .map(|v| v.parse::<Engine>().map_err(anyhow::Error::msg))
+        .transpose()?
+        .unwrap_or_default();
+    let root = env_ollama_root(env)?.unwrap_or_else(|| seed_engine.default_root());
+    seed_config(&homes, &root, seed_engine)?;
     if first == Some("sync-config") {
         sync_config(&homes)?;
         return Ok(Action::SyncConfig);
     }
     let want_preflight = preflight::needs_preflight(&args, env);
-    let config_model = std::fs::read_to_string(homes.local.join("config.toml"))
+    let cfg = std::fs::read_to_string(homes.local.join("config.toml"))
         .ok()
-        .and_then(|t| t.parse::<toml::Table>().ok())
+        .and_then(|t| t.parse::<toml::Table>().ok());
+    let config_model = cfg
+        .as_ref()
         .and_then(|c| c.get("model").and_then(|m| m.as_str()).map(str::to_string))
         .or_else(|| Some(DEFAULT_MODEL.to_string()));
-    let argv = apply_overrides(args, env, config_model)?;
-    let preflight_root = want_preflight.then(|| effective_root(&argv, &homes, &root));
+    // `[local] engine = "ollama|lmstudio|llamacpp"` in codex-local's config.toml.
+    let config_engine = cfg
+        .as_ref()
+        .and_then(|c| c.get("local")?.get("engine")?.as_str().map(str::to_string));
+    let mut applied = apply_overrides(args, env, config_model, config_engine)?;
+    let preflight_root = want_preflight.then(|| effective_root(&applied.argv, &homes, &root));
+    // llama.cpp serves whatever it loaded: default to the first `/v1/models` id.
+    if let (Some(r), Engine::LlamaCpp, None) = (&preflight_root, applied.engine, &applied.model)
+        && !applied.argv.iter().any(|a| a == "-m" || a == "--model")
+        && let Some(id) = preflight::first_model_id(r)
+    {
+        applied.argv.insert(1, "-c".into());
+        applied
+            .argv
+            .insert(2, format!("model={}", toml::Value::String(id)).into());
+    }
+    let probe_model = (!applied.engine_explicit && !applied.url_explicit)
+        .then(|| applied.model.clone())
+        .flatten()
+        .filter(|_| want_preflight);
     Ok(Action::Run {
-        argv,
+        argv: applied.argv,
         codex_home: homes.local,
         preflight_root,
+        probe_model,
     })
 }
 
@@ -118,7 +148,7 @@ fn effective_root(argv: &[OsString], homes: &Homes, fallback: &str) -> String {
 }
 
 pub(crate) fn env_ollama_root(env: EnvFn) -> Result<Option<String>> {
-    for key in ["CODEX_LOCAL_OLLAMA_URL", "OLLAMA_HOST"] {
+    for key in ["CODEX_LOCAL_URL", "CODEX_LOCAL_OLLAMA_URL", "OLLAMA_HOST"] {
         if let Some(v) = env(key) {
             return resolve_ollama_root(&v).map(Some);
         }

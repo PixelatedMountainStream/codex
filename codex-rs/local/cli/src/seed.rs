@@ -5,6 +5,8 @@ use anyhow::Result;
 use toml::Table;
 use toml::Value;
 
+use codex_local_models::Engine;
+
 use crate::DEFAULT_MODEL;
 use crate::Homes;
 use crate::PROVIDER_ID;
@@ -33,7 +35,7 @@ pub(crate) fn web_search_server() -> Value {
     ])
 }
 
-pub(crate) fn seed_toml(root: &str, stock_home: &str) -> Result<String> {
+pub(crate) fn seed_toml(root: &str, stock_home: &str, engine: Engine) -> Result<String> {
     let s = |v: &str| Value::String(v.to_string());
     let provider = table([
         ("name", s("codex-local")),
@@ -68,7 +70,10 @@ pub(crate) fn seed_toml(root: &str, stock_home: &str) -> Result<String> {
         "mcp_servers".into(),
         table([(WEB_SEARCH_ID, web_search_server())]),
     );
-    t.insert("agents".into(), table([("max_threads", Value::Integer(6))]));
+    t.insert(
+        "agents".into(),
+        table([("max_threads", Value::Integer(engine.default_max_threads()))]),
+    );
     t.insert(
         "shell_environment_policy".into(),
         table([("set", table([("CODEX_HOME", s(stock_home))]))]),
@@ -77,21 +82,23 @@ pub(crate) fn seed_toml(root: &str, stock_home: &str) -> Result<String> {
 }
 
 /// Write codex-local's `config.toml` if absent. Returns whether it was written.
-pub fn seed_config(h: &Homes, root: &str) -> Result<bool> {
+pub fn seed_config(h: &Homes, root: &str, engine: Engine) -> Result<bool> {
     let path = h.local.join("config.toml");
     if path.exists() {
         return Ok(false);
     }
-    let body = seed_toml(root, &h.stock.to_string_lossy())?;
+    let body = seed_toml(root, &h.stock.to_string_lossy(), engine)?;
     fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
     Ok(true)
 }
 
 #[cfg(test)]
 mod tests {
+    use codex_local_models::Engine;
+
     #[test]
     fn seeds_six_agent_threads() {
-        let body = super::seed_toml("http://127.0.0.1:11434", "/h").unwrap();
+        let body = super::seed_toml("http://127.0.0.1:11434", "/h", Engine::Ollama).unwrap();
         let v: toml::Value = toml::from_str(&body).unwrap();
         assert_eq!(v["agents"]["max_threads"].as_integer(), Some(6));
         assert_eq!(v["web_search"].as_str(), Some("disabled"));
@@ -100,5 +107,8 @@ mod tests {
         assert_eq!(ws["command"].as_str(), Some("uvx"));
         assert_eq!(ws["default_tools_approval_mode"].as_str(), Some("approve"));
         assert_eq!(ws["args"][0].as_str(), Some(super::WEB_SEARCH_PKG));
+        let lm = super::seed_toml("http://localhost:1234", "/h", Engine::LmStudio).unwrap();
+        let lm: toml::Value = toml::from_str(&lm).unwrap();
+        assert_eq!(lm["agents"]["max_threads"].as_integer(), Some(7));
     }
 }

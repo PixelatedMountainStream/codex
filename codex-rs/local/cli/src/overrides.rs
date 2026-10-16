@@ -3,6 +3,10 @@ use std::ffi::OsString;
 use anyhow::Result;
 use anyhow::bail;
 
+use codex_local_models::Engine;
+use codex_local_models::resolve_engine;
+
+use crate::DEFAULT_MODEL;
 use crate::EnvFn;
 use crate::PROVIDER_ID;
 use crate::env_ollama_root;
@@ -10,11 +14,27 @@ use crate::resolve_ollama_root;
 
 pub(crate) const MAX_RETRIES: u64 = 2;
 
-/// Strip `--ollama-url` (ours, unknown to upstream) and inject `-c` overrides right
+/// Result of [`apply_overrides`].
+#[derive(Debug)]
+pub struct Applied {
+    pub argv: Vec<OsString>,
+    pub engine: Engine,
+    /// Flag, env or config set the engine (else it is the `ollama` default).
+    pub engine_explicit: bool,
+    /// A URL flag or env var chose the root.
+    pub url_explicit: bool,
+    /// The model we injected (`None` when `-m`/`-c model=` was given, or llama.cpp
+    /// still needs its first `/v1/models` id).
+    pub model: Option<String>,
+}
+
+/// Strip `--engine`, `--base-url`/`--ollama-url` (ours, unknown to upstream) and inject `-c` overrides right
 /// after argv[0] (root-level, so they reach every subcommand).
 ///
-/// Precedence: flags (`-m`, `--ollama-url`) > `CODEX_LOCAL_MODEL` >
-/// `CODEX_LOCAL_OLLAMA_URL` > `OLLAMA_HOST` > config.toml > built-ins. `-m` is left to
+/// Precedence: flags (`-m`, `--base-url`/`--ollama-url`) > `CODEX_LOCAL_MODEL` >
+/// `CODEX_LOCAL_URL` > `CODEX_LOCAL_OLLAMA_URL` > `OLLAMA_HOST` > config.toml > built-ins.
+/// The engine is `--engine` > `CODEX_LOCAL_ENGINE` > config `[local] engine` > `ollama`;
+/// a non-Ollama engine with no URL override gets its default port and default model. `-m` is left to
 /// upstream (it already wins), so the env model is injected only when no model flag is
 /// present, else the configured model. Both the provider and the model are always
 /// injected: upstream's TUI only overrides a resumed session's rollout provider/model
@@ -24,9 +44,11 @@ pub fn apply_overrides(
     args: Vec<OsString>,
     env: EnvFn,
     config_model: Option<String>,
-) -> Result<Vec<OsString>> {
+    config_engine: Option<String>,
+) -> Result<Applied> {
     let mut rest = Vec::with_capacity(args.len());
     let mut flag_url: Option<String> = None;
+    let mut flag_engine: Option<String> = None;
     let mut has_model_flag = false;
     let mut it = args.into_iter();
     let argv0 = it.next();
@@ -39,14 +61,26 @@ pub fn apply_overrides(
         let s = a.to_string_lossy().into_owned();
         if s == "--" {
             after_dd = true;
-        } else if s == "--ollama-url" {
+        } else if s == "--ollama-url" || s == "--base-url" {
             match it.next() {
                 Some(v) => flag_url = Some(v.to_string_lossy().into_owned()),
-                None => bail!("--ollama-url requires a value"),
+                None => bail!("{s} requires a value"),
             }
             continue;
-        } else if let Some(v) = s.strip_prefix("--ollama-url=") {
+        } else if let Some(v) = s
+            .strip_prefix("--ollama-url=")
+            .or_else(|| s.strip_prefix("--base-url="))
+        {
             flag_url = Some(v.to_string());
+            continue;
+        } else if s == "--engine" {
+            match it.next() {
+                Some(v) => flag_engine = Some(v.to_string_lossy().into_owned()),
+                None => bail!("--engine requires a value"),
+            }
+            continue;
+        } else if let Some(v) = s.strip_prefix("--engine=") {
+            flag_engine = Some(v.to_string());
             continue;
         } else if s == "-m" || s == "--model" || s.starts_with("--model=") || s.starts_with("-m=") {
             has_model_flag = true;
@@ -56,9 +90,27 @@ pub fn apply_overrides(
         rest.push(a);
     }
 
+    let (engine, engine_explicit) = resolve_engine(
+        flag_engine.as_deref(),
+        env("CODEX_LOCAL_ENGINE").as_deref(),
+        config_engine.as_deref(),
+    )
+    .map_err(anyhow::Error::msg)?;
     let root = match flag_url {
         Some(u) => Some(resolve_ollama_root(&u)?),
         None => env_ollama_root(env)?,
+    };
+    let url_explicit = root.is_some();
+    // Seeded config points at Ollama; another engine needs its own default root.
+    let root = root.or_else(|| (engine != Engine::Ollama).then(|| engine.default_root()));
+    // The seeded Ollama default model is wrong for another engine.
+    let config_model = config_model.filter(|m| engine == Engine::Ollama || m != DEFAULT_MODEL);
+    let model = if has_model_flag {
+        None
+    } else {
+        env("CODEX_LOCAL_MODEL")
+            .or(config_model)
+            .or_else(|| engine.default_model().map(str::to_string))
     };
     let mut out: Vec<OsString> = argv0.into_iter().collect();
     let mut push_c = |kv: String| {
@@ -66,8 +118,8 @@ pub fn apply_overrides(
         out.push(kv.into());
     };
     push_c(format!("model_provider=\"{PROVIDER_ID}\""));
-    if !has_model_flag && let Some(m) = env("CODEX_LOCAL_MODEL").or(config_model) {
-        push_c(format!("model={}", toml::Value::String(m)));
+    if let Some(m) = &model {
+        push_c(format!("model={}", toml::Value::String(m.clone())));
     }
     if let Some(root) = root {
         let v = toml::Value::String(format!("{root}/v1"));
@@ -93,7 +145,13 @@ pub fn apply_overrides(
         }
     }
     out.extend(rest);
-    Ok(out)
+    Ok(Applied {
+        argv: out,
+        engine,
+        engine_explicit,
+        url_explicit,
+        model,
+    })
 }
 
 #[cfg(test)]
@@ -107,8 +165,9 @@ mod tests {
                 .map(|(_, v)| v.to_string())
         };
         let a = args.iter().map(OsString::from).collect();
-        apply_overrides(a, &f, Some("cfgm".to_string()))
+        apply_overrides(a, &f, Some("cfgm".to_string()), None)
             .unwrap()
+            .argv
             .iter()
             .map(|s| s.to_string_lossy().into_owned())
             .collect()
@@ -121,6 +180,92 @@ mod tests {
     const MD: &str = "model=\"cfgm\"";
     const DA: &str = "features.daemon_auto_start=false";
     const URL_KEY: &str = "model_providers.codex-local.base_url";
+
+    fn applied(args: &[&str], env: &[(&str, &str)], cfg_engine: Option<&str>) -> Applied {
+        let f = |k: &str| {
+            env.iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| v.to_string())
+        };
+        let a = args.iter().map(OsString::from).collect();
+        apply_overrides(
+            a,
+            &f,
+            Some(DEFAULT_MODEL.to_string()),
+            cfg_engine.map(str::to_string),
+        )
+        .unwrap()
+    }
+
+    fn has(a: &Applied, kv: &str) -> bool {
+        a.argv.iter().any(|s| s == kv)
+    }
+
+    #[test]
+    fn engine_precedence_flag_env_config_default() {
+        let a = applied(&["x", "exec"], &[], None);
+        assert_eq!((a.engine, a.engine_explicit), (Engine::Ollama, false));
+        assert!(
+            !a.argv
+                .iter()
+                .any(|s| s.to_string_lossy().contains("base_url"))
+        );
+        let a = applied(&["x", "exec"], &[], Some("lmstudio"));
+        assert_eq!((a.engine, a.engine_explicit), (Engine::LmStudio, true));
+        let a = applied(
+            &["x", "exec"],
+            &[("CODEX_LOCAL_ENGINE", "llamacpp")],
+            Some("lmstudio"),
+        );
+        assert_eq!(a.engine, Engine::LlamaCpp);
+        let a = applied(
+            &["x", "--engine", "ollama", "exec"],
+            &[("CODEX_LOCAL_ENGINE", "llamacpp")],
+            Some("lmstudio"),
+        );
+        assert_eq!(a.engine, Engine::Ollama);
+        assert!(!a.argv.iter().any(|s| s == "--engine" || s == "ollama"));
+        assert!(
+            apply_overrides(
+                vec!["x".into(), "--engine=bogus".into()],
+                &|_| None,
+                None,
+                None
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn non_ollama_engine_gets_port_and_model_unless_overridden() {
+        let a = applied(&["x", "--engine=lmstudio", "exec"], &[], None);
+        assert!(has(
+            &a,
+            "model_providers.codex-local.base_url=\"http://localhost:1234/v1\""
+        ));
+        assert!(has(&a, "model=\"qwen3.8-27b-mlx\""));
+        assert!(!a.url_explicit);
+        let a = applied(
+            &["x", "--engine=lmstudio", "--base-url", "h:9", "exec"],
+            &[],
+            None,
+        );
+        assert!(has(
+            &a,
+            "model_providers.codex-local.base_url=\"http://h:9/v1\""
+        ));
+        assert!(a.url_explicit);
+        let a = applied(
+            &["x", "--engine=llamacpp", "exec"],
+            &[("CODEX_LOCAL_URL", "h:8")],
+            None,
+        );
+        assert!(has(
+            &a,
+            "model_providers.codex-local.base_url=\"http://h:8/v1\""
+        ));
+        assert_eq!(a.model, None);
+    }
 
     #[test]
     fn nothing_set_changes_nothing() {
