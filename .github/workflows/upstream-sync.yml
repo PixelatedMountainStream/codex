@@ -41,6 +41,9 @@ jobs:
     timeout-minutes: 120
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Pin gh to this fork: the `upstream` remote added below would otherwise
+      # make gh target openai/codex for pr/issue commands.
+      GH_REPO: ${{ github.repository }}
     steps:
       - uses: actions/checkout@v4
         with:
