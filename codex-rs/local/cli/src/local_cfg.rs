@@ -14,7 +14,7 @@ use crate::Homes;
 pub(crate) const FILE: &str = "codex-local.toml";
 
 const TEMPLATE: &str = "# codex-local settings (read only by codex-local).\n\
-# Engine: ollama | lmstudio | llamacpp. Unset means ollama, with a hint if the model is\n\
+# Engine: ollama | lmstudio | llamacpp. Unset means lmstudio, with a hint if the model is\n\
 # found on another engine's default port.\n\
 # [local]\n\
 # engine = \"ollama\"\n";

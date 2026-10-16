@@ -29,7 +29,8 @@ pub use seed::seed_config;
 pub use sync::sync_config;
 pub use url::resolve_ollama_root;
 
-pub const DEFAULT_MODEL: &str = "qwen3.8:27b";
+/// Seeded model: the default engine's (LM Studio) placeholder model.
+pub const DEFAULT_MODEL: &str = codex_local_models::LMSTUDIO_DEFAULT_MODEL;
 pub const PROVIDER_ID: &str = "codex-local";
 
 /// `<upstream-version>+local.<sha7>`; the sha comes from `build.rs`.
@@ -62,7 +63,7 @@ pub enum Action {
     Run {
         argv: Vec<OsString>,
         codex_home: PathBuf,
-        /// Ollama root to probe before delegating; `None` skips the preflight.
+        /// Engine root to probe before delegating; `None` skips the preflight.
         preflight_root: Option<String>,
         /// Model to look for on the other engines' default ports when the engine was
         /// never chosen explicitly; `None` skips the probe.
@@ -79,12 +80,13 @@ pub fn prepare(args: Vec<OsString>, env: EnvFn, user_home: Option<PathBuf>) -> R
     let homes = resolve_homes(env, user_home)?;
     ensure_home(&homes)?;
     // Seed from env/built-ins only; a one-off --ollama-url/--engine flag must not persist.
-    // The seeded URL is always Ollama's (an engine's default port is injected at run time,
-    // after the winning engine is known), and a bad env engine must not abort here.
+    // The seeded URL is always the default engine's (LM Studio; any engine's default port is
+    // injected at run time, after the winning engine is known, so a seeded default root reads
+    // as "unset"), and a bad env engine must not abort here.
     let seed_engine = env("CODEX_LOCAL_ENGINE")
         .and_then(|v| v.parse::<Engine>().ok())
         .unwrap_or_default();
-    let root = env_ollama_root(env)?.unwrap_or_else(|| Engine::Ollama.default_root());
+    let root = env_ollama_root(env)?.unwrap_or_else(|| Engine::default().default_root());
     seed_config(&homes, &root, seed_engine)?;
     let config_engine = local_cfg::engine(&homes)?;
     if first == Some("sync-config") {
@@ -152,8 +154,9 @@ fn effective_root(argv: &[OsString], homes: &Homes, fallback: &str) -> String {
     .unwrap_or_else(|| fallback.to_string())
 }
 
-/// Provider root from config.toml, unless it is just the seeded Ollama default (which
-/// must not beat another engine's default port).
+/// Provider root from config.toml, unless it is just a seeded engine-default root (which
+/// must not beat the winning engine's default port). This also covers homes seeded with
+/// Ollama's root before LM Studio became the default.
 fn config_root(cfg: Option<&toml::Table>) -> Option<String> {
     let url = cfg?
         .get("model_providers")?
@@ -164,7 +167,7 @@ fn config_root(cfg: Option<&toml::Table>) -> Option<String> {
         .trim_end_matches('/')
         .trim_end_matches("/v1")
         .to_string();
-    (root != Engine::Ollama.default_root()).then_some(root)
+    (!Engine::is_default_root(&root)).then_some(root)
 }
 
 pub(crate) fn env_ollama_root(env: EnvFn) -> Result<Option<String>> {
@@ -235,7 +238,7 @@ mod tests {
         assert_eq!(cfg["model"].as_str(), Some(DEFAULT_MODEL));
         assert_eq!(
             cfg["model_providers"][PROVIDER_ID]["base_url"].as_str(),
-            Some("http://localhost:11434/v1")
+            Some("http://127.0.0.1:1234/v1")
         );
         assert_eq!(
             cfg["shell_environment_policy"]["set"]["CODEX_HOME"].as_str(),
@@ -304,18 +307,19 @@ mod tests {
         );
         let a = |v: &[&str]| v.iter().map(OsString::from).collect::<Vec<_>>();
         let act = prepare(a(&["x", "--engine", "ollama", "exec"]), &env, None).unwrap();
-        assert_eq!(base_url_arg(&act), None);
+        // The seeded LM Studio root reads as unset, so Ollama's own port is injected.
+        assert!(base_url_arg(&act).unwrap().contains(":11434/v1"));
         let env = run_env(
             tmp.path(),
             &[
-                ("CODEX_LOCAL_ENGINE", "lmstudio"),
+                ("CODEX_LOCAL_ENGINE", "llamacpp"),
                 ("CODEX_LOCAL_SKIP_PREFLIGHT", "1"),
             ],
         );
         let cfg = fs::read_to_string(tmp.path().join("local/config.toml")).unwrap();
-        assert!(cfg.contains("localhost:11434/v1"), "{cfg}");
+        assert!(cfg.contains("127.0.0.1:1234/v1"), "{cfg}");
         let act = prepare(a(&["x", "exec"]), &env, None).unwrap();
-        assert!(base_url_arg(&act).unwrap().contains(":1234/v1"));
+        assert!(base_url_arg(&act).unwrap().contains(":8080/v1"));
     }
 
     #[test]

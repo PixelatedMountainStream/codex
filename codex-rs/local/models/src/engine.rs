@@ -3,10 +3,13 @@
 use std::fmt;
 use std::str::FromStr;
 
+/// Placeholder default model for LM Studio (the default engine); change it here only.
+pub const LMSTUDIO_DEFAULT_MODEL: &str = "qwen3.8-27b-mlx";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Engine {
-    #[default]
     Ollama,
+    #[default]
     LmStudio,
     LlamaCpp,
 }
@@ -31,14 +34,29 @@ impl Engine {
     }
 
     pub fn default_root(self) -> String {
-        format!("http://localhost:{}", self.default_port())
+        format!("http://127.0.0.1:{}", self.default_port())
+    }
+
+    /// Whether `root` is some engine's built-in default root (either loopback spelling;
+    /// older homes were seeded with `localhost`). Such a root in `config.toml` is a seed,
+    /// not a user choice, so it must not beat the winning engine's own port.
+    pub fn is_default_root(root: &str) -> bool {
+        Engine::ALL.iter().any(|e| {
+            let p = e.default_port();
+            root == format!("http://127.0.0.1:{p}") || root == format!("http://localhost:{p}")
+        })
+    }
+
+    /// Whether `model` is the built-in default model of some engine (a seed, not a choice).
+    pub fn is_default_model(model: &str) -> bool {
+        Engine::ALL.iter().any(|e| e.default_model() == Some(model))
     }
 
     /// `None` for llama.cpp: it serves whatever it loaded (first `/v1/models` id).
     pub fn default_model(self) -> Option<&'static str> {
         match self {
             Engine::Ollama => Some("qwen3.8:27b"),
-            Engine::LmStudio => Some("qwen3.8-27b-mlx"),
+            Engine::LmStudio => Some(LMSTUDIO_DEFAULT_MODEL),
             Engine::LlamaCpp => None,
         }
     }
@@ -69,7 +87,7 @@ impl FromStr for Engine {
     }
 }
 
-/// Precedence: flag > env > config > default (`Ollama`). The bool is whether any
+/// Precedence: flag > env > config > default (`LmStudio`). The bool is whether any
 /// source set it explicitly.
 pub fn resolve_engine(
     flag: Option<&str>,
@@ -91,7 +109,8 @@ mod tests {
         assert_eq!("LMStudio".parse(), Ok(Engine::LmStudio));
         assert!("vllm".parse::<Engine>().is_err());
         let r = resolve_engine;
-        assert_eq!(r(None, None, None), Ok((Engine::Ollama, false)));
+        assert_eq!(r(None, None, None), Ok((Engine::LmStudio, false)));
+        assert_eq!(r(None, None, Some("ollama")), Ok((Engine::Ollama, true)));
         assert_eq!(
             r(None, None, Some("lmstudio")),
             Ok((Engine::LmStudio, true))

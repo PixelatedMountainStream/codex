@@ -1,4 +1,4 @@
-//! Ollama-backed model catalog for `codex-local` (`/model` picker, req 8).
+//! Local-engine model catalog for `codex-local` (`/model` picker, req 8).
 //!
 //! Lists models via `GET <root>/v1/models` (every engine serves it). The context window comes
 //! from the entry's `context_length`, else (Ollama-shaped bodies only) `POST <root>/api/show`.
@@ -7,6 +7,7 @@ mod engine;
 mod v1;
 
 pub use engine::Engine;
+pub use engine::LMSTUDIO_DEFAULT_MODEL;
 pub use engine::resolve_engine;
 pub use v1::V1Model;
 pub use v1::list_v1_models;
@@ -172,7 +173,8 @@ impl ModelsEndpointClient for OllamaModelsEndpoint {
 }
 
 fn factory(info: &ModelProviderInfo) -> SharedModelsManager {
-    let base = info.base_url.as_deref().unwrap_or("http://127.0.0.1:11434");
+    let default_root = Engine::default().default_root();
+    let base = info.base_url.as_deref().unwrap_or(&default_root);
     let root = base.trim_end_matches('/').trim_end_matches("/v1");
     Arc::new(LoadsOnDemand(Arc::new(
         OpenAiModelsManager::new_without_cache(

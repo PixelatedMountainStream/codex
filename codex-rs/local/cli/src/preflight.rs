@@ -70,7 +70,7 @@ const VALUE_FLAGS: &[&str] = &[
     "--remote-auth-token-env",
 ];
 
-/// Whether this invocation needs a reachable Ollama (exec, review, resume, the TUI, ...).
+/// Whether this invocation needs a reachable engine (exec, review, resume, the TUI, ...).
 pub(crate) fn needs_preflight(args: &[OsString], env: EnvFn) -> bool {
     if env("CODEX_LOCAL_SKIP_PREFLIGHT").is_some_and(|v| v != "0") {
         return false;
@@ -167,7 +167,7 @@ pub(crate) fn find_model_elsewhere(
 pub fn engine_hint(root: &str, model: &str) -> Option<String> {
     let others: Vec<_> = Engine::ALL
         .into_iter()
-        .filter(|e| *e != Engine::Ollama)
+        .filter(|e| *e != Engine::default())
         .map(|e| (e, format!("http://127.0.0.1:{}", e.default_port())))
         .collect();
     hint_with(root, model, &others)

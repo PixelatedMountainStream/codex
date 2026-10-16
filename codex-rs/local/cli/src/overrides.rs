@@ -6,7 +6,6 @@ use anyhow::bail;
 use codex_local_models::Engine;
 use codex_local_models::resolve_engine;
 
-use crate::DEFAULT_MODEL;
 use crate::EnvFn;
 use crate::PROVIDER_ID;
 use crate::env_ollama_root;
@@ -19,7 +18,7 @@ pub(crate) const MAX_RETRIES: u64 = 2;
 pub struct Applied {
     pub argv: Vec<OsString>,
     pub engine: Engine,
-    /// Flag, env or config set the engine (else it is the `ollama` default).
+    /// Flag, env or config set the engine (else it is the `lmstudio` default).
     pub engine_explicit: bool,
     /// A URL flag, env var or non-default config provider URL chose the root.
     pub url_explicit: bool,
@@ -35,8 +34,8 @@ pub struct Applied {
 ///
 /// Precedence: flags (`-m`, `--base-url`/`--ollama-url`) > `CODEX_LOCAL_MODEL` >
 /// `CODEX_LOCAL_URL` > `CODEX_LOCAL_OLLAMA_URL` > `OLLAMA_HOST` > config.toml > built-ins.
-/// The engine is `--engine` > `CODEX_LOCAL_ENGINE` > config `[local] engine` > `ollama`;
-/// a non-Ollama engine with no URL override gets its default port and default model. `-m` is left to
+/// The engine is `--engine` > `CODEX_LOCAL_ENGINE` > config `[local] engine` > `lmstudio`;
+/// the winning engine with no URL override gets its default port and default model. `-m` is left to
 /// upstream (it already wins), so the env model is injected only when no model flag is
 /// present, else the configured model. Both the provider and the model are always
 /// injected: upstream's TUI only overrides a resumed session's rollout provider/model
@@ -118,11 +117,11 @@ pub fn apply_overrides(
     };
     // Explicit URLs (flag, env, non-default config provider URL) beat engine default ports.
     let url_explicit = explicit_root.is_some() || config_root.is_some();
-    let root = explicit_root.or_else(|| {
-        (engine != Engine::Ollama && config_root.is_none()).then(|| engine.default_root())
-    });
-    // The seeded Ollama default model is wrong for another engine.
-    let config_model = config_model.filter(|m| engine == Engine::Ollama || m != DEFAULT_MODEL);
+    let root = explicit_root.or_else(|| config_root.is_none().then(|| engine.default_root()));
+    // A seeded default model of another engine (LM Studio's, or Ollama's in homes seeded
+    // before LM Studio became the default) is wrong for the winning engine.
+    let config_model = config_model
+        .filter(|m| engine.default_model() == Some(m.as_str()) || !Engine::is_default_model(m));
     let model = if has_model_flag {
         None
     } else {
@@ -152,7 +151,7 @@ pub fn apply_overrides(
     push_c(format!(
         "model_providers.{PROVIDER_ID}.stream_max_retries={MAX_RETRIES}"
     ));
-    // Ollama fails the built-in server-side web_search tool; also covers old installs.
+    // Local engines fail the built-in server-side web_search tool; also covers old installs.
     push_c("web_search=\"disabled\"".to_string());
     // No app-server daemon (needs a package we don't ship; also skips our in-process hooks).
     push_c("features.daemon_auto_start=false".to_string());
@@ -177,6 +176,7 @@ pub fn apply_overrides(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DEFAULT_MODEL;
 
     fn run(args: &[&str], env: &[(&str, &str)]) -> Vec<String> {
         let f = |k: &str| {
@@ -185,12 +185,19 @@ mod tests {
                 .map(|(_, v)| v.to_string())
         };
         let a = args.iter().map(OsString::from).collect();
-        apply_overrides(a, &f, Some("cfgm".to_string()), None, None)
-            .unwrap()
-            .argv
-            .iter()
-            .map(|s| s.to_string_lossy().into_owned())
-            .collect()
+        // A custom config URL keeps the default engine's own root out of these argv shapes.
+        apply_overrides(
+            a,
+            &f,
+            Some("cfgm".to_string()),
+            None,
+            Some("http://cfg:1".into()),
+        )
+        .unwrap()
+        .argv
+        .iter()
+        .map(|s| s.to_string_lossy().into_owned())
+        .collect()
     }
 
     const RQ: &str = "model_providers.codex-local.request_max_retries=2";
@@ -225,12 +232,33 @@ mod tests {
     #[test]
     fn engine_precedence_flag_env_config_default() {
         let a = applied(&["x", "exec"], &[], None);
-        assert_eq!((a.engine, a.engine_explicit), (Engine::Ollama, false));
+        assert_eq!((a.engine, a.engine_explicit), (Engine::LmStudio, false));
+        assert!(has(
+            &a,
+            "model_providers.codex-local.base_url=\"http://127.0.0.1:1234/v1\""
+        ));
+        assert!(has(&a, &format!("model=\"{DEFAULT_MODEL}\"")));
+        // Explicit ollama still resolves (here the config carries Ollama's old seed).
+        let f = |_: &str| None;
+        let o = apply_overrides(
+            vec!["x".into(), "--engine=ollama".into()],
+            &f,
+            Some("qwen3.8:27b".into()),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!((o.engine, o.engine_explicit), (Engine::Ollama, true));
         assert!(
-            !a.argv
+            o.argv
                 .iter()
-                .any(|s| s.to_string_lossy().contains("base_url"))
+                .any(|s| s == "model_providers.codex-local.base_url=\"http://127.0.0.1:11434/v1\"")
         );
+        // Old Ollama-seeded config, no explicit engine: now LM Studio.
+        let m =
+            apply_overrides(vec!["x".into()], &f, Some("qwen3.8:27b".into()), None, None).unwrap();
+        assert_eq!(m.engine, Engine::LmStudio);
+        assert_eq!(m.model.as_deref(), Some(DEFAULT_MODEL));
         let a = applied(&["x", "exec"], &[], Some("lmstudio"));
         assert_eq!((a.engine, a.engine_explicit), (Engine::LmStudio, true));
         let a = applied(
@@ -263,7 +291,7 @@ mod tests {
         let a = applied(&["x", "--engine=lmstudio", "exec"], &[], None);
         assert!(has(
             &a,
-            "model_providers.codex-local.base_url=\"http://localhost:1234/v1\""
+            "model_providers.codex-local.base_url=\"http://127.0.0.1:1234/v1\""
         ));
         assert!(has(&a, "model=\"qwen3.8-27b-mlx\""));
         assert!(!a.url_explicit);

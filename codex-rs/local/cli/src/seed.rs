@@ -64,7 +64,7 @@ pub(crate) fn seed_toml(root: &str, stock_home: &str, engine: Engine) -> Result<
             ("daemon_auto_start", Value::Boolean(false)),
         ]),
     );
-    // Ollama can't run the server-side `web_search` tool; use the local MCP server.
+    // Local engines can't run the server-side `web_search` tool; use the local MCP server.
     t.insert("web_search".into(), s("disabled"));
     t.insert(
         "mcp_servers".into(),
@@ -97,18 +97,19 @@ mod tests {
     use codex_local_models::Engine;
 
     #[test]
-    fn seeds_six_agent_threads() {
-        let body = super::seed_toml("http://127.0.0.1:11434", "/h", Engine::Ollama).unwrap();
+    fn seeds_lmstudio_defaults() {
+        let body = super::seed_toml("http://127.0.0.1:1234", "/h", Engine::default()).unwrap();
         let v: toml::Value = toml::from_str(&body).unwrap();
-        assert_eq!(v["agents"]["max_threads"].as_integer(), Some(6));
+        assert_eq!(v["model"].as_str(), Some(crate::DEFAULT_MODEL));
+        assert_eq!(v["agents"]["max_threads"].as_integer(), Some(7));
         assert_eq!(v["web_search"].as_str(), Some("disabled"));
         assert_eq!(v["features"]["daemon_auto_start"].as_bool(), Some(false));
         let ws = &v["mcp_servers"]["web-search"];
         assert_eq!(ws["command"].as_str(), Some("uvx"));
         assert_eq!(ws["default_tools_approval_mode"].as_str(), Some("approve"));
         assert_eq!(ws["args"][0].as_str(), Some(super::WEB_SEARCH_PKG));
-        let lm = super::seed_toml("http://localhost:1234", "/h", Engine::LmStudio).unwrap();
-        let lm: toml::Value = toml::from_str(&lm).unwrap();
-        assert_eq!(lm["agents"]["max_threads"].as_integer(), Some(7));
+        let ol = super::seed_toml("http://127.0.0.1:11434", "/h", Engine::Ollama).unwrap();
+        let ol: toml::Value = toml::from_str(&ol).unwrap();
+        assert_eq!(ol["agents"]["max_threads"].as_integer(), Some(6));
     }
 }

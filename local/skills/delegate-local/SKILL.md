@@ -1,7 +1,7 @@
 ---
 name: delegate-local
 description: >
-  Delegate bounded, token-heavy, judgment-light sub-tasks to the local Ollama model
+  Delegate bounded, token-heavy, judgment-light sub-tasks to the local model (LM Studio by default)
   (qwen3.8:27b) via `codex-local exec` to cut cloud-token usage. Use when the user asks to
   "delegate locally", "offload this", "run it on the local model", runs /delegate-local, or
   when a task has large mechanical read / edit / summarize / search / verify work that the
@@ -20,11 +20,11 @@ reliable ONLY on narrow, fully-specified, single-shot units paired with a cheap 
 ## Setup (zero-config)
 
 `codex-local` is installed beside stock `codex` (`local/scripts/install.py`). It defaults to
-model `qwen3.8:27b` on `http://localhost:11434` (plain Ollama or a PAIR proxy). Overrides:
+engine LM Studio, model `qwen3.8-27b-mlx` (placeholder) on `http://127.0.0.1:1234` (PAIR's LM Studio facade). Ollama (`qwen3.8:27b`, port 11434) and llama.cpp are one flag away. Overrides:
 `-m MODEL`, `--base-url URL` (alias `--ollama-url`), `--engine ollama|lmstudio|llamacpp`, env
 `CODEX_LOCAL_MODEL` / `CODEX_LOCAL_URL` / `CODEX_LOCAL_OLLAMA_URL` / `OLLAMA_HOST` /
 `CODEX_LOCAL_ENGINE`. The engine can also be set in codex-local's config.toml
-(`[local]` table, `engine = "lmstudio"`); precedence is flag > env > config > `ollama`. No profiles, tunnels, fleet files or node locks. Check with
+(`[local]` table, `engine = "lmstudio"`); precedence is flag > env > config > `lmstudio`. Homes seeded with Ollama's URL/model and no explicit engine now resolve to LM Studio; keep Ollama with `engine = "ollama"`, `--engine ollama` or `CODEX_LOCAL_ENGINE=ollama`. No profiles, tunnels, fleet files or node locks. Check with
 `verify_install.py` (full) if a unit fails oddly.
 
 ## Green / Yellow / Red decisioning
@@ -89,7 +89,7 @@ Scope verifiers tightly (explicit paths or `--include`); stale artifacts such as
   shell-tool rule.
 - Files changed but the verifier fails: it acted wrongly, or the verifier is mis-scoped.
   Check the verifier first, then the diff.
-- `codex-local exec` exits non-zero or hangs: check Ollama is up (`curl $URL/api/tags`),
+- `codex-local exec` exits non-zero or hangs: check the engine is up (`curl $URL/v1/models`),
   then escalate or split the unit.
 
 ## Honesty about savings

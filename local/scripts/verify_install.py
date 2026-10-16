@@ -146,7 +146,7 @@ def quick(rep, exe, sums) -> None:
         srv, url = mock_ollama.start()
         try:
             env = {**os.environ, "CODEX_HOME": str(stock), "CODEX_LOCAL_HOME": str(local),
-                   "CODEX_LOCAL_OLLAMA_URL": url}
+                   "CODEX_LOCAL_OLLAMA_URL": url, "CODEX_LOCAL_ENGINE": "ollama"}
             env.pop("OLLAMA_HOST", None)
             rc, out, err = _lib.run([exe, "sync-config"], env=env)
             if rc != 0:
