@@ -51,18 +51,19 @@ fn main() -> anyhow::Result<()> {
         &codex_local_cli::process_env,
         codex_local_cli::user_home_dir(),
     )?;
-    let (argv, codex_home, preflight_root, probe_model) = match action {
+    let (engine, argv, codex_home, preflight_root, probe_model) = match action {
         codex_local_cli::Action::Version(v) => {
             println!("{v}");
             return Ok(());
         }
         codex_local_cli::Action::SyncConfig => return Ok(()),
         codex_local_cli::Action::Run {
+            engine,
             argv,
             codex_home,
             preflight_root,
             probe_model,
-        } => (argv, codex_home, preflight_root, probe_model),
+        } => (engine, argv, codex_home, preflight_root, probe_model),
     };
     if let Some(root) = &preflight_root {
         let down = codex_local_cli::preflight_check(root);
@@ -80,7 +81,7 @@ fn main() -> anyhow::Result<()> {
     // SAFETY: still single-threaded; no runtime or worker threads exist yet.
     unsafe { std::env::set_var("CODEX_HOME", &codex_home) };
     codex_local_models::register();
-    codex_local_models::codec::register(codex_local_models::codec::Mode::DottedInbound);
+    codex_local_models::codec::register(codex_local_cli::codec_mode(engine));
     codex_local_resume::register();
     let remote_control_disabled = codex_app_server::take_remote_control_disabled_env();
     arg0_dispatch_or_else(move |arg0_paths: Arg0DispatchPaths| async move {

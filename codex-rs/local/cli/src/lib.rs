@@ -61,6 +61,7 @@ pub enum Action {
     /// Delegate to upstream with this argv; the caller must first set
     /// `CODEX_HOME` to `codex_home`.
     Run {
+        engine: Engine,
         argv: Vec<OsString>,
         codex_home: PathBuf,
         /// Engine root to probe before delegating; `None` skips the preflight.
@@ -127,11 +128,22 @@ pub fn prepare(args: Vec<OsString>, env: EnvFn, user_home: Option<PathBuf>) -> R
         .flatten()
         .filter(|_| want_preflight);
     Ok(Action::Run {
+        engine: applied.engine,
         argv: applied.argv,
         codex_home: homes.local,
         preflight_root,
         probe_model,
     })
+}
+
+/// Wire-codec mode for an engine. llama.cpp's namespace handling is unverified, and
+/// flatten is always safe, so only Ollama gets the dotted-inbound mode.
+pub fn codec_mode(engine: Engine) -> codex_local_models::codec::Mode {
+    use codex_local_models::codec::Mode;
+    match engine {
+        Engine::Ollama => Mode::DottedInbound,
+        Engine::LmStudio | Engine::LlamaCpp => Mode::Flatten,
+    }
 }
 
 /// Root that upstream will end up using: the injected base_url override, else the
@@ -182,6 +194,14 @@ pub(crate) fn env_ollama_root(env: EnvFn) -> Result<Option<String>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn engine_to_codec_mode() {
+        use codex_local_models::codec::Mode;
+        assert_eq!(codec_mode(Engine::Ollama), Mode::DottedInbound);
+        assert_eq!(codec_mode(Engine::LmStudio), Mode::Flatten);
+        assert_eq!(codec_mode(Engine::LlamaCpp), Mode::Flatten);
+    }
+
     use super::*;
     use std::fs;
 
