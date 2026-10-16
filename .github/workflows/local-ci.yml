@@ -30,6 +30,24 @@ jobs:
       - name: Check fork surface
         if: hashFiles('local/scripts/check_fork_surface.py') != ''
         run: python3 local/scripts/check_fork_surface.py
+      # TODO: switch to `uses: randlee/sc-lint@v1` (operation: setup, pinned
+      # released version) once sc-lint ships prefix patterns + SCB-FEATURE-001
+      # (randlee/sc-lint#603). Until then, build the PR commit from git.
+      - name: Cache sc-lint
+        id: sc-lint-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/sc-lint
+            ~/.cargo/bin/sc-lint-boundary
+          key: sc-lint-bc19f2b-${{ runner.os }}
+      - name: Install sc-lint
+        if: steps.sc-lint-cache.outputs.cache-hit != 'true'
+        run: cargo install --locked --git https://github.com/ehrvs/sc-lint --rev bc19f2b sc-lint sc-lint-boundary
+      - name: sc-lint boundary (fork independence)
+        if: hashFiles('codex-rs/sc-lint.toml') != ''
+        working-directory: codex-rs
+        run: sc-lint lint sc-boundary --rule-filter dependencies
 
   python:
     runs-on: ubuntu-latest

@@ -4,6 +4,9 @@
 Prints one JSON object {ok, upstream, files[], total_lines, violations[]} and
 exits 0 when ok, 1 on violations, 2 on a tool error (bad config, missing tag).
 The policy schema is documented at the top of local/fork-surface.toml.
+Crate/feature dependency edges are not checked here: sc-lint owns them
+(codex-rs/sc-lint.toml + codex-rs/boundaries/). This script only verifies each
+codex-local-* crate has a boundary record.
 """
 import argparse
 import json
@@ -18,6 +21,8 @@ BUILTIN_IGNORE = [
     "codex-rs/local/**",
     "local/**",
     "boundaries/**",
+    "codex-rs/boundaries/**",
+    "codex-rs/sc-lint.toml",
     ".claude/**",
     ".codex/skills/**",
     ".github/workflows/local-*.yml",
@@ -63,35 +68,22 @@ def resolve_ref(root, tag):
     raise RuntimeError(f"upstream ref not found: {tag} (also tried upstream/{tag})")
 
 
-def local_dependency_violations(root):
-    """No crate outside codex-local-* may depend on codex-local-*, and only
-    codex-local-cli may depend on another local crate (it is the only root).
+def boundary_record_violations(root):
+    """Every codex-local-* crate under codex-rs/local/ needs a boundary record
+    directory codex-rs/boundaries/<name>/ with at least one .toml file.
 
-    sc-lint has no wildcard/default-allow mode (allowed_dependencies is
-    mandatory, so local crates could not depend on arbitrary upstream crates),
-    so this rule is enforced here, generically, with no crate lists.
+    The dependency/feature edges themselves are enforced by sc-lint
+    (codex-rs/sc-lint.toml, run in local-ci); this only guards coverage.
     """
-    ws = Path(root) / "codex-rs"
-    if not (ws / "Cargo.toml").exists():
-        return []
-    r = subprocess.run(["cargo", "metadata", "--no-deps", "--format-version", "1"],
-                       cwd=ws, capture_output=True, text=True)
-    if r.returncode:
-        raise RuntimeError("cargo metadata: " + r.stderr.strip()[-300:])
+    local = Path(root) / "codex-rs" / "local"
     out = []
-    for pkg in json.loads(r.stdout)["packages"]:
-        name = pkg["name"]
-        for dep in pkg["dependencies"]:
-            if not dep["name"].startswith("codex-local-"):
-                continue
-            if not name.startswith("codex-local-"):
-                out.append({"kind": "upstream_depends_on_local", "crate": name,
-                            "dependency": dep["name"]})
-            elif name != "codex-local-cli" and dep["name"] != name:
-                out.append({"kind": "local_not_callable_from_cli_only", "crate": name,
-                            "dependency": dep["name"]})
-            elif name == "codex-local-cli" and dep["name"] == name:
-                continue
+    for manifest in sorted(local.glob("*/Cargo.toml")):
+        name = tomllib.loads(manifest.read_text()).get("package", {}).get("name", "")
+        if not name.startswith("codex-local-"):
+            continue
+        rec = Path(root) / "codex-rs" / "boundaries" / name
+        if not any(rec.glob("*.toml")):
+            out.append({"kind": "missing_boundary_record", "crate": name})
     return out
 
 
@@ -123,7 +115,7 @@ def check(root):
         violations.append({"kind": "over_line_budget", "lines": total, "max": max_lines})
     if max_files is not None and len(files) > max_files:
         violations.append({"kind": "over_file_budget", "files": len(files), "max": max_files})
-    violations += local_dependency_violations(root)
+    violations += boundary_record_violations(root)
     return {
         "ok": not violations,
         "upstream": tag,

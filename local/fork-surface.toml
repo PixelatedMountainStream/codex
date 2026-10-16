@@ -11,7 +11,8 @@
 #                             the budget (e.g. Cargo.lock; verify by regeneration).
 #   ignore    list of globs   OPTIONAL extra fork-owned globs, appended to the
 #                             built-in set, which is always ignored: local/**,
-#                             codex-rs/local/**, boundaries/**, .claude/**,
+#                             codex-rs/local/**, boundaries/**,
+#                             codex-rs/boundaries/**, codex-rs/sc-lint.toml, .claude/**,
 #                             .codex/skills/**, .github/workflows/local-*.yml,
 #                             .github/workflows/upstream-sync.yml
 #   [budget]

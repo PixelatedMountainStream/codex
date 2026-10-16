@@ -3,7 +3,7 @@
 Where the build differs from the approved plan.
 
 - **GitHub home:** PixelatedMountainStream/codex, with stacked PRs on base `codex-local/main`. The Radiant-Vision-Systems fork is deferred, because org members can't create public repos.
-- **Boundary check:** sc-lint boundary records were replaced by a `cargo metadata` check in `check_fork_surface.py`. sc-lint has no wildcard mode and would need a static list of 161 crates.
+- **Boundary check:** sc-lint enforces crate and feature independence between `codex-rs/local/*` and upstream (`codex-rs/sc-lint.toml`, records in `codex-rs/boundaries/`). It relies on trailing-`*` prefix patterns and SCB-FEATURE-001 from randlee/sc-lint#603, so CI installs a pinned git revision until a release exists. `check_fork_surface.py` only checks that every `codex-local-*` crate has a record.
 - **New hook H8:** in `core/src/tools/router.rs` (splits flattened `ns.name` tool names on a registry miss).
 - **H1:** uses `include!` of upstream `cli/src/main.rs` under `cfg(codex_local)`. `codex-local-cli`'s dependencies must mirror upstream cli's.
 - **H4:** also drops the provider filter for named lookups when registered.
