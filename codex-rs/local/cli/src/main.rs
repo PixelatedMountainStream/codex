@@ -64,16 +64,18 @@ fn main() -> anyhow::Result<()> {
             probe_model,
         } => (argv, codex_home, preflight_root, probe_model),
     };
-    if let Some(root) = &preflight_root
-        && let Err(e) = codex_local_cli::preflight_check(root)
-    {
-        eprintln!("{}", codex_local_cli::preflight_failure_message(root, &e));
-        std::process::exit(1);
-    }
-    if let (Some(root), Some(model)) = (&preflight_root, &probe_model)
-        && let Some(hint) = codex_local_cli::engine_hint(root, model)
-    {
-        eprintln!("{hint}");
+    if let Some(root) = &preflight_root {
+        let down = codex_local_cli::preflight_check(root);
+        // Probe the other engines' ports even when the default is unreachable.
+        if let Some(model) = &probe_model
+            && let Some(hint) = codex_local_cli::engine_hint(root, model)
+        {
+            eprintln!("{hint}");
+        }
+        if let Err(e) = down {
+            eprintln!("{}", codex_local_cli::preflight_failure_message(root, &e));
+            std::process::exit(1);
+        }
     }
     // SAFETY: still single-threaded; no runtime or worker threads exist yet.
     unsafe { std::env::set_var("CODEX_HOME", &codex_home) };

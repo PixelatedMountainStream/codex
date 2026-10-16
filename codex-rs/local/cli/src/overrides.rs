@@ -21,11 +21,13 @@ pub struct Applied {
     pub engine: Engine,
     /// Flag, env or config set the engine (else it is the `ollama` default).
     pub engine_explicit: bool,
-    /// A URL flag or env var chose the root.
+    /// A URL flag, env var or non-default config provider URL chose the root.
     pub url_explicit: bool,
     /// The model we injected (`None` when `-m`/`-c model=` was given, or llama.cpp
     /// still needs its first `/v1/models` id).
     pub model: Option<String>,
+    /// The model the run will use: the `-m`/`-c model=` value, else the injected one.
+    pub effective_model: Option<String>,
 }
 
 /// Strip `--engine`, `--base-url`/`--ollama-url` (ours, unknown to upstream) and inject `-c` overrides right
@@ -45,11 +47,13 @@ pub fn apply_overrides(
     env: EnvFn,
     config_model: Option<String>,
     config_engine: Option<String>,
+    config_root: Option<String>,
 ) -> Result<Applied> {
     let mut rest = Vec::with_capacity(args.len());
     let mut flag_url: Option<String> = None;
     let mut flag_engine: Option<String> = None;
     let mut has_model_flag = false;
+    let mut flag_model: Option<String> = None;
     let mut it = args.into_iter();
     let argv0 = it.next();
     let mut after_dd = false;
@@ -82,10 +86,22 @@ pub fn apply_overrides(
         } else if let Some(v) = s.strip_prefix("--engine=") {
             flag_engine = Some(v.to_string());
             continue;
-        } else if s == "-m" || s == "--model" || s.starts_with("--model=") || s.starts_with("-m=") {
+        } else if s == "-m" || s == "--model" {
             has_model_flag = true;
-        } else if s.starts_with("model=") && rest.last().is_some_and(|p| p == "-c") {
+            rest.push(a);
+            if let Some(v) = it.next() {
+                flag_model = Some(v.to_string_lossy().into_owned());
+                rest.push(v);
+            }
+            continue;
+        } else if let Some(v) = s.strip_prefix("--model=").or_else(|| s.strip_prefix("-m=")) {
             has_model_flag = true;
+            flag_model = Some(v.to_string());
+        } else if let Some(v) = s.strip_prefix("model=")
+            && rest.last().is_some_and(|p| p == "-c")
+        {
+            has_model_flag = true;
+            flag_model = Some(v.trim_matches('"').to_string());
         }
         rest.push(a);
     }
@@ -96,13 +112,15 @@ pub fn apply_overrides(
         config_engine.as_deref(),
     )
     .map_err(anyhow::Error::msg)?;
-    let root = match flag_url {
+    let explicit_root = match flag_url {
         Some(u) => Some(resolve_ollama_root(&u)?),
         None => env_ollama_root(env)?,
     };
-    let url_explicit = root.is_some();
-    // Seeded config points at Ollama; another engine needs its own default root.
-    let root = root.or_else(|| (engine != Engine::Ollama).then(|| engine.default_root()));
+    // Explicit URLs (flag, env, non-default config provider URL) beat engine default ports.
+    let url_explicit = explicit_root.is_some() || config_root.is_some();
+    let root = explicit_root.or_else(|| {
+        (engine != Engine::Ollama && config_root.is_none()).then(|| engine.default_root())
+    });
     // The seeded Ollama default model is wrong for another engine.
     let config_model = config_model.filter(|m| engine == Engine::Ollama || m != DEFAULT_MODEL);
     let model = if has_model_flag {
@@ -112,6 +130,7 @@ pub fn apply_overrides(
             .or(config_model)
             .or_else(|| engine.default_model().map(str::to_string))
     };
+    let effective_model = flag_model.or_else(|| model.clone());
     let mut out: Vec<OsString> = argv0.into_iter().collect();
     let mut push_c = |kv: String| {
         out.push("-c".into());
@@ -151,6 +170,7 @@ pub fn apply_overrides(
         engine_explicit,
         url_explicit,
         model,
+        effective_model,
     })
 }
 
@@ -165,7 +185,7 @@ mod tests {
                 .map(|(_, v)| v.to_string())
         };
         let a = args.iter().map(OsString::from).collect();
-        apply_overrides(a, &f, Some("cfgm".to_string()), None)
+        apply_overrides(a, &f, Some("cfgm".to_string()), None, None)
             .unwrap()
             .argv
             .iter()
@@ -193,6 +213,7 @@ mod tests {
             &f,
             Some(DEFAULT_MODEL.to_string()),
             cfg_engine.map(str::to_string),
+            None,
         )
         .unwrap()
     }
@@ -230,6 +251,7 @@ mod tests {
                 vec!["x".into(), "--engine=bogus".into()],
                 &|_| None,
                 None,
+                None,
                 None
             )
             .is_err()
@@ -265,6 +287,23 @@ mod tests {
             "model_providers.codex-local.base_url=\"http://h:8/v1\""
         ));
         assert_eq!(a.model, None);
+        // A custom config provider URL beats the engine's default port.
+        let f = |_: &str| None;
+        let a = apply_overrides(
+            vec!["x".into(), "--engine=lmstudio".into()],
+            &f,
+            None,
+            None,
+            Some("http://remote:9".into()),
+        )
+        .unwrap();
+        assert!(
+            a.url_explicit
+                && !a
+                    .argv
+                    .iter()
+                    .any(|s| s.to_string_lossy().contains("base_url"))
+        );
     }
 
     #[test]

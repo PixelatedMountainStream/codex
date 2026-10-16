@@ -3,6 +3,7 @@
 
 mod homes;
 mod links;
+mod local_cfg;
 mod overrides;
 mod preflight;
 mod seed;
@@ -78,16 +79,19 @@ pub fn prepare(args: Vec<OsString>, env: EnvFn, user_home: Option<PathBuf>) -> R
     let homes = resolve_homes(env, user_home)?;
     ensure_home(&homes)?;
     // Seed from env/built-ins only; a one-off --ollama-url/--engine flag must not persist.
+    // The seeded URL is always Ollama's (an engine's default port is injected at run time,
+    // after the winning engine is known), and a bad env engine must not abort here.
     let seed_engine = env("CODEX_LOCAL_ENGINE")
-        .map(|v| v.parse::<Engine>().map_err(anyhow::Error::msg))
-        .transpose()?
+        .and_then(|v| v.parse::<Engine>().ok())
         .unwrap_or_default();
-    let root = env_ollama_root(env)?.unwrap_or_else(|| seed_engine.default_root());
+    let root = env_ollama_root(env)?.unwrap_or_else(|| Engine::Ollama.default_root());
     seed_config(&homes, &root, seed_engine)?;
+    let config_engine = local_cfg::engine(&homes)?;
     if first == Some("sync-config") {
         sync_config(&homes)?;
         return Ok(Action::SyncConfig);
     }
+    let args_snapshot = args.clone();
     let want_preflight = preflight::needs_preflight(&args, env);
     let cfg = std::fs::read_to_string(homes.local.join("config.toml"))
         .ok()
@@ -96,24 +100,27 @@ pub fn prepare(args: Vec<OsString>, env: EnvFn, user_home: Option<PathBuf>) -> R
         .as_ref()
         .and_then(|c| c.get("model").and_then(|m| m.as_str()).map(str::to_string))
         .or_else(|| Some(DEFAULT_MODEL.to_string()));
-    // `[local] engine = "ollama|lmstudio|llamacpp"` in codex-local's config.toml.
-    let config_engine = cfg
-        .as_ref()
-        .and_then(|c| c.get("local")?.get("engine")?.as_str().map(str::to_string));
-    let mut applied = apply_overrides(args, env, config_model, config_engine)?;
+    let config_root = config_root(cfg.as_ref());
+    let mut applied = apply_overrides(args, env, config_model, config_engine, config_root)?;
     let preflight_root = want_preflight.then(|| effective_root(&applied.argv, &homes, &root));
-    // llama.cpp serves whatever it loaded: default to the first `/v1/models` id.
-    if let (Some(r), Engine::LlamaCpp, None) = (&preflight_root, applied.engine, &applied.model)
-        && !applied.argv.iter().any(|a| a == "-m" || a == "--model")
-        && let Some(id) = preflight::first_model_id(r)
+    // llama.cpp serves whatever it loaded: default to the first `/v1/models` id. This is
+    // model selection, so it runs even when the preflight itself is skipped.
+    if applied.engine == Engine::LlamaCpp
+        && applied.effective_model.is_none()
+        && preflight::uses_model(&args_snapshot)
     {
-        applied.argv.insert(1, "-c".into());
-        applied
-            .argv
-            .insert(2, format!("model={}", toml::Value::String(id)).into());
+        let r = preflight_root
+            .clone()
+            .unwrap_or_else(|| effective_root(&applied.argv, &homes, &root));
+        if let Some(id) = preflight::first_model_id(&r) {
+            applied.argv.insert(1, "-c".into());
+            applied
+                .argv
+                .insert(2, format!("model={}", toml::Value::String(id)).into());
+        }
     }
     let probe_model = (!applied.engine_explicit && !applied.url_explicit)
-        .then(|| applied.model.clone())
+        .then(|| applied.effective_model.clone())
         .flatten()
         .filter(|_| want_preflight);
     Ok(Action::Run {
@@ -136,15 +143,28 @@ fn effective_root(argv: &[OsString], homes: &Homes, fallback: &str) -> String {
             return strip(v.trim_matches('"'));
         }
     }
-    let cfg = std::fs::read_to_string(homes.local.join("config.toml"))
-        .ok()
-        .and_then(|t| t.parse::<toml::Table>().ok());
-    cfg.and_then(|c| {
-        c["model_providers"][PROVIDER_ID]["base_url"]
-            .as_str()
-            .map(strip)
-    })
+    config_root(
+        std::fs::read_to_string(homes.local.join("config.toml"))
+            .ok()
+            .and_then(|t| t.parse::<toml::Table>().ok())
+            .as_ref(),
+    )
     .unwrap_or_else(|| fallback.to_string())
+}
+
+/// Provider root from config.toml, unless it is just the seeded Ollama default (which
+/// must not beat another engine's default port).
+fn config_root(cfg: Option<&toml::Table>) -> Option<String> {
+    let url = cfg?
+        .get("model_providers")?
+        .get(PROVIDER_ID)?
+        .get("base_url")?
+        .as_str()?;
+    let root = url
+        .trim_end_matches('/')
+        .trim_end_matches("/v1")
+        .to_string();
+    (root != Engine::Ollama.default_root()).then_some(root)
 }
 
 pub(crate) fn env_ollama_root(env: EnvFn) -> Result<Option<String>> {
@@ -245,5 +265,79 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    fn run_env(tmp: &std::path::Path, extra: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let mut m: Vec<(String, String)> = vec![
+            (
+                "CODEX_HOME".into(),
+                tmp.join("stock").to_string_lossy().into(),
+            ),
+            (
+                "CODEX_LOCAL_HOME".into(),
+                tmp.join("local").to_string_lossy().into(),
+            ),
+        ];
+        m.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+        move |k: &str| m.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone())
+    }
+
+    fn base_url_arg(a: &Action) -> Option<String> {
+        let Action::Run { argv, .. } = a else {
+            panic!()
+        };
+        argv.iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .find(|s| s.contains(".base_url="))
+    }
+
+    #[test]
+    fn flag_engine_beats_bad_env_engine_and_seed_never_bakes_a_port() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("stock")).unwrap();
+        let env = run_env(
+            tmp.path(),
+            &[
+                ("CODEX_LOCAL_ENGINE", "bogus"),
+                ("CODEX_LOCAL_SKIP_PREFLIGHT", "1"),
+            ],
+        );
+        let a = |v: &[&str]| v.iter().map(OsString::from).collect::<Vec<_>>();
+        let act = prepare(a(&["x", "--engine", "ollama", "exec"]), &env, None).unwrap();
+        assert_eq!(base_url_arg(&act), None);
+        let env = run_env(
+            tmp.path(),
+            &[
+                ("CODEX_LOCAL_ENGINE", "lmstudio"),
+                ("CODEX_LOCAL_SKIP_PREFLIGHT", "1"),
+            ],
+        );
+        let cfg = fs::read_to_string(tmp.path().join("local/config.toml")).unwrap();
+        assert!(cfg.contains("localhost:11434/v1"), "{cfg}");
+        let act = prepare(a(&["x", "exec"]), &env, None).unwrap();
+        assert!(base_url_arg(&act).unwrap().contains(":1234/v1"));
+    }
+
+    #[test]
+    fn legacy_local_table_migrates_to_codex_local_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("stock")).unwrap();
+        let env = run_env(tmp.path(), &[("CODEX_LOCAL_SKIP_PREFLIGHT", "1")]);
+        let a = |v: &[&str]| v.iter().map(OsString::from).collect::<Vec<_>>();
+        prepare(a(&["x", "exec"]), &env, None).unwrap();
+        let own = fs::read_to_string(tmp.path().join("local/codex-local.toml")).unwrap();
+        assert!(!own.contains("\nengine"), "seeded unset: {own}");
+        let cfg_path = tmp.path().join("local/config.toml");
+        let cfg = fs::read_to_string(&cfg_path).unwrap();
+        fs::write(
+            &cfg_path,
+            format!("{cfg}\n[local]\nengine = \"lmstudio\"\n"),
+        )
+        .unwrap();
+        let act = prepare(a(&["x", "exec"]), &env, None).unwrap();
+        assert!(base_url_arg(&act).unwrap().contains(":1234/v1"));
+        assert!(!fs::read_to_string(&cfg_path).unwrap().contains("[local]"));
+        let own = fs::read_to_string(tmp.path().join("local/codex-local.toml")).unwrap();
+        assert!(own.contains("engine = \"lmstudio\""), "{own}");
     }
 }

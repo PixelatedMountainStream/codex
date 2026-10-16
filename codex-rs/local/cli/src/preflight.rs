@@ -75,6 +75,11 @@ pub(crate) fn needs_preflight(args: &[OsString], env: EnvFn) -> bool {
     if env("CODEX_LOCAL_SKIP_PREFLIGHT").is_some_and(|v| v != "0") {
         return false;
     }
+    uses_model(args)
+}
+
+/// Whether the subcommand talks to the model at all (independent of the skip switch).
+pub(crate) fn uses_model(args: &[OsString]) -> bool {
     let mut it = args.iter().skip(1).map(|a| a.to_string_lossy());
     while let Some(a) = it.next() {
         match a.as_ref() {
@@ -169,14 +174,15 @@ pub fn engine_hint(root: &str, model: &str) -> Option<String> {
 }
 
 fn hint_with(root: &str, model: &str, others: &[(Engine, String)]) -> Option<String> {
-    let here = list(root, TIMEOUT).ok()?;
+    // An unreachable root is the case the hint most helps: treat it as "model absent".
+    let here = list(root, TIMEOUT).unwrap_or_default();
     if here.iter().any(|m| m.id == model) {
         return None;
     }
     let e = find_model_elsewhere(model, others, Duration::from_secs(1))?;
     Some(format!(
         "codex-local: model `{model}` not found at {root}, but {e} serves it; \
-         use --engine {e} or set `[local] engine = \"{e}\"` in config.toml."
+         use --engine {e} or set `[local] engine = \"{e}\"` in codex-local.toml."
     ))
 }
 

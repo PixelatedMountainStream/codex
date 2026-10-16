@@ -99,7 +99,7 @@ impl OllamaModelsEndpoint {
         let mut set = tokio::task::JoinSet::new();
         for (i, m) in listed.iter().enumerate() {
             // Only Ollama-shaped answers need `/api/show`; others report the length inline.
-            if m.context_length.is_none() {
+            if m.context_length.is_none() && m.ollama_shaped {
                 let (this, n) = (self.clone_light(), m.id.clone());
                 set.spawn(async move { (i, this.context_window(&n).await) });
             }
@@ -131,7 +131,8 @@ impl OllamaModelsEndpoint {
         info.visibility = ModelVisibility::List;
         info.priority = i32::try_from(index).unwrap_or(i32::MAX);
         info.context_window = Some(window);
-        info.max_context_window = Some(window);
+        // A default, not a cap: the config's `model_context_window` must be able to win.
+        info.max_context_window = None;
         info.used_fallback_model_metadata = false;
         if self.freeform_apply_patch {
             info.apply_patch_tool_type = Some(ApplyPatchToolType::Freeform);
@@ -321,6 +322,7 @@ mod tests {
             .collect();
         assert_eq!(got, vec![("a:1", 1000), ("b:2", 2000), ("c:3", 3000)]);
         assert!(models.iter().all(|m| m.apply_patch_tool_type.is_some()));
+        assert!(models.iter().all(|m| m.max_context_window.is_none()));
     }
 
     #[tokio::test]
