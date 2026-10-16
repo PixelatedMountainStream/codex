@@ -104,6 +104,7 @@ pub fn prepare(args: Vec<OsString>, env: EnvFn, user_home: Option<PathBuf>) -> R
         .or_else(|| Some(DEFAULT_MODEL.to_string()));
     let config_root = config_root(cfg.as_ref());
     let mut applied = apply_overrides(args, env, config_model, config_engine, config_root)?;
+    overrides::inject_default_effort(&mut applied.argv, cfg.as_ref());
     let preflight_root = want_preflight.then(|| effective_root(&applied.argv, &homes, &root));
     // llama.cpp serves whatever it loaded: default to the first `/v1/models` id. This is
     // model selection, so it runs even when the preflight itself is skipped.

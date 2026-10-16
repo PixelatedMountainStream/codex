@@ -21,3 +21,4 @@ Where the build differs from the approved plan.
 
 - Stock resumes a codex-local session with `codex resume <id> -c model_provider=openai`; `codex exec resume <id>` needs no flag.
 - codex-local always continues on its own provider and model: it injects `-c model_provider="codex-local"` and `-c model=<CODEX_LOCAL_MODEL or configured model>` (unless `-m` is given), because upstream only overrides a resumed rollout's provider/model when a CLI layer sets them.
+- **Reasoning effort:** default reasoning effort is low on local engines; override with -c model_reasoning_effort=... (injected at run time only when unset in `-c`, config.toml top level or the active profile; `"none"` is respected; never seeded into config.toml).

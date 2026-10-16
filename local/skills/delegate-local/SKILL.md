@@ -24,7 +24,7 @@ engine LM Studio, model `qwen/qwen3.8-27b` (4-bit MLX; the 8-bit build is `-m qw
 `-m MODEL`, `--base-url URL` (alias `--ollama-url`), `--engine ollama|lmstudio|llamacpp`, env
 `CODEX_LOCAL_MODEL` / `CODEX_LOCAL_URL` / `CODEX_LOCAL_OLLAMA_URL` / `OLLAMA_HOST` /
 `CODEX_LOCAL_ENGINE`. The engine can also be set in codex-local's config.toml
-(`[local]` table, `engine = "lmstudio"`); precedence is flag > env > config > `lmstudio`. Homes seeded with Ollama's URL/model and no explicit engine now resolve to LM Studio; keep Ollama with `engine = "ollama"`, `--engine ollama` or `CODEX_LOCAL_ENGINE=ollama`. No profiles, tunnels, fleet files or node locks. Check with
+(`[local]` table, `engine = "lmstudio"`); precedence is flag > env > config > `lmstudio`. Homes seeded with Ollama's URL/model and no explicit engine now resolve to LM Studio; keep Ollama with `engine = "ollama"`, `--engine ollama` or `CODEX_LOCAL_ENGINE=ollama`. No profiles, tunnels, fleet files or node locks. Check with Default reasoning effort is low on local engines; override with -c model_reasoning_effort=...
 `verify_install.py` (full) if a unit fails oddly.
 
 ## Green / Yellow / Red decisioning

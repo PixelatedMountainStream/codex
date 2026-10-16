@@ -192,6 +192,60 @@ pub fn apply_overrides(
     })
 }
 
+const EFFORT_KEY: &str = "model_reasoning_effort";
+
+/// True when a reasoning effort is set anywhere codex-local can see: a `-c`/`--config`
+/// override in `args`, or the user's config.toml (top level, or the active profile, chosen
+/// by `-p`/`--profile` else the top-level `profile`). Any value counts, including `"none"`.
+pub(crate) fn reasoning_effort_set(args: &[OsString], cfg: Option<&toml::Table>) -> bool {
+    let strs: Vec<String> = args
+        .iter()
+        .take_while(|a| *a != "--")
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let mut profile: Option<String> = None;
+    for (i, s) in strs.iter().enumerate() {
+        let next = strs.get(i + 1).map(String::as_str).unwrap_or("");
+        let kv = match s.as_str() {
+            "-c" | "--config" => next,
+            _ => s
+                .strip_prefix("--config=")
+                .or_else(|| s.strip_prefix("-c"))
+                .unwrap_or(""),
+        };
+        if kv.trim_start().starts_with(EFFORT_KEY) && kv.contains('=') {
+            return true;
+        }
+        if s == "-p" || s == "--profile" {
+            profile = Some(next.to_string());
+        } else if let Some(v) = s.strip_prefix("--profile=") {
+            profile = Some(v.to_string());
+        }
+    }
+    let Some(cfg) = cfg else { return false };
+    if cfg.contains_key(EFFORT_KEY) {
+        return true;
+    }
+    profile
+        .or_else(|| {
+            cfg.get("profile")
+                .and_then(|p| p.as_str())
+                .map(str::to_string)
+        })
+        .and_then(|p| cfg.get("profiles")?.get(&p)?.get(EFFORT_KEY).cloned())
+        .is_some()
+}
+
+/// Local engines think at their own (long) default unless the request carries
+/// `reasoning.effort`, and upstream omits the field for "none". Default to `low`
+/// at run time (never seeded) unless the user set a value anywhere.
+pub(crate) fn inject_default_effort(argv: &mut Vec<OsString>, cfg: Option<&toml::Table>) {
+    if !reasoning_effort_set(argv, cfg) && !argv.is_empty() {
+        argv.insert(1, "-c".into());
+        argv.insert(2, format!("{EFFORT_KEY}=\"low\"").into());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -497,5 +551,34 @@ mod tests {
                 "-m"
             ]
         );
+    }
+
+    #[test]
+    fn default_effort_low_unless_set_anywhere() {
+        let inject = |args: &[&str], cfg: &str| {
+            let mut v: Vec<OsString> = args.iter().map(OsString::from).collect();
+            let t = cfg.parse::<toml::Table>().unwrap();
+            inject_default_effort(&mut v, Some(&t));
+            v.iter()
+                .map(|s| s.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            inject(&["x", "exec"], ""),
+            ["x", "-c", "model_reasoning_effort=\"low\"", "exec"]
+        );
+        for (a, c) in [
+            (
+                &["x", "-c", "model_reasoning_effort=\"high\"", "exec"][..],
+                "",
+            ),
+            (&["x", "exec"][..], "model_reasoning_effort = \"none\""),
+            (
+                &["x", "exec"][..],
+                "profile=\"p\"\n[profiles.p]\nmodel_reasoning_effort=\"high\"",
+            ),
+        ] {
+            assert_eq!(inject(a, c).len(), a.len(), "{a:?} {c}");
+        }
     }
 }
