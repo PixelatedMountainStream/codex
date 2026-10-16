@@ -1,5 +1,6 @@
 import contextlib
 import io
+import os
 import json
 import subprocess
 import sys
@@ -14,8 +15,18 @@ import sync_upstream as su  # noqa: E402
 KEYS = {"ok", "step", "conflicts", "build_errors", "test_failures", "surface_violations", "next_action"}
 
 
-def git(cwd, *a):
-    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *a], cwd=cwd, check=True, capture_output=True)
+HERMETIC = ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "init.defaultBranch=main",
+            "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"]
+
+
+def _env():
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+    return env
+
+
+def git(cwd, *a, check=True):
+    return subprocess.run(["git", *HERMETIC, *a], cwd=cwd, check=check, capture_output=True, text=True, env=_env())
 
 
 def run_cli(root, *args):
@@ -78,7 +89,8 @@ class SyncTests(unittest.TestCase):
         git(self.work, "add", "z.rs"); git(self.work, "commit", "-qm", "1")
         git(self.work, "checkout", "-q", "-b", "m2", "m1~1"); (self.work / "z.rs").write_text("2")
         git(self.work, "add", "z.rs"); git(self.work, "commit", "-qm", "2")
-        subprocess.run(["git", "merge", "m1"], cwd=self.work, capture_output=True)
+        git(self.work, "merge", "m1", check=False)  # expected to conflict
+        self.assertTrue(git(self.work, "ls-files", "-u").stdout.strip(), "setup produced no conflict")
         code, out = run_cli(self.work, "conflicts")
         self.assertEqual(code, 2)
         self.assertEqual(out["conflicts"], [{"path": "z.rs", "kind": "other"}])

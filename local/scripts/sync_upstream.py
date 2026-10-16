@@ -120,9 +120,11 @@ def classify(path, allow, generated):
 
 
 def unmerged(root):
-    out = git(root, "diff", "--name-only", "--diff-filter=U").stdout
+    # index stage entries are the authoritative record of unmerged paths
+    out = git(root, "ls-files", "-u", "-z").stdout
+    paths = sorted({e.split("\t", 1)[1] for e in out.split("\0") if "\t" in e})
     allow, generated = load_policy(root)
-    return [{"path": p, "kind": classify(p, allow, generated)} for p in out.splitlines() if p]
+    return [{"path": p, "kind": classify(p, allow, generated)} for p in paths]
 
 
 def conflict_result(step, root):
