@@ -3,6 +3,16 @@
 //! collision-checked aliases, history is translated the same way, and inbound calls are
 //! mapped back to canonical items through an exact reverse map (aliases are never parsed).
 //! `DottedInbound` (Ollama) sends tools unchanged and maps `ns.tool` call names back.
+//!
+//! Known limits (documented, not fixed): aliases appear in telemetry and raw-capture
+//! because those observers run before inbound canonicalisation; one engine per
+//! codex-local process (no mixed-engine threads); the per-request literal set is
+//! process-wide, so concurrent sub-agents with different tool sets can race on it;
+//! `AdditionalTools`/`ToolSearchOutput` are only produced for OpenAI-hosted paths
+//! (responses-lite, hosted tool_search) and never reach local engines, so they are not
+//! translated; streamed argument deltas of flattened custom calls arrive as function
+//! argument JSON, which the SSE layer does not turn into `ToolCallInputDelta`, so such
+//! calls get no live diff preview (the final item is canonical and executes normally).
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -34,8 +44,9 @@ type Pair = (Option<String>, String);
 
 #[derive(Default)]
 struct Codec {
-    fwd: HashMap<Pair, String>,
     rev: HashMap<String, (Pair, Kind)>,
+    /// Literal top-level function names of the latest request; never reverse-mapped.
+    literals: HashSet<String>,
 }
 
 static MODE: OnceLock<Mode> = OnceLock::new();
@@ -79,21 +90,62 @@ fn sanitize(s: &str) -> String {
         .collect()
 }
 
-fn hashed(ns: Option<&str>, name: &str, naive: &str) -> String {
-    let digest = Sha256::digest(format!("{}\0{name}", ns.unwrap_or("")));
-    let hex: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
-    let head: String = naive.chars().take(54).collect();
+fn naive(ns: Option<&str>, name: &str) -> String {
+    match ns {
+        Some(ns) => format!("{}__{}", sanitize(ns), sanitize(name)),
+        None => sanitize(name),
+    }
+}
+
+/// Hashed alias: `trunc54(naive) + "_" + hex8(sha256(tag ns \0 name [\0 salt]))`.
+/// `tag` separates `None` from `Some("")`; `salt == 0` hashes no salt.
+fn hashed(ns: Option<&str>, name: &str, salt: u32) -> String {
+    let mut h = Sha256::new();
+    h.update([u8::from(ns.is_some())]);
+    h.update(ns.unwrap_or(""));
+    h.update([0]);
+    h.update(name);
+    if salt > 0 {
+        h.update([0]);
+        h.update(salt.to_string());
+    }
+    let hex: String = h
+        .finalize()
+        .iter()
+        .take(4)
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let head: String = naive(ns, name).chars().take(54).collect();
     format!("{head}_{hex}")
 }
 
-/// `Some(alias)` when the plain alias is usable as-is.
-fn plain_alias(ns: Option<&str>, name: &str) -> Option<String> {
-    let alias = match ns {
-        Some(ns) => format!("{}__{}", sanitize(ns), sanitize(name)),
-        None => sanitize(name),
-    };
-    let clean = ns.is_none_or(|n| sanitize(n) == n) && sanitize(name) == name;
-    (clean && alias.len() <= 64).then_some(alias)
+/// Pure, deterministic alias of `(ns, name)` (depends on nothing else).
+///
+/// Plain form `P(ns, name)`: `name` when `ns` is `None`, else `ns + "__" + name`. It is
+/// used only when `ns`/`name` are unchanged by `sanitize`, `len(P) <= 64`, and:
+///   * `ns == None`: `name` contains no `"__"`;
+///   * `ns == Some`: `name` contains no `"__"` and does not start with `'_'`
+///     (`ns` is unrestricted, so MCP namespaces `mcp__server__` work; they yield
+///     `mcp__server____tool`).
+/// Injectivity: a plain `None` alias never contains `"__"`, a plain `Some` alias
+/// always does, so the two never collide. For `Some`, the last `"__"` in `P` starts
+/// exactly at `len(ns)`: an occurrence starting later would lie inside `name` (barred)
+/// or straddle the separator and `name[0]` (barred by the no-leading-`'_'` rule), and
+/// `P` has no later separator. So `ns = P[..i]`, `name = P[i+2..]` with `i` the last
+/// `"__"` index recovers the pair uniquely. Otherwise the hashed form is used
+/// (`salt` 0), which is deterministic too; `salt > 0` is only for literal conflicts.
+fn alias_of(ns: Option<&str>, name: &str, salt: u32) -> String {
+    let clean = ns.is_none_or(|n| sanitize(n) == n)
+        && sanitize(name) == name
+        && !name.contains("__")
+        && (ns.is_none() || !name.starts_with('_'));
+    if salt == 0 && clean {
+        let plain = naive(ns, name);
+        if plain.len() <= 64 {
+            return plain;
+        }
+    }
+    hashed(ns, name, salt)
 }
 
 fn kind_of(tool: &Value) -> Kind {
@@ -155,8 +207,7 @@ impl Codec {
             for inner in t["tools"].as_array().into_iter().flatten() {
                 let name = inner["name"].as_str().unwrap_or_default();
                 let pair = (Some(ns.to_string()), name.to_string());
-                self.rev
-                    .insert(format!("{ns}.{name}"), (pair, kind_of(inner)));
+                self.remember(&format!("{ns}.{name}"), pair, kind_of(inner), true);
             }
         }
     }
@@ -182,28 +233,8 @@ impl Codec {
                 slots.push(Ok(t));
             }
         }
-        // Pass 2: an alias is plain only if clean, short, unique and not a literal tool.
-        let mut owners: HashMap<String, HashSet<&Pair>> = HashMap::new();
-        for (pair, _) in &entries {
-            if let Some(a) = plain_alias(pair.0.as_deref(), &pair.1) {
-                owners.entry(a).or_default().insert(pair);
-            }
-        }
-        let aliases: Vec<String> = entries
-            .iter()
-            .map(|(pair, _)| {
-                let (ns, name) = (pair.0.as_deref(), pair.1.as_str());
-                plain_alias(ns, name)
-                    .filter(|a| owners[a].len() == 1 && !literals.contains(a))
-                    .unwrap_or_else(|| {
-                        let naive = match ns {
-                            Some(ns) => format!("{}__{}", sanitize(ns), sanitize(name)),
-                            None => sanitize(name),
-                        };
-                        hashed(ns, name, &naive)
-                    })
-            })
-            .collect();
+        // Aliases are pure; only a literal-name conflict in this request forces a salt.
+        self.literals = literals;
         let mut out = Vec::new();
         for slot in slots {
             match slot {
@@ -211,25 +242,44 @@ impl Codec {
                 Err(i) => {
                     let (pair, tool) = &entries[i];
                     let kind = kind_of(tool);
-                    self.fwd.insert(pair.clone(), aliases[i].clone());
-                    self.rev.insert(aliases[i].clone(), (pair.clone(), kind));
-                    out.push(as_function(tool.clone(), &aliases[i]));
+                    let alias = self.alias(pair.0.as_deref(), &pair.1, kind, true);
+                    out.push(as_function(tool.clone(), &alias));
                 }
             }
         }
         out
     }
 
-    fn alias(&mut self, ns: &Option<String>, name: &str) -> String {
-        let key = (ns.clone(), name.to_string());
-        if let Some(a) = self.fwd.get(&key) {
-            return a.clone();
+    /// Records `alias -> pair`. The mapping is injective, so a different pair under the
+    /// same alias is a bug (or a 32-bit hash collision): log it and keep the first.
+    fn remember(&mut self, alias: &str, pair: Pair, kind: Kind, authoritative: bool) {
+        match self.rev.get_mut(alias) {
+            Some((p, k)) if *p == pair => {
+                if authoritative {
+                    *k = kind;
+                }
+            }
+            Some((p, _)) => {
+                tracing::error!(alias, existing = ?p, new = ?pair, "codec alias conflict");
+                debug_assert!(false, "codec alias conflict for {alias}");
+            }
+            None => {
+                self.rev.insert(alias.to_string(), (pair, kind));
+            }
         }
-        let a = plain_alias(ns.as_deref(), name)
-            .filter(|a| self.rev.get(a).is_none_or(|(p, _)| *p == key))
-            .unwrap_or_else(|| hashed(ns.as_deref(), name, &sanitize(name)));
-        self.fwd.insert(key.clone(), a.clone());
-        self.rev.insert(a.clone(), (key, Kind::Function));
+    }
+
+    /// Alias for tool definitions and history alike: the pure alias, salted only while it
+    /// equals a literal top-level function name of the current request.
+    fn alias(&mut self, ns: Option<&str>, name: &str, kind: Kind, tool_def: bool) -> String {
+        let mut salt = 0;
+        let mut a = alias_of(ns, name, salt);
+        while self.literals.contains(&a) {
+            salt += 1;
+            a = alias_of(ns, name, salt);
+        }
+        let pair = (ns.map(str::to_string), name.to_string());
+        self.remember(&a, pair, kind, tool_def);
         a
     }
 
@@ -244,7 +294,7 @@ impl Codec {
                 call_id,
                 internal_chat_message_metadata_passthrough,
             } => {
-                let name = self.alias(&Some(ns), &name);
+                let name = self.alias(Some(&ns), &name, Kind::Function, false);
                 ResponseItem::FunctionCall {
                     id,
                     name,
@@ -263,7 +313,7 @@ impl Codec {
                 output,
                 internal_chat_message_metadata_passthrough,
             } => {
-                let name = name.map(|n| self.alias(&Some(ns), &n));
+                let name = name.map(|n| self.alias(Some(&ns), &n, Kind::Function, false));
                 ResponseItem::FunctionCallOutput {
                     id,
                     call_id,
@@ -282,7 +332,7 @@ impl Codec {
                 internal_chat_message_metadata_passthrough,
                 ..
             } => {
-                let name = self.alias(&namespace, &name);
+                let name = self.alias(namespace.as_deref(), &name, Kind::Custom, false);
                 ResponseItem::FunctionCall {
                     id,
                     name,
@@ -320,6 +370,10 @@ impl Codec {
         else {
             return item;
         };
+        // A literal function name of this request is never redirected.
+        if self.literals.contains(name) {
+            return item;
+        }
         // Flatten maps aliases; DottedInbound maps `ns.tool` (both live in `rev`).
         let Some(((ns, orig), kind)) = self.rev.get(name).cloned() else {
             return item;
@@ -403,22 +457,89 @@ mod tests {
     }
 
     #[test]
-    fn collision_pair_gets_distinct_aliases_with_exact_reverse() {
+    fn aliases_are_pure_and_stable_across_requests() {
         let mut c = Codec::default();
-        let out = flatten(
+        let first = flatten(&mut c, json!([ns_tool("mcp__s__", &["t"])]));
+        let other = flatten(
             &mut c,
-            json!([ns_tool("mcp__s", &["a__b"]), ns_tool("mcp__s__a", &["b"])]),
+            json!([ns_tool("x", &["y"]), ns_tool("mcp__s__", &["t"])]),
         );
+        assert_eq!(first[0]["name"], other[1]["name"]);
+        assert_eq!(first[0]["name"], "mcp__s____t");
+        assert_eq!(first[0]["name"], alias_of(Some("mcp__s__"), "t", 0));
+    }
+
+    #[test]
+    fn colliding_pairs_get_distinct_stable_aliases_across_requests() {
+        let mut c = Codec::default();
+        let r1 = flatten(&mut c, json!([ns_tool("a", &["b__c"])]));
+        let r2 = flatten(&mut c, json!([ns_tool("a__b", &["c"])]));
         let (a, b) = (
-            out[0]["name"].as_str().unwrap(),
-            out[1]["name"].as_str().unwrap(),
+            r1[0]["name"].as_str().unwrap(),
+            r2[0]["name"].as_str().unwrap(),
         );
         assert_ne!(a, b);
-        assert!(out.iter().all(|t| t["type"] == "function"));
-        let back = c.inbound(Mode::Flatten, call(None, a));
-        assert_eq!(back, call(Some("mcp__s"), "a__b"));
-        let back = c.inbound(Mode::Flatten, call(None, b));
-        assert_eq!(back, call(Some("mcp__s__a"), "b"));
+        assert_eq!(
+            c.inbound(Mode::Flatten, call(None, a)),
+            call(Some("a"), "b__c")
+        );
+        assert_eq!(
+            c.inbound(Mode::Flatten, call(None, b)),
+            call(Some("a__b"), "c")
+        );
+        let again = flatten(&mut c, json!([ns_tool("a", &["b__c"])]));
+        assert_eq!(again[0]["name"], a);
+    }
+
+    #[test]
+    fn literal_equal_to_alias_is_salted_and_never_redirected() {
+        let mut c = Codec::default();
+        let hashed_lit = alias_of(Some("a.b"), "x", 0);
+        let lit =
+            |n: &str| json!({"type": "function", "name": n, "parameters": {"type": "object"}});
+        let out = flatten(
+            &mut c,
+            json!([
+                ns_tool("a", &["b"]),
+                lit("a__b"),
+                ns_tool("a.b", &["x"]),
+                lit(&hashed_lit)
+            ]),
+        );
+        let (plain, salted) = (
+            out[0]["name"].as_str().unwrap(),
+            out[2]["name"].as_str().unwrap(),
+        );
+        assert_ne!(plain, "a__b");
+        assert_ne!(salted, hashed_lit);
+        assert_eq!(
+            c.inbound(Mode::Flatten, call(None, plain)),
+            call(Some("a"), "b")
+        );
+        assert_eq!(
+            c.inbound(Mode::Flatten, call(None, salted)),
+            call(Some("a.b"), "x")
+        );
+        for l in ["a__b", hashed_lit.as_str()] {
+            assert_eq!(c.inbound(Mode::Flatten, call(None, l)), call(None, l));
+        }
+    }
+
+    #[test]
+    fn flattened_custom_call_maps_back_to_custom_tool_call() {
+        let mut c = Codec::default();
+        let custom = json!({"type": "custom", "name": "apply_patch", "description": "p"});
+        flatten(&mut c, json!([custom]));
+        let mut fc = call(None, "apply_patch");
+        if let ResponseItem::FunctionCall { arguments, .. } = &mut fc {
+            *arguments = json!({"input": "*** Begin"}).to_string();
+        }
+        // router.rs maps `CustomToolCall` straight to `ToolPayload::Custom { input }`.
+        assert!(matches!(
+            c.inbound(Mode::Flatten, fc),
+            ResponseItem::CustomToolCall { namespace: None, name, input, .. }
+                if name == "apply_patch" && input == "*** Begin"
+        ));
     }
 
     #[test]

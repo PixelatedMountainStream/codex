@@ -28,6 +28,7 @@ allow = [
     "codex-rs/cli/build.rs",
     "codex-rs/core/src/client.rs",
     "codex-rs/core/src/stream_events_utils.rs",
+    "codex-rs/core/src/session/turn.rs",
     "codex-rs/model-provider/src/provider.rs",
     "codex-rs/model-provider/src/lib.rs",
     "codex-rs/core/src/lib.rs",
