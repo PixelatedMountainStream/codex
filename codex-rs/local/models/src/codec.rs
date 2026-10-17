@@ -324,6 +324,8 @@ impl Codec {
                 encrypted_function_args,
                 call_id,
                 internal_chat_message_metadata_passthrough,
+                status,
+                encrypted_content,
             } => {
                 let name = self.alias(Some(&ns), &name, Kind::Function, false)?;
                 ResponseItem::FunctionCall {
@@ -334,6 +336,8 @@ impl Codec {
                     encrypted_function_args,
                     call_id,
                     internal_chat_message_metadata_passthrough,
+                    status,
+                    encrypted_content,
                 }
             }
             ResponseItem::FunctionCallOutput {
@@ -363,7 +367,8 @@ impl Codec {
                 namespace,
                 input,
                 internal_chat_message_metadata_passthrough,
-                ..
+                status,
+                encrypted_content,
             } => {
                 let name = self.alias(namespace.as_deref(), &name, Kind::Custom, false)?;
                 ResponseItem::FunctionCall {
@@ -374,6 +379,8 @@ impl Codec {
                     encrypted_function_args: None,
                     call_id,
                     internal_chat_message_metadata_passthrough,
+                    status,
+                    encrypted_content,
                 }
             }
             ResponseItem::CustomToolCallOutput {
@@ -417,6 +424,8 @@ impl Codec {
             call_id,
             internal_chat_message_metadata_passthrough,
             encrypted_function_args,
+            status,
+            encrypted_content,
             ..
         } = item
         else {
@@ -431,6 +440,8 @@ impl Codec {
                 encrypted_function_args,
                 call_id,
                 internal_chat_message_metadata_passthrough,
+                status,
+                encrypted_content,
             },
             Kind::Custom => {
                 let input = serde_json::from_str::<Value>(&arguments)
@@ -439,12 +450,13 @@ impl Codec {
                     .unwrap_or(arguments);
                 ResponseItem::CustomToolCall {
                     id,
-                    status: None,
+                    status,
                     call_id,
                     name: orig,
                     namespace: ns,
                     input,
                     internal_chat_message_metadata_passthrough,
+                    encrypted_content,
                 }
             }
         }
@@ -480,6 +492,8 @@ mod tests {
             encrypted_function_args: None,
             call_id: "c1".into(),
             internal_chat_message_metadata_passthrough: None,
+            status: None,
+            encrypted_content: None,
         }
     }
 
@@ -639,6 +653,7 @@ mod tests {
             namespace: None,
             input: "*** Begin".into(),
             internal_chat_message_metadata_passthrough: None,
+            encrypted_content: None,
         };
         let mut input = vec![hist_call.clone(), call(Some("multi"), "spawn")];
         c.outbound(Mode::Flatten, &mut tools, &mut input).unwrap();
@@ -656,6 +671,51 @@ mod tests {
             matches!(&input[1], ResponseItem::FunctionCall { namespace: None, call_id, .. } if call_id == "c1")
         );
         assert_eq!(c.inbound(Mode::Flatten, input[0].clone()), hist_call);
+
+        // Populated status/encrypted_content survive the custom round trip.
+        let populated = ResponseItem::CustomToolCall {
+            id: None,
+            status: Some("completed".into()),
+            call_id: "c9".into(),
+            name: "apply_patch".into(),
+            namespace: None,
+            input: "*** Begin".into(),
+            internal_chat_message_metadata_passthrough: None,
+            encrypted_content: Some("enc".into()),
+        };
+        let mut input = vec![populated.clone()];
+        c.outbound(Mode::Flatten, &mut tools, &mut input).unwrap();
+        assert!(
+            matches!(&input[0], ResponseItem::FunctionCall { status: Some(s), encrypted_content: Some(e), .. }
+            if s == "completed" && e == "enc")
+        );
+        assert_eq!(c.inbound(Mode::Flatten, input[0].clone()), populated);
+
+        // Alias inbound to a namespaced FunctionCall keeps them too.
+        let mut c = Codec::default();
+        let alias = flatten(&mut c, json!([ns_tool("multi", &["spawn"])]))[0]["name"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mut fc = call(None, &alias);
+        if let ResponseItem::FunctionCall {
+            status,
+            encrypted_content,
+            ..
+        } = &mut fc
+        {
+            *status = Some("completed".into());
+            *encrypted_content = Some("enc".into());
+        }
+        assert!(matches!(
+            c.inbound(Mode::Flatten, fc),
+            ResponseItem::FunctionCall {
+                namespace: Some(_),
+                status: Some(_),
+                encrypted_content: Some(_),
+                ..
+            }
+        ));
     }
 
     #[test]
