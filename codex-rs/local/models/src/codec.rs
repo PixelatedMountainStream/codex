@@ -324,6 +324,8 @@ impl Codec {
                 encrypted_function_args,
                 call_id,
                 internal_chat_message_metadata_passthrough,
+                status,
+                encrypted_content,
             } => {
                 let name = self.alias(Some(&ns), &name, Kind::Function, false)?;
                 ResponseItem::FunctionCall {
@@ -334,6 +336,8 @@ impl Codec {
                     encrypted_function_args,
                     call_id,
                     internal_chat_message_metadata_passthrough,
+                    status,
+                    encrypted_content,
                 }
             }
             ResponseItem::FunctionCallOutput {
@@ -374,6 +378,8 @@ impl Codec {
                     encrypted_function_args: None,
                     call_id,
                     internal_chat_message_metadata_passthrough,
+                    status: None,
+                    encrypted_content: None,
                 }
             }
             ResponseItem::CustomToolCallOutput {
@@ -431,6 +437,8 @@ impl Codec {
                 encrypted_function_args,
                 call_id,
                 internal_chat_message_metadata_passthrough,
+                status: None,
+                encrypted_content: None,
             },
             Kind::Custom => {
                 let input = serde_json::from_str::<Value>(&arguments)
@@ -445,6 +453,7 @@ impl Codec {
                     namespace: ns,
                     input,
                     internal_chat_message_metadata_passthrough,
+                    encrypted_content: None,
                 }
             }
         }
@@ -480,6 +489,8 @@ mod tests {
             encrypted_function_args: None,
             call_id: "c1".into(),
             internal_chat_message_metadata_passthrough: None,
+            status: None,
+            encrypted_content: None,
         }
     }
 
@@ -639,6 +650,7 @@ mod tests {
             namespace: None,
             input: "*** Begin".into(),
             internal_chat_message_metadata_passthrough: None,
+            encrypted_content: None,
         };
         let mut input = vec![hist_call.clone(), call(Some("multi"), "spawn")];
         c.outbound(Mode::Flatten, &mut tools, &mut input).unwrap();

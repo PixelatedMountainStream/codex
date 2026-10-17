@@ -76,9 +76,15 @@ mod tests {
             ResponseItem::Message {
                 id: id("msg_1"),
                 role: "assistant".into(),
-                content: vec![ContentItem::OutputText { text: "hi".into() }],
+                content: vec![ContentItem::OutputText {
+                    text: "hi".into(),
+                    annotations: None,
+                    logprobs: None,
+                }],
                 phase: None,
                 internal_chat_message_metadata_passthrough: None,
+                status: None,
+                encrypted_content: None,
             },
             ResponseItem::FunctionCall {
                 id: id("fc_1"),
@@ -88,6 +94,8 @@ mod tests {
                 encrypted_function_args: None,
                 call_id: "call_1".into(),
                 internal_chat_message_metadata_passthrough: None,
+                status: None,
+                encrypted_content: None,
             },
             ResponseItem::FunctionCallOutput {
                 id: id("fco_1"),
@@ -100,10 +108,16 @@ mod tests {
         ];
         let out = sanitize_history(items);
         assert_eq!(out.len(), 3);
-        assert!(matches!(&out[1], ResponseItem::FunctionCall { encrypted_function_args: None, .. }));
+        assert!(matches!(
+            &out[1],
+            ResponseItem::FunctionCall {
+                encrypted_function_args: None,
+                ..
+            }
+        ));
         assert!(out.iter().all(|i| i.id().is_none()));
         assert!(matches!(&out[0], ResponseItem::Message { content, .. }
-            if matches!(&content[0], ContentItem::OutputText { text } if text == "hi")));
+            if matches!(&content[0], ContentItem::OutputText { text, .. } if text == "hi")));
         assert!(
             matches!(&out[1], ResponseItem::FunctionCall { call_id, .. } if call_id == "call_1")
         );
@@ -123,6 +137,8 @@ mod tests {
                 encrypted_function_args: Some(vec!["blob".to_string()]),
                 call_id: "call_2".into(),
                 internal_chat_message_metadata_passthrough: None,
+                status: None,
+                encrypted_content: None,
             },
             ResponseItem::FunctionCallOutput {
                 id: None,
@@ -145,8 +161,10 @@ mod tests {
         ];
         let out = sanitize_history(items);
         assert_eq!(out.len(), 2);
-        assert!(matches!(&out[0], ResponseItem::FunctionCall { arguments, encrypted_function_args: None, .. }
-            if arguments == "{}"));
+        assert!(
+            matches!(&out[0], ResponseItem::FunctionCall { arguments, encrypted_function_args: None, .. }
+            if arguments == "{}")
+        );
         assert!(matches!(&out[1], ResponseItem::FunctionCallOutput { .. }));
     }
 }
