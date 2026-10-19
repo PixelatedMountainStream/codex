@@ -2,7 +2,7 @@
 # upstream crates (see boundaries/). Only the dependency rules run, so
 # upstream manifests are not linted.
 [tool.sc-lint]
-minimum_version = "0.4.0"
+minimum_version = "0.8.0"
 
 [[tool.sc-lint.lint]]
 name = "fork-boundary"
