@@ -30,24 +30,35 @@ jobs:
       - name: Check fork surface
         if: hashFiles('local/scripts/check_fork_surface.py') != ''
         run: python3 local/scripts/check_fork_surface.py
-      # TODO: switch to `uses: randlee/sc-lint@v1` (operation: setup, pinned
-      # released version) once sc-lint ships prefix patterns + SCB-FEATURE-001
-      # (randlee/sc-lint#603). Until then, build the PR commit from git.
-      - name: Cache sc-lint
-        id: sc-lint-cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/sc-lint
-            ~/.cargo/bin/sc-lint-boundary
-          key: sc-lint-bc19f2b-${{ runner.os }}
+      # Pinned release; the action verifies the archive against the release
+      # checksums.txt. Pin the action ref and `version` together.
       - name: Install sc-lint
-        if: steps.sc-lint-cache.outputs.cache-hit != 'true'
-        run: cargo install --locked --git https://github.com/ehrvs/sc-lint --rev bc19f2b sc-lint sc-lint-boundary
+        uses: randlee/sc-lint@0d03abd5031875cdb2807c0dd094bb032ee811ed  # v0.8.0
+        # The v0.8.0 action reads INPUT_WORKING_DIRECTORY but the runner exports INPUT_WORKING-DIRECTORY (action/index.js:54), so hyphenated inputs are ignored; remove once fixed upstream.
+        env:
+          INPUT_WORKING_DIRECTORY: codex-rs
+        with:
+          operation: setup
+          version: 0.8.0
+          working-directory: codex-rs
       - name: sc-lint boundary (fork independence)
         if: hashFiles('codex-rs/sc-lint.toml') != ''
         working-directory: codex-rs
         run: sc-lint lint sc-boundary --rule-filter dependencies
+      # Negative check: the fixture violates SCB-FEATURE-001 (features set on a
+      # prefix-allowed workspace dependency) and SCB-DEPENDENCY-001 (dependency
+      # outside the allowed prefix); the lint must fail with both rule IDs.
+      - name: sc-lint negative fixture (must fail)
+        working-directory: local/tests/sc-lint-fixtures/feature-violation
+        run: |
+          rc=0
+          sc-lint lint sc-boundary --rule-filter dependencies --json > out.json || rc=$?
+          cat out.json
+          # v0.8.0 exits 10 on lint failure; any other code (crash, signal) fails.
+          test "$rc" -eq 10
+          # Exactly these findings: the fx-sibling dependency edge must not appear.
+          jq -e '.data.findings | map([.rule_id, (.owner_ids | join(">"))]) | sort
+            == [["SCB-DEPENDENCY-001","fx-owner>up-dep"],["SCB-FEATURE-001","fx-owner>fx-sibling"]]' out.json
 
   python:
     runs-on: ubuntu-latest

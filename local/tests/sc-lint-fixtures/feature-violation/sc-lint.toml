@@ -1,0 +1,7 @@
+# Negative fixture: sc-lint must report violations here (see local-ci.yml).
+[tool.sc-lint]
+minimum_version = "0.8.0"
+
+[[tool.sc-lint.lint]]
+name = "fork-boundary"
+command = ["sc-lint", "lint", "sc-boundary", "--rule-filter", "dependencies"]

@@ -1,0 +1,11 @@
+[package]
+name = "fx-owner"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+# Matched by the "fx-*" prefix pattern, so no dependency edge finding, but
+# setting features is not exempted: SCB-FEATURE-001.
+fx-sibling = { path = "../fx-sibling", features = ["extra"] }
+# Not matched by any allowed pattern: SCB-DEPENDENCY-001.
+up-dep = { path = "../up-dep" }
